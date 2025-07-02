@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+default = ["std"]
+std = ["stwo/std"]
 parallel = ["dep:rayon", "stwo/parallel"]
-prover = ["stwo/prover"]
+prover = ["stwo/prover", "std"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
@@ -14,3 +16,4 @@ itertools.workspace = true
 tracing.workspace = true
 stwo = { path = "../stwo" }
 rand.workspace = true
+hashbrown.workspace = true
