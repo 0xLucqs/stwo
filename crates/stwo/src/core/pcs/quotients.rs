@@ -48,7 +48,11 @@ impl ColumnSampleBatch {
     pub fn new_vec(samples: &[&Vec<PointSample>]) -> Vec<Self> {
         // Group samples by point, and create a ColumnSampleBatch for each point.
         // This should keep a stable ordering.
+        #[cfg(feature = "std")]
         let mut grouped_samples = IndexMap::new();
+        #[cfg(not(feature = "std"))]
+        let mut grouped_samples = IndexMap::with_hasher(foldhash::fast::RandomState::default());
+
         for (column_index, samples) in samples.iter().enumerate() {
             for sample in samples.iter() {
                 grouped_samples

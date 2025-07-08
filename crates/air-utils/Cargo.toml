@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-bytemuck.workspace = true
+bytemuck = { workspace = true, features = ["extern_crate_std"] }
 itertools.workspace = true
 rayon = { version = "1.10.0", optional = false }
 stwo = { path = "../stwo", features = ["prover"] }

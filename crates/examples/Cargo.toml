@@ -13,11 +13,11 @@ bench = false
 
 [dependencies]
 rayon = { workspace = true, optional = true }
-num-traits.workspace = true
+num-traits = { workspace = true, features = ["std"] }
 itertools.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-serde.workspace = true
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std"] }
 stwo = { path = "../stwo", features = ["prover"] }
 stwo-constraint-framework = { path = "../constraint-framework", features = [
     "prover",
