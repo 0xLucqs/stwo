@@ -123,6 +123,10 @@ impl Column<BaseField> for BaseColumn {
             },
         )
     }
+
+    fn as_raw_mut_bytes(&mut self) -> Option<&mut [u8]> {
+        Some(cast_slice_mut(&mut self.data))
+    }
 }
 
 impl FromIterator<BaseField> for BaseColumn {

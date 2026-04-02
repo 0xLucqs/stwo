@@ -63,4 +63,13 @@ pub trait Column<T>: Clone + Debug + FromIterator<T> + Send + Sync {
     fn set(&mut self, index: usize, value: T);
     /// Splits the column into two halves.
     fn split_at_mid(self) -> (Self, Self);
+
+    /// Returns the column's backing memory as a mutable byte slice, if the column supports
+    /// direct memory access. Returns `None` by default.
+    ///
+    /// Used for low-memory page replacement (converting anonymous heap pages to file-backed
+    /// mmap pages).
+    fn as_raw_mut_bytes(&mut self) -> Option<&mut [u8]> {
+        None
+    }
 }

@@ -1,12 +1,19 @@
-//! Disk-backed coefficient storage for low-memory proving.
+//! Disk-backed storage for low-memory proving.
 //!
 //! When proving on memory-constrained devices (e.g., mobile phones), polynomial coefficients
-//! can be spilled to a temporary file and memory-mapped. The OS then manages which pages are
-//! resident in physical memory, evicting unused pages under memory pressure.
+//! and evaluations can be spilled to temporary files and memory-mapped. The OS then manages
+//! which pages are resident in physical memory, evicting unused pages under memory pressure.
 //!
-//! This is particularly effective because coefficient access patterns during proving are
-//! sequential (OODS evaluation, FFT for materialization), which the kernel readahead handles
-//! well.
+//! Two spilling strategies are supported:
+//!
+//! 1. **Spill-and-reload**: Write data to file, drop the in-memory copy, reload later via mmap.
+//!    Used for polynomial coefficients that aren't needed during Merkle tree building.
+//!
+//! 2. **Page replacement (MAP_FIXED)**: Write data to file, then use `mmap(MAP_FIXED)` to
+//!    replace the anonymous heap pages backing a Vec with file-backed pages *in place*. The Vec
+//!    pointer/length/capacity are unchanged, but the OS can now evict pages under memory
+//!    pressure and re-fault them from the file. Used for evaluation data that must remain
+//!    addressable during Merkle tree building.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -133,6 +140,120 @@ impl FrozenSpillFile {
     /// Returns true if the spill file has no entries.
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// A Vec-like container whose backing memory is a file-backed mmap instead of anonymous heap.
+///
+/// When the OS is under memory pressure, file-backed pages can be evicted and re-faulted from
+/// disk. Anonymous heap pages (regular Vec) cannot be evicted on mobile (no swap), causing OOM
+/// kills. This type converts a Vec's data to file-backed storage.
+///
+/// On drop, the mmap is properly unmapped (not free'd via the allocator).
+pub struct MmapVec<T: Pod> {
+    ptr: *mut T,
+    len: usize,
+    byte_len: usize,
+    _file: NamedTempFile,
+}
+
+unsafe impl<T: Pod> Send for MmapVec<T> {}
+unsafe impl<T: Pod> Sync for MmapVec<T> {}
+
+impl<T: Pod> MmapVec<T> {
+    /// Converts a Vec to file-backed mmap storage.
+    ///
+    /// Writes the Vec's data to a temp file, mmaps it, and returns the mmap-backed view.
+    /// The original Vec's memory is freed.
+    #[cfg(unix)]
+    pub fn from_vec(data: Vec<T>) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let len = data.len();
+        let byte_len = len * std::mem::size_of::<T>();
+
+        if byte_len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::NonNull::dangling().as_ptr(),
+                len: 0,
+                byte_len: 0,
+                _file: NamedTempFile::new()?,
+            });
+        }
+
+        // Write data to temp file.
+        let mut file = NamedTempFile::new()?;
+        file.write_all(bytemuck::cast_slice(&data))?;
+        file.as_file().sync_all()?;
+
+        // Drop the original Vec to free its anonymous heap pages.
+        drop(data);
+
+        // Mmap the file.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            ptr: ptr as *mut T,
+            len,
+            byte_len,
+            _file: file,
+        })
+    }
+
+    /// No-op on non-Unix: just wraps the Vec data.
+    #[cfg(not(unix))]
+    pub fn from_vec(data: Vec<T>) -> std::io::Result<Self> {
+        let len = data.len();
+        let byte_len = len * std::mem::size_of::<T>();
+        let ptr = Box::into_raw(data.into_boxed_slice()) as *mut T;
+        Ok(Self {
+            ptr,
+            len,
+            byte_len,
+            _file: NamedTempFile::new()?,
+        })
+    }
+}
+
+impl<T: Pod> std::ops::Deref for MmapVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Pod> std::ops::DerefMut for MmapVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T: Pod> Drop for MmapVec<T> {
+    fn drop(&mut self) {
+        if self.byte_len > 0 {
+            #[cfg(unix)]
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.byte_len);
+            }
+            #[cfg(not(unix))]
+            unsafe {
+                // Reconstruct the Box to free the allocation.
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.ptr, self.len));
+            }
+        }
     }
 }
 
