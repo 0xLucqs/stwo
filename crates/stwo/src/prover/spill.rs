@@ -257,6 +257,171 @@ impl<T: Pod> Drop for MmapVec<T> {
     }
 }
 
+/// A raw mmap region that needs to be munmapped on drop.
+struct MmapRegion {
+    ptr: *mut libc::c_void,
+    byte_len: usize,
+    _file: NamedTempFile,
+}
+
+unsafe impl Send for MmapRegion {}
+unsafe impl Sync for MmapRegion {}
+
+impl Drop for MmapRegion {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.ptr, self.byte_len);
+        }
+    }
+}
+
+/// Guard holding file-backed mmap data for evaluation columns.
+///
+/// While this guard is alive, Poly evals may contain Vecs pointing into the mmap data.
+/// Those Vecs must be forgotten (not dropped) before this guard is dropped. Call
+/// `forget_mmap_backed_evals()` on the polynomials before dropping this guard.
+pub struct EvalMmapGuard {
+    _regions: Vec<MmapRegion>,
+}
+
+/// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
+///
+/// For each polynomial with evaluations, the BaseColumn's Vec data is written to a temp file,
+/// mmapped, and the Vec is swapped to point to the mmap data. The original heap allocation is
+/// freed. The returned guard must outlive the polynomials.
+///
+/// After using the evaluations (e.g., for Merkle tree building), call
+/// `forget_mmap_backed_evals()` to prevent the Vecs from deallocating mmap memory on drop.
+pub fn spill_eval_columns(
+    polynomials: &mut [crate::prover::air::component_prover::Poly<
+        crate::prover::backend::simd::SimdBackend,
+    >],
+) -> Option<EvalMmapGuard> {
+    let mut mmap_regions = Vec::new();
+
+    for poly in polynomials.iter_mut() {
+        let evals = match &mut poly.evals {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let col = &mut evals.values;
+        // Take the current Vec data out (heap-backed).
+        let heap_data: Vec<crate::prover::backend::simd::m31::PackedBaseField> =
+            std::mem::take(&mut col.data);
+        let packed_len = heap_data.len();
+
+        // Write to temp file as raw bytes, mmap it back.
+        let byte_len = packed_len
+            * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
+        let byte_ptr = heap_data.as_ptr() as *const u8;
+        let bytes = unsafe { std::slice::from_raw_parts(byte_ptr, byte_len) };
+
+        let mut file = match NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Eval mmap spill failed (create file): {e}");
+                col.data = heap_data;
+                continue;
+            }
+        };
+        if let Err(e) = file.write_all(bytes) {
+            tracing::warn!("Eval mmap spill failed (write): {e}");
+            col.data = heap_data;
+            continue;
+        }
+        if let Err(e) = file.as_file().sync_all() {
+            tracing::warn!("Eval mmap spill failed (sync): {e}");
+            col.data = heap_data;
+            continue;
+        }
+
+        // Drop the heap allocation.
+        drop(heap_data);
+
+        // Mmap the file with read-write access (MAP_PRIVATE: writes create COW pages).
+        #[cfg(unix)]
+        let mmap_result = unsafe {
+            use std::os::unix::io::AsRawFd;
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_file().as_raw_fd(),
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ptr)
+            }
+        };
+
+        #[cfg(not(unix))]
+        let mmap_result: Result<*mut libc::c_void, std::io::Error> =
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not unix"));
+
+        let mmap_ptr = match mmap_result {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                tracing::warn!("Eval mmap failed: {e}");
+                continue;
+            }
+        };
+
+        // Create a Vec pointing to the mmap data.
+        // SAFETY: mmap returned a valid, aligned pointer. The file is synced and the
+        // data has the exact same layout as the original Vec<PackedBaseField>.
+        col.data = unsafe {
+            Vec::from_raw_parts(
+                mmap_ptr as *mut crate::prover::backend::simd::m31::PackedBaseField,
+                packed_len,
+                packed_len,
+            )
+        };
+
+        // Store file + mmap info for cleanup. The MmapVec isn't used here; we store
+        // the raw info needed for munmap.
+        mmap_regions.push(MmapRegion {
+            ptr: mmap_ptr,
+            byte_len,
+            _file: file,
+        });
+    }
+
+    if mmap_regions.is_empty() {
+        return None;
+    }
+
+    tracing::info!(
+        "Spilled {} evaluation columns to file-backed mmap",
+        mmap_regions.len()
+    );
+
+    Some(EvalMmapGuard {
+        _regions: mmap_regions,
+    })
+}
+
+/// Forgets evaluation Vecs that point to mmap memory, preventing dealloc of mmap pages.
+///
+/// Must be called before the EvalMmapGuard is dropped if any polynomial evals were spilled.
+pub fn forget_mmap_backed_evals(
+    polynomials: &mut [crate::prover::air::component_prover::Poly<
+        crate::prover::backend::simd::SimdBackend,
+    >],
+) {
+    for poly in polynomials.iter_mut() {
+        if let Some(evals) = poly.evals.take() {
+            // Forget the CircleEvaluation to prevent Vec::drop on mmap memory.
+            // The EvalMmapGuard will handle munmap.
+            std::mem::forget(evals);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

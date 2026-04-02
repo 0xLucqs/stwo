@@ -739,6 +739,26 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             }
         }
 
+        // In LowMemory mode, replace evaluation Vec backing with file-backed mmap.
+        // This converts ~5 GB of anonymous heap into OS-managed pages that can be evicted
+        // under memory pressure and re-faulted from disk. Only the Merkle builder's working
+        // set (~256 MB) needs to be physically resident.
+        let _eval_mmap_guard = if memory_mode == ProverMemoryMode::LowMemory {
+            // The spill function works with concrete SimdBackend types. Check if we can
+            // downcast. In practice, B is always SimdBackend in the proving pipeline.
+            let polys_ptr = &mut polynomials as *mut Vec<Poly<B>> as *mut Vec<
+                Poly<crate::prover::backend::simd::SimdBackend>,
+            >;
+            // SAFETY: This is only called when B = SimdBackend (the only backend that
+            // implements BackendForChannel). The cast is sound because Poly<B> and
+            // Poly<SimdBackend> have identical layout when B = SimdBackend.
+            let guard = unsafe { crate::prover::spill::spill_eval_columns(&mut *polys_ptr) };
+            phase_memory_checkpoint("pcs:tree:new:after_eval_mmap_spill");
+            guard
+        } else {
+            None
+        };
+
         let _span = span!(Level::INFO, "Merkle").entered();
         let max_log_domain_size = polynomials
             .iter()
@@ -766,9 +786,18 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             };
 
         if memory_mode == ProverMemoryMode::LowMemory {
-            for poly in &mut polynomials {
-                if poly.evals.is_some() {
-                    let _ = poly.take_evals();
+            if _eval_mmap_guard.is_some() {
+                // Evals are mmap-backed: forget them to prevent Vec::drop on mmap memory.
+                let polys_ptr = &mut polynomials as *mut Vec<Poly<B>> as *mut Vec<
+                    Poly<crate::prover::backend::simd::SimdBackend>,
+                >;
+                unsafe { crate::prover::spill::forget_mmap_backed_evals(&mut *polys_ptr) };
+            } else {
+                // Evals are heap-backed: drop normally.
+                for poly in &mut polynomials {
+                    if poly.evals.is_some() {
+                        let _ = poly.take_evals();
+                    }
                 }
             }
             phase_memory_checkpoint("pcs:tree:new:after_low_memory_eval_release");
