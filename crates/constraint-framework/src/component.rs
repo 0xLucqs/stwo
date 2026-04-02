@@ -182,6 +182,10 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
         &self.trace_locations
     }
 
+    pub fn framework_eval(&self) -> &E {
+        &self.eval
+    }
+
     pub fn preprocessed_column_indices(&self) -> &[usize] {
         &self.preprocessed_column_indices
     }

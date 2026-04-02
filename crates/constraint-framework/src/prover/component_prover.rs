@@ -18,7 +18,10 @@ use stwo::prover::backend::{Backend, CpuBackend};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
-use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, EvaluationMode, Poly, Trace};
+use stwo::prover::{
+    ComponentProver, DomainEvaluationAccumulator, EvaluationMode, Poly, Trace,
+    TraceEvalAccessPattern,
+};
 use tracing::{span, Level};
 
 use super::{CpuDomainEvaluator, SimdDomainEvaluator};
@@ -49,7 +52,7 @@ fn get_trace_columns<'a, B: Backend>(
             //
             // Ideally we'd slice to just those indices, but the type system requires
             // borrowing the entire evaluation.
-            component_polys.map_cols(|c| Cow::Borrowed(&c.evals))
+            component_polys.map_cols(|c| Cow::Borrowed(c.evals()))
         }
         EvaluationMode::ExtendToEvalDomain => {
             let _span = span!(Level::INFO, "Constraint Extension").entered();
@@ -211,6 +214,20 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             }
         });
     }
+
+    fn trace_eval_access_pattern(&self) -> Option<TraceEvalAccessPattern> {
+        Some(TraceEvalAccessPattern {
+            tree_spans: self
+                .trace_locations
+                .iter()
+                .copied()
+                .filter(|span| {
+                    span.tree_index != PREPROCESSED_TRACE_IDX && span.col_start < span.col_end
+                })
+                .collect(),
+            preprocessed_columns: self.preprocessed_column_indices.clone(),
+        })
+    }
 }
 
 impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent<E> {
@@ -256,6 +273,20 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
             &accum.random_coeff_powers,
             accum.col,
         );
+    }
+
+    fn trace_eval_access_pattern(&self) -> Option<TraceEvalAccessPattern> {
+        Some(TraceEvalAccessPattern {
+            tree_spans: self
+                .trace_locations
+                .iter()
+                .copied()
+                .filter(|span| {
+                    span.tree_index != PREPROCESSED_TRACE_IDX && span.col_start < span.col_end
+                })
+                .collect(),
+            preprocessed_columns: self.preprocessed_column_indices.clone(),
+        })
     }
 }
 

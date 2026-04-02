@@ -12,6 +12,7 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::poly::circle::CanonicCoset;
 use crate::prover::backend::{Backend, Col, Column, ColumnOps, CpuBackend};
+use crate::prover::memory::phase_memory_checkpoint;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, SecureCirclePoly};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
@@ -169,8 +170,10 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
         )
         .entered();
 
+        phase_memory_checkpoint("composition:finalize:start");
         let sub_accumulations = self.sub_accumulations.into_iter().flatten().collect_vec();
         let lifted_accumulation = B::lift_and_accumulate(sub_accumulations);
+        phase_memory_checkpoint("composition:finalize:after_lift");
 
         if let Some(eval) = lifted_accumulation {
             // Determine the domain and twiddles based on evaluation mode.
@@ -197,10 +200,12 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
             };
             let twiddles_ref = owned_twiddles.as_ref().unwrap_or(twiddles);
 
-            SecureCirclePoly(eval.columns.map(|c| {
+            let poly = SecureCirclePoly(eval.columns.map(|c| {
                 CircleEvaluation::<B, BaseField, BitReversedOrder>::new(domain, c)
                     .interpolate_with_twiddles(twiddles_ref)
-            }))
+            }));
+            phase_memory_checkpoint("composition:finalize:after_interpolation");
+            poly
         } else {
             SecureCirclePoly(std::array::from_fn(|_| {
                 CircleCoefficients::new(Col::<B, BaseField>::zeros(1 << log_size))

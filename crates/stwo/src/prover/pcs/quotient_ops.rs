@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::iter::zip;
 
 use itertools::Itertools;
@@ -10,7 +11,9 @@ use crate::core::pcs::quotients::{
     build_samples_with_randomness_and_periodicity, ColumnSampleBatch, PointSample,
 };
 use crate::core::pcs::TreeVec;
-use crate::prover::backend::ColumnOps;
+use crate::prover::air::component_prover::Poly;
+use crate::prover::backend::{Backend, ColumnOps};
+use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
@@ -168,8 +171,128 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     )
 }
 
+/// Maximum number of columns to materialize simultaneously during low-memory FRI quotient
+/// computation. Limits transient memory to `batch_size * eval_size` instead of
+/// `all_columns_at_log_size * eval_size`.
+const LOW_MEMORY_QUOTIENT_BATCH_SIZE: usize = 8;
+
+pub fn compute_fri_quotients_from_polys<B: QuotientOps + AccumulationOps + Backend>(
+    polynomials: &TreeVec<Vec<&Poly<B>>>,
+    samples: &TreeVec<Vec<Vec<PointSample>>>,
+    random_coeff: SecureField,
+    lifting_log_size: u32,
+    twiddles: &TwiddleTree<B>,
+    log_blowup_factor: u32,
+    base_column_pool: &BaseColumnPool<B>,
+) -> SecureEvaluation<B, BitReversedOrder> {
+    let _span = span!(
+        Level::INFO,
+        "Compute FRI quotients (low memory)",
+        class = "FRIQuotientsLowMemory"
+    )
+    .entered();
+    let mut accumulated_numerators_vec: Vec<AccumulatedNumerators<B>> = vec![];
+    let samples_with_randomness = build_samples_with_randomness_and_periodicity(
+        samples,
+        polynomials
+            .0
+            .iter()
+            .map(|x| x.iter().map(|poly| poly.log_size()))
+            .collect(),
+        lifting_log_size,
+        random_coeff,
+    );
+
+    // Process each tree's polynomials separately to avoid cross-tree materialization overlap.
+    // Within each tree, polynomials are grouped by log_size and sub-batched.
+    for (tree_polys, tree_samples) in polynomials.iter().zip(samples_with_randomness.iter()) {
+        zip(tree_polys.iter(), tree_samples.iter())
+            .sorted_by_key(|(poly, _)| poly.log_size())
+            .group_by(|(poly, _)| poly.log_size())
+            .into_iter()
+            .for_each(|(_, tuples)| {
+                let (polys, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
+
+                // Sub-batch materialization to limit transient memory.
+                for chunk_start in (0..polys.len()).step_by(LOW_MEMORY_QUOTIENT_BATCH_SIZE) {
+                    let chunk_end = (chunk_start + LOW_MEMORY_QUOTIENT_BATCH_SIZE).min(polys.len());
+                    let chunk_polys = &polys[chunk_start..chunk_end];
+                    let chunk_samples = &samples_with_randomness[chunk_start..chunk_end];
+
+                    let sample_batches = ColumnSampleBatch::new_vec(chunk_samples);
+
+                    let evals: Vec<Cow<'_, CircleEvaluation<B, BaseField, BitReversedOrder>>> =
+                        chunk_polys
+                            .iter()
+                            .map(|poly: &&Poly<B>| {
+                                poly.evals.as_ref().map(Cow::Borrowed).unwrap_or_else(|| {
+                                    Cow::Owned(
+                                        poly.materialize_evaluation(twiddles, base_column_pool),
+                                    )
+                                })
+                            })
+                            .collect();
+                    let columns = evals.iter().map(|eval| eval.as_ref()).collect_vec();
+                    B::accumulate_numerators(
+                        &columns,
+                        &sample_batches,
+                        &mut accumulated_numerators_vec,
+                        log_blowup_factor,
+                    );
+                    // Evaluations are dropped here, freeing memory before the next sub-batch.
+                }
+            });
+    }
+
+    // Sort by (sample_point, size) so that within each sample_point group the entries are in
+    // strictly ascending size order, as required by `lift_and_accumulate`. When processing
+    // multiple trees sequentially, each tree's entries are inserted in ascending log_size order,
+    // but after all of tree 0's entries (log_sizes L1..Lmax) come tree 1's entries (starting
+    // again from L1). Without the size sort, `lift_and_accumulate` would see non-monotonic sizes
+    // and underflow on the u32 log_ratio calculation.
+    let accumulations_per_sample_point = accumulated_numerators_vec
+        .into_iter()
+        .sorted_by_key(|c| {
+            (
+                c.sample_point.x,
+                c.sample_point.y,
+                c.partial_numerators_acc.len(),
+            )
+        })
+        .group_by(|c| c.sample_point)
+        .into_iter()
+        .map(|(sample_point, accumulations_per_log_size)| {
+            let accumulations_per_log_size = accumulations_per_log_size.collect_vec();
+            let first_linear_term_acc: SecureField = accumulations_per_log_size
+                .iter()
+                .map(|x| x.first_linear_term_acc)
+                .sum();
+            let partial_numerators_acc = accumulations_per_log_size
+                .into_iter()
+                .map(|x| x.partial_numerators_acc)
+                .collect_vec();
+            let res = B::lift_and_accumulate(partial_numerators_acc).unwrap();
+
+            AccumulatedNumerators {
+                sample_point,
+                partial_numerators_acc: res,
+                first_linear_term_acc,
+            }
+        })
+        .collect_vec();
+
+    B::compute_quotients_and_combine(
+        accumulations_per_sample_point,
+        lifting_log_size,
+        log_blowup_factor,
+        twiddles,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use itertools::Itertools;
     use num_traits::Zero;
     use rand::rngs::SmallRng;
@@ -189,7 +312,7 @@ mod tests {
     use crate::prover::backend::{Backend, BackendForChannel, Column, CpuBackend};
     use crate::prover::pcs::quotient_ops::compute_fri_quotients;
     use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
-    use crate::prover::{CommitmentSchemeProver, SecureField};
+    use crate::prover::{CommitmentSchemeProver, ProverMemoryMode, SecureField};
 
     #[test]
     fn test_quotients_are_low_degree() {
@@ -253,13 +376,14 @@ mod tests {
         polys
     }
 
-    fn prove_and_verify_pcs<
+    fn prove_and_verify_pcs_with_params<
         B: BackendForChannel<Blake2sMerkleChannel>,
         const STORE_COEFFS: bool,
-    >() -> Result<(), VerificationError> {
-        const N_COLS: usize = 10;
-        const LIFTING_LOG_SIZE: u32 = 8;
-
+        const N_COLS: usize,
+        const LIFTING_LOG_SIZE: u32,
+    >(
+        memory_mode: ProverMemoryMode,
+    ) -> Result<(), VerificationError> {
         // Setup the prover side of the pcs.
         let mut channel = Blake2sChannel::default();
         let config = PcsConfig::default();
@@ -271,6 +395,7 @@ mod tests {
         if STORE_COEFFS {
             commitment_scheme.set_store_polynomials_coefficients();
         }
+        commitment_scheme.set_memory_mode(memory_mode);
         let polys = prepare_polys::<B, N_COLS, LIFTING_LOG_SIZE>();
         let sizes = polys.iter().map(|poly| poly.log_size()).collect_vec();
 
@@ -298,17 +423,41 @@ mod tests {
         verifier.verify_values(TreeVec(sampled_points), proof.proof, &mut channel)
     }
 
+    fn prove_and_verify_pcs<
+        B: BackendForChannel<Blake2sMerkleChannel>,
+        const STORE_COEFFS: bool,
+    >(
+        memory_mode: ProverMemoryMode,
+    ) -> Result<(), VerificationError> {
+        prove_and_verify_pcs_with_params::<B, STORE_COEFFS, 10, 8>(memory_mode)
+    }
+
     #[test]
     fn test_pcs_prove_and_verify_cpu() {
-        assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
+        assert!(prove_and_verify_pcs::<CpuBackend, true>(ProverMemoryMode::Fast).is_ok());
     }
     #[test]
     fn test_pcs_prove_and_verify_simd() {
-        assert!(prove_and_verify_pcs::<SimdBackend, true>().is_ok());
+        assert!(prove_and_verify_pcs::<SimdBackend, true>(ProverMemoryMode::Fast).is_ok());
     }
     #[test]
     fn test_pcs_prove_and_verify_simd_with_barycentric() {
-        assert!(prove_and_verify_pcs::<SimdBackend, false>().is_ok());
+        assert!(prove_and_verify_pcs::<SimdBackend, false>(ProverMemoryMode::Fast).is_ok());
+    }
+
+    #[test]
+    fn test_pcs_prove_and_verify_cpu_low_memory() {
+        assert!(prove_and_verify_pcs::<CpuBackend, true>(ProverMemoryMode::LowMemory).is_ok());
+    }
+
+    #[test]
+    fn test_pcs_prove_and_verify_simd_low_memory() {
+        assert!(prove_and_verify_pcs::<SimdBackend, true>(ProverMemoryMode::LowMemory).is_ok());
+    }
+
+    #[test]
+    fn test_pcs_prove_and_verify_cpu_low_memory_without_explicit_coeffs() {
+        assert!(prove_and_verify_pcs::<CpuBackend, false>(ProverMemoryMode::LowMemory).is_ok());
     }
 
     /// Tests that SIMD quotient computation produces low-degree quotients even when the trace
@@ -355,5 +504,162 @@ mod tests {
         let zeros = coeffs[0].coeffs.split_off((1 << LOG_SIZE) - 1);
 
         assert!(zeros.iter().all(|c| c.is_zero()));
+    }
+
+    fn run_manual_pcs_memory_measurement(memory_mode: ProverMemoryMode) {
+        const N_COLS: usize = 128;
+        const LIFTING_LOG_SIZE: u32 = 16;
+
+        let start = Instant::now();
+        let result = prove_and_verify_pcs_with_params::<CpuBackend, true, N_COLS, LIFTING_LOG_SIZE>(
+            memory_mode,
+        );
+        let elapsed_ms = start.elapsed().as_millis();
+        assert!(result.is_ok());
+
+        println!(
+            "manual_pcs_memory_measurement mode={memory_mode:?} n_cols={} lifting_log_size={} elapsed_ms={elapsed_ms}",
+            N_COLS,
+            LIFTING_LOG_SIZE,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual memory measurement"]
+    fn measure_pcs_memory_fast() {
+        run_manual_pcs_memory_measurement(ProverMemoryMode::Fast);
+    }
+
+    #[test]
+    #[ignore = "manual memory measurement"]
+    fn measure_pcs_memory_low_memory() {
+        run_manual_pcs_memory_measurement(ProverMemoryMode::LowMemory);
+    }
+
+    /// Tests that low-memory FRI quotient computation produces the same result as fast mode
+    /// when there are multiple commitment trees with many columns at the same log_size.
+    ///
+    /// This is a regression test for a bug where `lift_and_accumulate` received entries in
+    /// non-monotonic size order across trees, causing u32 underflow in the log_ratio calculation
+    /// and silently incorrect results in release mode.
+    #[test]
+    fn test_pcs_prove_and_verify_simd_low_memory_multi_tree_many_columns() {
+        // 20 columns per tree forces multiple batches of 8 (batch_size=8, ceil(20/8)=3 batches).
+        // With 2 trees at the same log_size, the cross-tree ordering bug is triggered.
+        const N_COLS_PER_TREE: usize = 20;
+        const LIFTING_LOG_SIZE: u32 = 8;
+
+        let mut channel_fast = Blake2sChannel::default();
+        let mut channel_low = Blake2sChannel::default();
+        let config = PcsConfig::default();
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(LIFTING_LOG_SIZE + config.fri_config.log_blowup_factor).half_coset(),
+        );
+
+        let polys_tree0: Vec<CircleCoefficients<SimdBackend>> = (0..N_COLS_PER_TREE)
+            .map(|i| {
+                CircleCoefficients::new(
+                    (0..1 << LIFTING_LOG_SIZE)
+                        .map(|j| M31::from((i * 1000 + j) as u32))
+                        .collect(),
+                )
+            })
+            .collect();
+        // Second tree: same number of columns at the same log_size
+        let polys_tree1: Vec<CircleCoefficients<SimdBackend>> = (0..N_COLS_PER_TREE)
+            .map(|i| {
+                CircleCoefficients::new(
+                    (0..1 << LIFTING_LOG_SIZE)
+                        .map(|j| M31::from((i * 2000 + j + 1) as u32))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let sample_point = SECURE_FIELD_CIRCLE_GEN.mul(12345678u128);
+        let sampled_points = TreeVec(vec![
+            (0..N_COLS_PER_TREE)
+                .map(|_| vec![sample_point])
+                .collect_vec(),
+            (0..N_COLS_PER_TREE)
+                .map(|_| vec![sample_point])
+                .collect_vec(),
+        ]);
+
+        // Fast mode.
+        let mut cs_fast =
+            CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+        cs_fast.set_store_polynomials_coefficients();
+        let mut tree_builder = cs_fast.tree_builder();
+        tree_builder.extend_polys(polys_tree0.clone());
+        tree_builder.commit(&mut channel_fast);
+        let mut tree_builder = cs_fast.tree_builder();
+        tree_builder.extend_polys(polys_tree1.clone());
+        tree_builder.commit(&mut channel_fast);
+        let fast_proof = cs_fast.prove_values(sampled_points.clone(), &mut channel_fast);
+
+        // Low-memory mode.
+        let mut cs_low =
+            CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+        cs_low.set_store_polynomials_coefficients();
+        cs_low.set_memory_mode(ProverMemoryMode::LowMemory);
+        let mut tree_builder = cs_low.tree_builder();
+        tree_builder.extend_polys(polys_tree0);
+        tree_builder.commit(&mut channel_low);
+        let mut tree_builder = cs_low.tree_builder();
+        tree_builder.extend_polys(polys_tree1);
+        tree_builder.commit(&mut channel_low);
+        let low_proof = cs_low.prove_values(sampled_points.clone(), &mut channel_low);
+
+        // Both should verify successfully.
+        let mut verifier_channel_fast = Blake2sChannel::default();
+        let mut verifier_channel_low = Blake2sChannel::default();
+        let mut verifier_fast =
+            CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        let mut verifier_low =
+            CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        let sizes: Vec<u32> = (0..N_COLS_PER_TREE)
+            .map(|_| LIFTING_LOG_SIZE)
+            .collect_vec();
+        verifier_fast.commit(
+            fast_proof.proof.commitments[0],
+            &sizes,
+            &mut verifier_channel_fast,
+        );
+        verifier_fast.commit(
+            fast_proof.proof.commitments[1],
+            &sizes,
+            &mut verifier_channel_fast,
+        );
+        verifier_low.commit(
+            low_proof.proof.commitments[0],
+            &sizes,
+            &mut verifier_channel_low,
+        );
+        verifier_low.commit(
+            low_proof.proof.commitments[1],
+            &sizes,
+            &mut verifier_channel_low,
+        );
+        assert!(
+            verifier_fast
+                .verify_values(
+                    sampled_points.clone(),
+                    fast_proof.proof,
+                    &mut verifier_channel_fast
+                )
+                .is_ok(),
+            "fast mode verification failed"
+        );
+        assert!(
+            verifier_low
+                .verify_values(
+                    sampled_points,
+                    low_proof.proof,
+                    &mut verifier_channel_low
+                )
+                .is_ok(),
+            "low-memory mode verification failed (multi-tree regression)"
+        );
     }
 }

@@ -31,7 +31,7 @@ use stwo::prover::poly::circle::{CircleEvaluation, SecureCirclePoly, SecureEvalu
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
-use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, Trace};
+use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, Trace, TraceEvalAccessPattern};
 use stwo_constraint_framework::{
     EvalAtRow, InfoEvaluator, PointEvaluator, SimdDomainEvaluator, TraceLocationAllocator,
 };
@@ -206,7 +206,7 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
         let mut component_trace = trace
             .polys
             .sub_tree(&self.trace_locations)
-            .map_cols(|c| &c.evals);
+            .map_cols(|c| c.evals());
 
         // Build auxiliary trace.
         let span = span!(Level::INFO, "Extension").entered();
@@ -281,6 +281,18 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
             );
             unsafe { acc_col.set_packed(vec_row, acc_col.packed_at(vec_row) + row_res * denom_inv) }
         }
+    }
+
+    fn trace_eval_access_pattern(&self) -> Option<TraceEvalAccessPattern> {
+        Some(TraceEvalAccessPattern {
+            tree_spans: self
+                .trace_locations
+                .iter()
+                .copied()
+                .filter(|span| span.col_start < span.col_end)
+                .collect(),
+            preprocessed_columns: vec![],
+        })
     }
 }
 

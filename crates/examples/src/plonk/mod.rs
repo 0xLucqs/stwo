@@ -15,7 +15,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::Column;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::{prove, CommitmentSchemeProver};
+use stwo::prover::{prove, CommitmentSchemeProver, ProverMemoryMode};
 use stwo_constraint_framework::logup::LookupElements;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
@@ -155,6 +155,14 @@ pub fn prove_fibonacci_plonk(
     log_n_rows: u32,
     config: PcsConfig,
 ) -> (PlonkComponent, StarkProof<Blake2sMerkleHasher>) {
+    prove_fibonacci_plonk_with_memory_mode(log_n_rows, config, ProverMemoryMode::Fast)
+}
+
+pub fn prove_fibonacci_plonk_with_memory_mode(
+    log_n_rows: u32,
+    config: PcsConfig,
+    memory_mode: ProverMemoryMode,
+) -> (PlonkComponent, StarkProof<Blake2sMerkleHasher>) {
     assert!(log_n_rows >= LOG_N_LANES);
 
     // Prepare a fibonacci circuit.
@@ -190,11 +198,12 @@ pub fn prove_fibonacci_plonk(
     let mut commitment_scheme =
         CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
+    commitment_scheme.set_memory_mode(memory_mode);
 
     // Preprocessed trace.
     let span = span!(Level::INFO, "Constant").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    let mut constant_trace = [
+    let constant_trace = [
         circuit.a_wire.clone(),
         circuit.b_wire.clone(),
         circuit.c_wire.clone(),
@@ -244,22 +253,29 @@ pub fn prove_fibonacci_plonk(
         claimed_sum,
     );
 
-    // Sanity check. Remove for production.
-    let trace_polys = commitment_scheme.trees.as_ref().map(|t| {
-        t.polynomials
-            .iter()
-            .map(|p| p.coeffs.clone().unwrap())
-            .collect_vec()
-    });
-    let component_eval = component.clone();
-    assert_constraints_on_polys(
-        &trace_polys,
-        CanonicCoset::new(log_n_rows),
-        |assert_eval| {
-            component_eval.evaluate(assert_eval);
-        },
-        claimed_sum,
-    );
+    // Sanity check. Remove for production. Skipped when coefficients have been spilled to disk.
+    let all_coeffs_resident = commitment_scheme
+        .trees
+        .0
+        .iter()
+        .all(|t| t.polynomials.iter().all(|p| p.coeffs.is_some()));
+    if all_coeffs_resident {
+        let trace_polys = commitment_scheme.trees.as_ref().map(|t| {
+            t.polynomials
+                .iter()
+                .map(|p| p.coeffs.clone().unwrap())
+                .collect_vec()
+        });
+        let component_eval = component.clone();
+        assert_constraints_on_polys(
+            &trace_polys,
+            CanonicCoset::new(log_n_rows),
+            |assert_eval| {
+                component_eval.evaluate(assert_eval);
+            },
+            claimed_sum,
+        );
+    }
 
     let proof = prove(&[&component], channel, commitment_scheme).unwrap();
 
@@ -288,15 +304,40 @@ impl Plonk {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::time::Instant;
 
     use stwo::core::air::Component;
     use stwo::core::channel::Blake2sChannel;
     use stwo::core::fri::FriConfig;
     use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
-    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use stwo::core::proof::StarkProof;
+    use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
     use stwo::core::verifier::verify;
+    use stwo::prover::ProverMemoryMode;
 
-    use crate::plonk::{prove_fibonacci_plonk, PlonkLookupElements};
+    use crate::plonk::{
+        prove_fibonacci_plonk, prove_fibonacci_plonk_with_memory_mode, PlonkComponent,
+        PlonkLookupElements,
+    };
+
+    fn verify_plonk_proof(
+        component: &PlonkComponent,
+        proof: StarkProof<Blake2sMerkleHasher>,
+        config: PcsConfig,
+    ) {
+        let channel = &mut Blake2sChannel::default();
+        let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+
+        let sizes = component.trace_log_degree_bounds();
+
+        commitment_scheme.commit(proof.commitments[0], &sizes[0], channel);
+        commitment_scheme.commit(proof.commitments[1], &sizes[1], channel);
+        let lookup_elements = PlonkLookupElements::draw(channel);
+        assert_eq!(lookup_elements, component.lookup_elements);
+        commitment_scheme.commit(proof.commitments[2], &sizes[2], channel);
+
+        verify(&[component], channel, commitment_scheme, proof).unwrap();
+    }
 
     #[test_log::test]
     fn test_simd_plonk_prove() {
@@ -314,26 +355,60 @@ mod tests {
         // Prove.
         let (component, proof) = prove_fibonacci_plonk(log_n_instances, config);
 
-        // Verify.
-        // TODO: Create Air instance independently.
-        let channel = &mut Blake2sChannel::default();
-        let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        verify_plonk_proof(&component, proof, config);
+    }
 
-        // Decommit.
-        // Retrieve the expected column sizes in each commitment interaction, from the AIR.
-        let sizes = component.trace_log_degree_bounds();
+    #[test_log::test]
+    fn test_simd_plonk_prove_low_memory() {
+        let log_n_instances = env::var("LOG_N_INSTANCES")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<u32>()
+            .unwrap();
+        let config = PcsConfig {
+            pow_bits: 10,
+            fri_config: FriConfig::new(5, 4, 64, 1),
+            lifting_log_size: None,
+        };
 
-        // Preprocessed columns.
-        commitment_scheme.commit(proof.commitments[0], &sizes[0], channel);
+        let (component, proof) = prove_fibonacci_plonk_with_memory_mode(
+            log_n_instances,
+            config,
+            ProverMemoryMode::LowMemory,
+        );
 
-        // Trace columns.
-        commitment_scheme.commit(proof.commitments[1], &sizes[1], channel);
-        // Draw lookup element.
-        let lookup_elements = PlonkLookupElements::draw(channel);
-        assert_eq!(lookup_elements, component.lookup_elements);
-        // Interaction columns.
-        commitment_scheme.commit(proof.commitments[2], &sizes[2], channel);
+        verify_plonk_proof(&component, proof, config);
+    }
 
-        verify(&[&component], channel, commitment_scheme, proof).unwrap();
+    fn run_manual_plonk_memory_measurement(memory_mode: ProverMemoryMode) {
+        const LOG_N_ROWS: u32 = 12;
+
+        let config = PcsConfig {
+            pow_bits: 10,
+            fri_config: FriConfig::new(5, 4, 64, 1),
+            lifting_log_size: None,
+        };
+        let start = Instant::now();
+        let (component, proof) =
+            prove_fibonacci_plonk_with_memory_mode(LOG_N_ROWS, config, memory_mode);
+        let elapsed_ms = start.elapsed().as_millis();
+
+        verify_plonk_proof(&component, proof, config);
+
+        println!(
+            "manual_plonk_memory_measurement mode={memory_mode:?} log_n_rows={} elapsed_ms={elapsed_ms}",
+            LOG_N_ROWS,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual memory measurement"]
+    fn measure_plonk_memory_fast() {
+        run_manual_plonk_memory_measurement(ProverMemoryMode::Fast);
+    }
+
+    #[test]
+    #[ignore = "manual memory measurement"]
+    fn measure_plonk_memory_low_memory() {
+        run_manual_plonk_memory_measurement(ProverMemoryMode::LowMemory);
     }
 }

@@ -17,6 +17,23 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Builds the first internal Merkle layer directly from columns without materializing the full
+    /// leaf hash array. Returns a layer of `2^(lifting_log_size - 1)` hashes.
+    ///
+    /// `columns` must be non-empty and sorted in increasing order by length.
+    /// `lifting_log_size` must be greater than zero.
+    ///
+    /// The default implementation materializes the full leaf layer (2^lifting_log_size hashes)
+    /// then builds the next layer. Backends may override with a streaming implementation that
+    /// avoids the leaf layer allocation, reducing peak memory by up to 4 GiB for large trees.
+    fn build_first_layer_above_leaves(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+    ) -> Col<Self, H::Hash> {
+        let leaves = Self::build_leaves(columns, lifting_log_size);
+        Self::build_next_layer(&leaves)
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {

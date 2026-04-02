@@ -222,6 +222,214 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         res
     }
 
+    /// Memory-efficient version of `build_leaves` + `build_next_layer`.
+    ///
+    /// The standard path allocates:
+    ///  - `buf` (lifted SIMD states):  `2^lifting_log_size_packed × 512 B` (up to 4 GiB)
+    ///  - `res` (leaf hashes):         `2^lifting_log_size × 32 B`          (up to 4 GiB)
+    ///  - `next_layer` (output):        `2^(lifting_log_size-1) × 32 B`     (up to 2 GiB)
+    ///
+    /// This implementation avoids `buf` and `res` entirely and only allocates the
+    /// `next_layer` output (2 GiB), reducing peak memory by up to 6 GiB.
+    ///
+    /// Correctness: for each pair of leaf-state indices `(2k, 2k+1)`, we finalize
+    /// both states to obtain 32 consecutive leaf hashes, then apply the SIMD
+    /// `build_next_layer` logic (compress 32 hashes → 16 hashes) to produce the
+    /// next-layer chunk `next[16k..16k+16]`.
+    #[allow(clippy::uninit_vec)]
+    fn build_first_layer_above_leaves(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+    ) -> Col<Self, Blake2sHash> {
+        // Fall back to default (build_leaves + build_next_layer) for small or edge cases.
+        // The SIMD optimisation only makes sense for large trees where buf/res are expensive.
+        if columns.is_empty() || lifting_log_size <= LOG_N_LANES {
+            let leaves = <SimdBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
+            >>::build_leaves(columns, lifting_log_size);
+            return <SimdBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
+            >>::build_next_layer(&leaves);
+        }
+        if columns.first().unwrap().len() < N_LANES {
+            let cpu_cols = columns.iter().map(|c| c.to_cpu()).collect_vec();
+            let leaves = <CpuBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
+            >>::build_leaves(&cpu_cols.iter().collect_vec(), lifting_log_size);
+            return <CpuBackend as MerkleOpsLifted<
+                Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
+            >>::build_next_layer(&leaves);
+        }
+
+        // ── Phase 1: compute SIMD states ────────────────────────────────────────────
+        // Identical to the first part of `build_leaves`.
+        let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
+        let mut prev_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
+            unsafe { uninit_vec(1 << max_log_size) };
+        let mut next_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
+            unsafe { uninit_vec(1 << max_log_size) };
+
+        #[cfg(not(feature = "parallel"))]
+        prev_layer_states.fill(INITIAL_STATE);
+        #[cfg(feature = "parallel")]
+        prev_layer_states
+            .par_iter_mut()
+            .for_each(|uninit| *uninit = INITIAL_STATE);
+
+        let last_chunk_index =
+            (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
+        let lifting_indices =
+            get_lifting_indices(columns.iter().map(|c| c.data.len()), last_chunk_index);
+        let mut byte_count = 0_u64;
+        let mut prev_chunk_max_log_size = 0;
+
+        for (start, end) in lifting_indices.into_iter().tuple_windows() {
+            let chunk_max_log_size: u32 = columns[end - 1].data.len().ilog2();
+            let next_layer_state_slice = &mut next_layer_states[0..1 << chunk_max_log_size];
+            let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
+            #[cfg(not(feature = "parallel"))]
+            let iter_states = next_layer_state_slice.iter_mut();
+            #[cfg(feature = "parallel")]
+            let iter_states = next_layer_state_slice.par_iter_mut();
+
+            iter_states.enumerate().for_each(|(i, state)| {
+                let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
+                let prev_state = std::array::from_fn(|j| {
+                    let prev_state_limb = prev_layer_states[i >> log_ratio][j];
+                    to_lifted_simd(prev_state_limb, log_ratio, i)
+                });
+                let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                    let column = columns[start + j];
+                    let log_size = column.data.len().ilog2();
+                    let log_ratio = chunk_max_log_size - log_size;
+                    to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
+                });
+                *state = compress_unfinalized(prev_state, msgs, local_byte_count);
+                for chunk_columns in
+                    &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
+                {
+                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
+                        std::array::from_fn(|j| chunk_columns[j].data[i].into_simd());
+                    local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+                    *state = compress_unfinalized(*state, msgs, local_byte_count);
+                }
+            });
+            byte_count += 4 * (end - start) as u64;
+            std::mem::swap(&mut prev_layer_states, &mut next_layer_states);
+            prev_chunk_max_log_size = chunk_max_log_size;
+        }
+
+        // Last chunk (uses compress_finalize instead of compress_unfinalized).
+        let chunk_max_log_size: u32 = max_log_size;
+        let next_layer_state_slice = &mut next_layer_states[0..1 << chunk_max_log_size];
+        let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
+        #[cfg(not(feature = "parallel"))]
+        let iter_states = next_layer_state_slice.iter_mut();
+        #[cfg(feature = "parallel")]
+        let iter_states = next_layer_state_slice.par_iter_mut();
+        byte_count += ((columns.len() - last_chunk_index) * N_BYTES_FELT) as u64;
+        iter_states.enumerate().for_each(|(i, state)| {
+            let prev_state = std::array::from_fn(|j| {
+                let prev_state_limb = prev_layer_states[i >> log_ratio][j];
+                to_lifted_simd(prev_state_limb, log_ratio, i)
+            });
+            let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
+            for (j, column) in columns[last_chunk_index..].iter().enumerate() {
+                let log_size = column.data.len().ilog2();
+                let log_ratio = chunk_max_log_size - log_size;
+                msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
+            }
+            *state = compress_finalize(prev_state, msgs, byte_count);
+        });
+
+        // Free prev_layer_states before allocating the output.
+        drop(prev_layer_states);
+
+        // ── Phase 2: compute next-layer hashes from pairs of leaf states ─────────────
+        //
+        // In build_leaves, next_layer_states[i] (after lifting to lifting_log_size_packed)
+        // would produce leaf hashes leaf[16i..16i+16].  build_next_layer groups pairs:
+        //   (state[2k], state[2k+1]) → next[16k..16k+16]
+        //
+        // We inline that computation here to avoid materialising the 4 GiB leaf layer.
+        // The key identity (verified below):
+        //   msgs[j] = untransposed_even[j]   for j < 8
+        //   msgs[j] = untransposed_odd[j-8]  for j >= 8
+        // is equivalent to concatenating the two groups of 16 leaf hashes and casting
+        // to the u32x16 message format expected by build_next_layer's compress_finalize.
+        let lifting_log_size_packed = lifting_log_size - LOG_N_LANES;
+        let lift_ratio = lifting_log_size_packed - max_log_size; // 0 when no extra lifting needed
+
+        // Output: 2^(lifting_log_size - 1) hashes.  Each iteration produces 16.
+        let n_output_chunks = 1usize << (lifting_log_size_packed - 1);
+        // Safety: all entries are written before being read.
+        let mut res: Vec<Blake2sHash> =
+            unsafe { uninit_vec(n_output_chunks << LOG_N_HASHES_PER_SIMD_STATE) };
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = res.chunks_mut(1 << LOG_N_HASHES_PER_SIMD_STATE);
+        #[cfg(feature = "parallel")]
+        let iter = res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE);
+
+        iter.enumerate().for_each(|(k, dst)| {
+            // State indices in the lifted domain: 2k (even) and 2k+1 (odd).
+            let i_even = 2 * k;
+            let i_odd = 2 * k + 1;
+
+            // Look up the base state and apply the lifting swizzle.
+            let lifted_even: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let base = next_layer_states[i_even >> lift_ratio];
+                std::array::from_fn(|j| to_lifted_simd(base[j], lift_ratio, i_even))
+            };
+            let lifted_odd: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let base = next_layer_states[i_odd >> lift_ratio];
+                std::array::from_fn(|j| to_lifted_simd(base[j], lift_ratio, i_odd))
+            };
+
+            // Untranspose each lifted state to produce the per-lane hash words.
+            // Optionally reduce mod M31 when IS_M31_OUTPUT is true — this matches what
+            // build_leaves does before feeding hashes into build_next_layer.
+            let u_even: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let mut u = untranspose_states(lifted_even);
+                if IS_M31_OUTPUT {
+                    u = std::array::from_fn(|i| reduce_to_m31_simd(u[i]));
+                }
+                u
+            };
+            let u_odd: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let mut u = untranspose_states(lifted_odd);
+                if IS_M31_OUTPUT {
+                    u = std::array::from_fn(|i| reduce_to_m31_simd(u[i]));
+                }
+                u
+            };
+
+            // Construct the 16-vector message from the two groups of leaf hash words.
+            // In memory, u_even represents leaf hashes [16*i_even .. 16*i_even + 16] and
+            // u_odd represents [16*i_odd .. 16*i_odd + 16].  These 32 consecutive hashes
+            // form the input chunk for one step of build_next_layer.
+            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = array::from_fn(|j| {
+                if j < N_FELTS_IN_BLAKE_STATE {
+                    u_even[j]
+                } else {
+                    u_odd[j - N_FELTS_IN_BLAKE_STATE]
+                }
+            });
+
+            // Hash the 32 leaf hashes into 16 next-layer hashes (same as build_next_layer).
+            let state =
+                compress_finalize(INITIAL_STATE, transpose_msgs(msgs), N_BYTES_IN_BLAKE_MESSAGE);
+            let mut untransposed = untranspose_states(state);
+            if IS_M31_OUTPUT {
+                untransposed = std::array::from_fn(|i| reduce_to_m31_simd(untransposed[i]));
+            }
+            let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
+            *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
+        });
+
+        res
+    }
+
     #[allow(clippy::uninit_vec)]
     fn build_next_layer(prev_layer: &Vec<Blake2sHash>) -> Vec<Blake2sHash> {
         // The log size of the current layer that needs to be built.
@@ -444,6 +652,85 @@ mod tests {
                     log_size
                 )
             );
+        }
+    }
+
+    /// Verifies that `build_first_layer_above_leaves` produces the same result as calling
+    /// `build_leaves` followed by `build_next_layer`.  Tests both IS_M31_OUTPUT variants and
+    /// cases with and without the lifting expansion (lifting_log_size > max_column_log_size).
+    #[test]
+    fn test_build_first_layer_above_leaves_matches_default() {
+        const MAX_LOG_N_ROWS: u32 = 9;
+        const N_COLS: u32 = 50;
+
+        let mut cols_cpu: Vec<Vec<BaseField>> = (0..N_COLS)
+            .map(|i| {
+                (0..1 << MAX_LOG_N_ROWS)
+                    .map(|j| M31::from(100 * i + j))
+                    .collect_vec()
+            })
+            .collect();
+
+        // Add smaller columns to exercise the lifting logic.
+        cols_cpu[0] = (0..1 << (MAX_LOG_N_ROWS - 3))
+            .map(M31::from_u32_unchecked)
+            .collect_vec();
+        cols_cpu[1] = (0..1 << (MAX_LOG_N_ROWS - 1))
+            .map(M31::from_u32_unchecked)
+            .collect_vec();
+
+        let cols_simd: Vec<BaseColumn> =
+            cols_cpu.iter().map(|c| BaseColumn::from_cpu(c)).collect();
+
+        // Sort by length (ascending) as required by the trait contract.
+        let mut sorted_cpu = cols_cpu.iter().collect_vec();
+        sorted_cpu.sort_by_key(|c| c.len());
+        let mut sorted_simd: Vec<&BaseColumn> = cols_simd.iter().collect();
+        sorted_simd.sort_by_key(|c| c.len());
+
+        // Test with IS_M31_OUTPUT = false (standard Blake2s).
+        {
+            type H = Blake2sMerkleHasher;
+            let lifting_log_size = MAX_LOG_N_ROWS + 2; // extra lifting
+            let leaves =
+                <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
+            let expected =
+                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
+                &sorted_simd,
+                lifting_log_size,
+            );
+            assert_eq!(expected, actual, "IS_M31_OUTPUT=false with extra lifting");
+        }
+
+        // Test with IS_M31_OUTPUT = true (M31-reduced Blake2s).
+        {
+            type H = Blake2sMerkleHasherGeneric<true>;
+            let lifting_log_size = MAX_LOG_N_ROWS; // no extra lifting
+            let leaves =
+                <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
+            let expected =
+                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
+                &sorted_simd,
+                lifting_log_size,
+            );
+            assert_eq!(expected, actual, "IS_M31_OUTPUT=true, no extra lifting");
+        }
+
+        // Test with IS_M31_OUTPUT = true and extra lifting.
+        {
+            type H = Blake2sMerkleHasherGeneric<true>;
+            let lifting_log_size = MAX_LOG_N_ROWS + 3; // extra lifting
+            let leaves =
+                <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
+            let expected =
+                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
+                &sorted_simd,
+                lifting_log_size,
+            );
+            assert_eq!(expected, actual, "IS_M31_OUTPUT=true, extra lifting");
         }
     }
 }
