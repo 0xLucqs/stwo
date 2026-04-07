@@ -18,8 +18,8 @@ pub use air::{AccumulationOps, ColumnAccumulator, DomainEvaluationAccumulator, E
 pub mod pcs;
 pub use pcs::quotient_ops::QuotientOps;
 pub use pcs::{
-    set_default_prover_memory_mode, CommitmentSchemeProver, CommitmentTreeProver, ProverMemoryMode,
-    TreeBuilder,
+    set_default_prover_memory_mode, set_low_memory_materialize_budget_bytes,
+    CommitmentSchemeProver, CommitmentTreeProver, ProverMemoryMode, TreeBuilder,
 };
 pub mod backend;
 pub mod channel;

@@ -174,24 +174,19 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         // For the standard trace-tree path (log_rows_per_leaf == 0, non-empty columns, height > 0)
         // use `build_first_layer_above_leaves` which avoids materialising the full leaf hash
         // layer.  This can save up to 6 GiB of peak anonymous memory for lifting_log_size = 27.
-        let (mut current_layer, mut current_log_size) = if log_rows_per_leaf == 0
-            && lifting_log_size > 0
-            && !columns.is_empty()
-        {
-            let sorted_columns = columns
-                .into_iter()
-                .sorted_by_key(|c| c.len())
-                .collect_vec();
-            (
-                B::build_first_layer_above_leaves(&sorted_columns, lifting_log_size),
-                lifting_log_size - 1,
-            )
-        } else {
-            (
-                build_leaf_layer::<B, H>(columns, lifting_log_size, log_rows_per_leaf),
-                lifting_log_size,
-            )
-        };
+        let (mut current_layer, mut current_log_size) =
+            if log_rows_per_leaf == 0 && lifting_log_size > 0 && !columns.is_empty() {
+                let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
+                (
+                    B::build_first_layer_above_leaves(&sorted_columns, lifting_log_size),
+                    lifting_log_size - 1,
+                )
+            } else {
+                (
+                    build_leaf_layer::<B, H>(columns, lifting_log_size, log_rows_per_leaf),
+                    lifting_log_size,
+                )
+            };
 
         while current_log_size > 0 {
             let next_layer = B::build_next_layer(&current_layer);

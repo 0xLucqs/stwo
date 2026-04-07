@@ -48,10 +48,18 @@ pub fn spill_twiddles_to_mmap(
             // try to dealloc mmap memory (UB). The MmapVec handles munmap on guard drop.
             // SAFETY: MmapVec data is valid for reads. The guard outlives the tree.
             tree.twiddles = unsafe {
-                Vec::from_raw_parts(fwd_mmap.as_ptr() as *mut u32, fwd_mmap.len(), fwd_mmap.len())
+                Vec::from_raw_parts(
+                    fwd_mmap.as_ptr() as *mut u32,
+                    fwd_mmap.len(),
+                    fwd_mmap.len(),
+                )
             };
             tree.itwiddles = unsafe {
-                Vec::from_raw_parts(inv_mmap.as_ptr() as *mut u32, inv_mmap.len(), inv_mmap.len())
+                Vec::from_raw_parts(
+                    inv_mmap.as_ptr() as *mut u32,
+                    inv_mmap.len(),
+                    inv_mmap.len(),
+                )
             };
             Some(TwiddleMmapGuard {
                 _fwd: fwd_mmap,
@@ -67,9 +75,7 @@ pub fn spill_twiddles_to_mmap(
 
 /// Must be called before dropping a TwiddleTree whose twiddles were spilled.
 /// Replaces the mmap-backed Vecs with empty Vecs so their Drop doesn't dealloc mmap memory.
-pub fn unspill_twiddles(
-    tree: &mut TwiddleTree<crate::prover::backend::simd::SimdBackend>,
-) {
+pub fn unspill_twiddles(tree: &mut TwiddleTree<crate::prover::backend::simd::SimdBackend>) {
     // Replace with empty Vecs. The old Vecs point to mmap memory — forgetting them
     // prevents Vec::drop from calling dealloc on the mmap addresses.
     let old_fwd = std::mem::take(&mut tree.twiddles);

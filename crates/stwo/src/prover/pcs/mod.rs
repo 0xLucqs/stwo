@@ -96,6 +96,91 @@ pub enum ProverMemoryMode {
 
 const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 
+/// Default budget (in bytes) for heap-backed evaluation memory used during
+/// [`ProverMemoryMode::LowMemory`] re-materialization (composition polynomial generation and
+/// decommit).
+///
+/// [`CommitmentTreeProver::materialize_evaluations_low_memory`] accumulates newly-materialized
+/// evaluation columns in anonymous heap memory up to this budget before flushing the batch to
+/// file-backed mmap. The final partial batch is left heap-backed, so if the entire
+/// re-materialized set fits in this budget, no spilling happens at all and the function is
+/// effectively equivalent to the eager `materialize_evaluations` path.
+///
+/// Raising this budget trades RAM for wall-clock: each mmap flush costs a file write, a
+/// sync, and a mmap call (tens of ms per column on mobile flash). A 1 GiB default lets the
+/// typical phone workload complete with zero spills during the tail phase when the initial
+/// commit spike has already been released. Devices with less than ~2 GiB of app budget should
+/// override via [`set_low_memory_materialize_budget_bytes`] or
+/// `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`.
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 1 << 30;
+
+/// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
+const LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV: &str = "STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES";
+
+/// Process-wide override for the re-materialization heap budget.
+///
+/// Uses `0` as the "unset" sentinel because a 0-byte budget is semantically meaningless for
+/// this knob and would degenerate to per-poly spilling (which is exactly what the pre-budget
+/// behavior was — a caller who wants that can set it to `1` explicitly).
+static LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets a process-wide override for the [`ProverMemoryMode::LowMemory`] re-materialization
+/// heap budget in bytes.
+///
+/// This takes precedence over the `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES` environment
+/// variable and is intended for embedded targets (iOS) where shell env vars do not propagate
+/// into the app process. Call this once at startup, before the first
+/// [`CommitmentSchemeProver::prove_values`] invocation:
+///
+/// ```ignore
+/// // 1.5 GiB budget on a phone with ~2 GiB of app headroom.
+/// stwo::prover::set_low_memory_materialize_budget_bytes(1_500 * 1024 * 1024);
+/// ```
+///
+/// Passing `0` clears the override and returns control to the env var / default. Any other
+/// positive value wins unconditionally.
+pub fn set_low_memory_materialize_budget_bytes(bytes: usize) {
+    LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Release);
+    tracing::info!(bytes, "stwo low-memory materialize budget override set");
+}
+
+/// Parses the re-materialization budget from a raw env var value (decimal bytes).
+///
+/// Returns `None` for empty, non-numeric, zero, or negative inputs. `0` is rejected at this
+/// layer so it cannot be mistaken for "disable batching entirely".
+fn parse_low_memory_materialize_budget_bytes(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|&b| b > 0)
+}
+
+/// Resolves the active re-materialization budget in bytes.
+///
+/// Resolution order (first match wins): programmatic override →
+/// `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES` env var →
+/// [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
+fn low_memory_materialize_budget_bytes() -> usize {
+    let override_val =
+        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+    if override_val > 0 {
+        return override_val;
+    }
+    match std::env::var(LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV) {
+        Ok(raw) => match parse_low_memory_materialize_budget_bytes(&raw) {
+            Some(b) => b,
+            None => {
+                tracing::warn!(
+                    env_var = LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV,
+                    env_value = raw.as_str(),
+                    default_bytes = DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+                    "Invalid re-materialize budget, using default"
+                );
+                DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES
+            }
+        },
+        Err(_) => DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+    }
+}
+
 /// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: no override set.
 const PROVER_MEMORY_MODE_OVERRIDE_UNSET: u8 = 0;
 /// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: pin to
@@ -848,7 +933,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             // SAFETY: This is only called when B = SimdBackend (the only backend that
             // implements BackendForChannel). The cast is sound because Poly<B> and
             // Poly<SimdBackend> have identical layout when B = SimdBackend.
-            if let Some(guard) = unsafe { crate::prover::spill::spill_eval_columns(&mut *polys_ptr) } {
+            if let Some(guard) =
+                unsafe { crate::prover::spill::spill_eval_columns(&mut *polys_ptr) }
+            {
                 eval_mmap_guards.push(guard);
             }
             phase_memory_checkpoint("pcs:tree:new:after_eval_mmap_spill");
@@ -1021,59 +1108,115 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
 
     /// `LowMemory`-aware variant of [`Self::materialize_evaluations`].
     ///
-    /// Materializes each polynomial's evaluation into a fresh heap buffer, then **immediately**
-    /// spills that single polynomial to file-backed mmap before moving on to the next. The peak
-    /// anonymous heap during the loop is therefore bounded by the size of one column plus the
-    /// FFT working set, instead of the cumulative size of every re-materialized eval (which is
-    /// what the eager `materialize_evaluations` produces and what causes the multi-hundred-MB
-    /// spike on memory-constrained devices).
+    /// Materializes polynomial evaluations in heap-backed buffers up to a configurable
+    /// byte budget (see [`low_memory_materialize_budget_bytes`]), then flushes each full
+    /// batch to file-backed mmap. The final partial batch is left heap-backed: if the entire
+    /// set of re-materialized evals fits within the budget, **no spilling occurs at all** and
+    /// this function is effectively the eager `materialize_evaluations` path with one extra
+    /// atomic load.
+    ///
+    /// This lets callers with generous memory budgets (e.g. phones with 1-2 GiB of headroom
+    /// during the decommit tail phase) trade RAM for wall-clock: each mmap flush costs a
+    /// file write, a sync, and a mmap call, which adds up to seconds of wall-clock on
+    /// mobile flash for a full privacy-demo-size trace. Defaulting the budget to 1 GiB
+    /// eliminates the spill overhead during the tail phase on phones that can afford it,
+    /// while still bounding the spike for memory-constrained devices that override the
+    /// budget down.
     ///
     /// The mmap [`crate::prover::spill::EvalMmapGuard`]s are appended to
-    /// [`Self::eval_mmap_guards`] so they live as long as the polynomials they back. Callers
-    /// MUST go through [`Self::drop_evaluations`] (or [`Self::release_evaluations`]) to release
-    /// the polynomials, since both helpers know how to forget mmap-backed Vecs before dropping
-    /// them.
+    /// [`Self::eval_mmap_guards`] so they live as long as the polynomials they back.
+    /// Callers MUST go through [`Self::drop_evaluations`] (or [`Self::release_evaluations`])
+    /// to release the polynomials, since both helpers know how to forget mmap-backed Vecs
+    /// before dropping them.
     ///
-    /// Safe for `B = SimdBackend` only — see [`Self::forget_mmap_backed_evals_if_any`] for the
-    /// reasoning. Non-Simd backends should fall back to the eager `materialize_evaluations`.
+    /// Safe for `B = SimdBackend` only — see [`Self::forget_mmap_backed_evals_if_any`] for
+    /// the reasoning. Non-Simd backends should fall back to the eager
+    /// `materialize_evaluations`.
     fn materialize_evaluations_low_memory(
         &mut self,
         twiddles: &TwiddleTree<B>,
         base_column_pool: &BaseColumnPool<B>,
     ) {
+        let budget_bytes = low_memory_materialize_budget_bytes();
         let total = self.polynomials.len();
+        // Accumulated bytes of newly-materialized (heap-backed) polys in the current batch,
+        // plus the half-open index range the batch spans. `pending_start` is `None` when no
+        // batch is open; `pending_end` is only read when `pending_start` is `Some`.
+        let mut pending_bytes = 0usize;
+        let mut pending_start: Option<usize> = None;
+        let mut pending_end: usize = 0;
+
         for idx in 0..total {
             if self.polynomials[idx].evals.is_some() {
+                // Pre-existing eval (heap- or mmap-backed from a prior call). Flush any
+                // newly-materialized pending batch *before* it, then leave this poly alone.
+                // Re-spilling an already-mmap-backed Vec would UB inside
+                // `spill_eval_columns`, so we must never include a pre-existing poly in a
+                // spill range.
+                if let Some(start) = pending_start.take() {
+                    self.spill_newly_materialized_range(start, pending_end);
+                    pending_bytes = 0;
+                }
                 continue;
             }
-            // Materialize a single polynomial. Its evals Vec is heap-backed at this point.
+
+            // Materialize this polynomial's evaluation into a fresh heap buffer.
             let evals = self.polynomials[idx].materialize_evaluation(twiddles, base_column_pool);
+            // Approximate heap-backed byte count as `len * sizeof(BaseField)`. The actual
+            // SIMD allocation is slightly larger due to packed lane alignment, but this is
+            // within a few percent and is fine for a coarse-grained budget threshold.
+            let bytes = evals.values.len() * std::mem::size_of::<BaseField>();
             self.polynomials[idx].evals = Some(evals);
 
-            // Immediately spill this single poly to file-backed mmap. After this call the
-            // BaseColumn's data Vec points at mmap memory and the original heap allocation
-            // has been freed; the next loop iteration starts again at ~0 anonymous bytes for
-            // the eval working set.
-            //
-            // SAFETY: spill_eval_columns expects `&mut [Poly<SimdBackend>]`. The cast is sound
-            // when `B = SimdBackend`, which is the only backend that runs the `LowMemory`
-            // re-materialization path. Same precondition as
-            // `Self::forget_mmap_backed_evals_if_any` and the existing cast in
-            // `Self::new_with_memory_mode`.
-            let single_simd: &mut [Poly<crate::prover::backend::simd::SimdBackend>] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (&mut self.polynomials[idx] as *mut Poly<B>)
-                        as *mut Poly<crate::prover::backend::simd::SimdBackend>,
-                    1,
-                )
-            };
-            if let Some(mut guard) = crate::prover::spill::spill_eval_columns(single_simd) {
-                // Translate the per-call slice-relative index (always 0) into the absolute
-                // index within `self.polynomials`, so the guard's bookkeeping points at the
-                // right poly when `forget_mmap_backed_evals` runs in `drop_evaluations`.
-                guard.offset_indices(idx);
-                self.eval_mmap_guards.push(guard);
+            if pending_start.is_none() {
+                pending_start = Some(idx);
             }
+            pending_end = idx + 1;
+            pending_bytes += bytes;
+
+            if pending_bytes >= budget_bytes {
+                // Flush the full batch: all polys in [pending_start..pending_end) are
+                // contiguous and were just materialized in this loop (heap-backed), so
+                // spilling them is safe.
+                let start = pending_start.take().unwrap();
+                self.spill_newly_materialized_range(start, pending_end);
+                pending_bytes = 0;
+            }
+        }
+
+        // The final partial batch is left heap-backed on purpose: if it fits in the budget,
+        // spilling it would incur disk I/O for no benefit and would force every subsequent
+        // read to fault through the page cache. It will be released normally by
+        // `drop_evaluations` or `release_evaluations` at the end of the current PCS phase.
+    }
+
+    /// Spills a contiguous range of **newly-materialized, heap-backed** polynomials
+    /// `[start..end)` to file-backed mmap.
+    ///
+    /// Precondition: every poly in the range whose `evals.is_some()` must be heap-backed
+    /// (not already mmap-backed from a prior call). Re-spilling an mmap-backed Vec would
+    /// drop the old mmap region through the global allocator and crash.
+    /// [`Self::materialize_evaluations_low_memory`] maintains this invariant by flushing
+    /// any pending batch before stepping over a pre-existing poly.
+    fn spill_newly_materialized_range(&mut self, start: usize, end: usize) {
+        debug_assert!(end > start, "empty spill range");
+        // SAFETY: cast from `&mut [Poly<B>]` to `&mut [Poly<SimdBackend>]` is sound when
+        // `B = SimdBackend`, the only backend that runs the LowMemory re-materialization
+        // path. Same precondition as `Self::forget_mmap_backed_evals_if_any` and the
+        // existing cast in `Self::new_with_memory_mode`.
+        let slice: &mut [Poly<crate::prover::backend::simd::SimdBackend>] = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut self.polynomials[start] as *mut Poly<B>)
+                    as *mut Poly<crate::prover::backend::simd::SimdBackend>,
+                end - start,
+            )
+        };
+        if let Some(mut guard) = crate::prover::spill::spill_eval_columns(slice) {
+            // `spill_eval_columns` stores indices relative to the start of its input slice;
+            // translate them back to absolute positions in `self.polynomials` so the guard
+            // lines up with the eventual `forget_mmap_backed_evals` call.
+            guard.offset_indices(start);
+            self.eval_mmap_guards.push(guard);
         }
     }
 
@@ -1292,9 +1435,11 @@ mod tests {
     use itertools::Itertools;
 
     use super::{
-        default_prover_memory_mode, parse_prover_memory_mode, set_default_prover_memory_mode,
-        CommitmentTreeMerkleProver, CommitmentTreeProver, ProverMemoryMode,
-        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE, PROVER_MEMORY_MODE_OVERRIDE_FAST,
+        default_prover_memory_mode, parse_low_memory_materialize_budget_bytes,
+        parse_prover_memory_mode, set_default_prover_memory_mode,
+        set_low_memory_materialize_budget_bytes, CommitmentTreeMerkleProver, CommitmentTreeProver,
+        ProverMemoryMode, DEFAULT_PROVER_MEMORY_MODE_OVERRIDE,
+        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE, PROVER_MEMORY_MODE_OVERRIDE_FAST,
         PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY, PROVER_MEMORY_MODE_OVERRIDE_UNSET,
     };
     use crate::core::channel::MerkleChannel;
@@ -1467,16 +1612,26 @@ mod tests {
     /// Verifies the `LowMemory` per-poly materialize-and-spill round-trip.
     ///
     /// 1. After construction the SIMD `LowMemory` tree has dropped its evals (precondition).
-    /// 2. `materialize_evaluations_low_memory` repopulates every poly's evals; the resulting tree
-    ///    must hold one mmap guard per polynomial.
+    /// 2. `materialize_evaluations_low_memory` repopulates every poly's evals; with a budget of 1
+    ///    byte the function spills after every column, so the resulting tree must hold at least one
+    ///    mmap guard (and in practice one per polynomial, though the exact count is an
+    ///    implementation detail).
     /// 3. The mmap-backed eval values must equal the values produced by the eager
     ///    `materialize_evaluations` path on a freshly constructed sibling tree, which transitively
     ///    asserts that the spill round-trip preserves bytes.
     /// 4. `drop_evaluations` must clear both the polys' evals and the guard list without crashing
     ///    on `Vec::drop` of mmap-backed memory — this is the regression that breaks if
     ///    [`CommitmentTreeProver::forget_mmap_backed_evals_if_any`] is wired incorrectly.
-    #[test]
-    fn test_simd_low_memory_materialize_round_trip() {
+    ///
+    /// Called as a sub-scenario from [`test_materialize_low_memory_budget_and_round_trip`]
+    /// so that all budget-override-touching logic is serialized behind a single `#[test]`
+    /// entry point — two concurrent `#[test]` functions both mutating
+    /// [`LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE`] would race on save/restore and
+    /// corrupt each other's expected budget.
+    fn run_simd_low_memory_materialize_round_trip_scenario() {
+        // Force the smallest meaningful budget so the spill code path is exercised.
+        // The caller is responsible for save/restore around this whole sub-scenario.
+        set_low_memory_materialize_budget_bytes(1);
         // Twiddle precomputation is shared between the two trees so the materialized values
         // are byte-identical.
         let pool = BaseColumnPool::<SimdBackend>::new();
@@ -1541,6 +1696,134 @@ mod tests {
 
         // Cleanup of the eager tree (heap-backed) must also work via the same drop helper.
         eager_tree.drop_evaluations();
+    }
+
+    /// Single entry point for every test that mutates the global
+    /// [`LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE`]. Bundling them under one `#[test]`
+    /// serializes them within this function so that no two scenarios ever race on
+    /// save/restore (which would cause one scenario's restore to stomp on another's
+    /// expected budget). Exercises:
+    ///
+    /// - **Round-trip correctness** at `budget = 1`: every poly spills, mmap-backed evals must
+    ///   match the eager path byte-for-byte, `drop_evaluations`/`release_evaluations` must release
+    ///   mmap pages cleanly.
+    /// - **Huge budget**: the entire re-materialized set fits in the budget, so no spilling happens
+    ///   at all. `eval_mmap_guards` must remain empty and every poly must have a heap-backed eval
+    ///   after the call — this is the fast path that makes the tail phase of a mobile proof fast
+    ///   when the device has headroom.
+    /// - **Tiny budget (1 byte)**: every poly exceeds the budget, so every single poly is spilled
+    ///   immediately. Mirrors the pre-budget behavior.
+    /// - **Medium budget**: budget smaller than one poly's eval bytes, so every materialize step
+    ///   crosses the flush threshold. Validates the batching path end-to-end and that guards are
+    ///   produced.
+    ///
+    /// The budget override is saved once at the top and restored once at the bottom.
+    #[test]
+    fn test_materialize_low_memory_budget_and_round_trip() {
+        let prev_budget =
+            LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+
+        // Scenario 0: round-trip correctness with budget=1 (see
+        // `run_simd_low_memory_materialize_round_trip_scenario` for the detailed contract).
+        run_simd_low_memory_materialize_round_trip_scenario();
+
+        let pool = BaseColumnPool::<SimdBackend>::new();
+        let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
+
+        // ---- Scenario 1: huge budget → no spill, everything heap-backed ---------------
+        set_low_memory_materialize_budget_bytes(1usize << 30); // 1 GiB — far exceeds test data
+        let mut huge_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        assert!(
+            huge_budget_tree
+                .polynomials
+                .iter()
+                .all(|p| p.evals.is_none()),
+            "precondition: LowMemory construction drops evals"
+        );
+        huge_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        assert!(
+            huge_budget_tree
+                .polynomials
+                .iter()
+                .all(|p| p.evals.is_some()),
+            "every poly must have evals after materialize_evaluations_low_memory"
+        );
+        assert!(
+            huge_budget_tree.eval_mmap_guards.is_empty(),
+            "huge budget must not spill: eval_mmap_guards must be empty, but had {} \
+             guards. Re-materialization is paying the disk-I/O cost unnecessarily.",
+            huge_budget_tree.eval_mmap_guards.len()
+        );
+        // drop_evaluations must still work when there are no guards.
+        huge_budget_tree.drop_evaluations();
+        assert!(huge_budget_tree
+            .polynomials
+            .iter()
+            .all(|p| p.evals.is_none()));
+
+        // ---- Scenario 2: tiny budget → spill every poly ------------------------------
+        set_low_memory_materialize_budget_bytes(1);
+        let mut tiny_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        tiny_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        assert!(
+            tiny_budget_tree
+                .polynomials
+                .iter()
+                .all(|p| p.evals.is_some()),
+            "every poly must have evals after materialize_evaluations_low_memory"
+        );
+        assert!(
+            !tiny_budget_tree.eval_mmap_guards.is_empty(),
+            "tiny budget must spill at least once"
+        );
+        tiny_budget_tree.drop_evaluations();
+
+        // ---- Scenario 3: medium budget → at least one spill + a final heap-backed ----
+        // Size the budget to be *smaller* than one polynomial's eval bytes, guaranteeing
+        // that every materialize call crosses the threshold. The test tree has 6 polys
+        // so we get ~6 flushes. The final partial batch is trivially empty in this case,
+        // but the important assertion is that the batching path is exercised end-to-end
+        // and guards get produced.
+        set_low_memory_materialize_budget_bytes(64);
+        let mut medium_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        medium_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        assert!(
+            medium_budget_tree
+                .polynomials
+                .iter()
+                .all(|p| p.evals.is_some()),
+            "every poly must have evals after materialize_evaluations_low_memory"
+        );
+        assert!(
+            !medium_budget_tree.eval_mmap_guards.is_empty(),
+            "medium budget must have spilled at least once with this tree shape"
+        );
+        medium_budget_tree.drop_evaluations();
+
+        // Restore global state so parallel tests see what they started with.
+        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE
+            .store(prev_budget, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn test_parse_low_memory_materialize_budget_bytes() {
+        // Accepts positive decimal integers.
+        assert_eq!(parse_low_memory_materialize_budget_bytes("1"), Some(1));
+        assert_eq!(
+            parse_low_memory_materialize_budget_bytes("1073741824"),
+            Some(1usize << 30)
+        );
+        assert_eq!(
+            parse_low_memory_materialize_budget_bytes("  42  "),
+            Some(42)
+        );
+        // Rejects zero (0-byte budget is meaningless for this knob), negatives, non-numeric.
+        assert_eq!(parse_low_memory_materialize_budget_bytes("0"), None);
+        assert_eq!(parse_low_memory_materialize_budget_bytes(""), None);
+        assert_eq!(parse_low_memory_materialize_budget_bytes("-1"), None);
+        assert_eq!(parse_low_memory_materialize_budget_bytes("abc"), None);
+        assert_eq!(parse_low_memory_materialize_budget_bytes("1.5"), None);
+        assert_eq!(parse_low_memory_materialize_budget_bytes("1MB"), None);
     }
 
     #[test]

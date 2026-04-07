@@ -11,9 +11,9 @@ use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::{Col, ColumnOps};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::ProverMemoryMode;
-use crate::prover::spill::EvalMmapGuard;
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
+use crate::prover::spill::EvalMmapGuard;
 
 /// Operations on BaseField polynomials.
 pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {

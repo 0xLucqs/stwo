@@ -23,20 +23,20 @@ use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding_alphas};
 use crate::core::utils::bit_reverse_index;
 use crate::core::ColumnVec;
+use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::cpu::circle::slow_precompute_twiddles;
 use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::fft::transpose_vecs;
 use crate::prover::backend::simd::fri::fold_circle_evaluation_into_line;
-use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::simd::m31::PackedM31;
 use crate::prover::backend::{Col, Column, CpuBackend};
 use crate::prover::fri::FriOps;
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::ProverMemoryMode;
-use crate::prover::spill::{spill_eval_columns, EvalMmapGuard};
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
+use crate::prover::spill::{spill_eval_columns, EvalMmapGuard};
 
 impl SimdBackend {
     // TODO(Ohad): optimize.
@@ -188,81 +188,81 @@ impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
     //  requires one of the numbers to be shifted left by 1 bit. This is not a reduced
     //  representation of the field.
-type Twiddles = Vec<u32>;
+    type Twiddles = Vec<u32>;
 
-fn evaluate_polynomials(
-    polynomials: ColumnVec<CircleCoefficients<Self>>,
-    log_blowup_factor: u32,
-    twiddles: &TwiddleTree<Self>,
-    store_polynomials_coefficients: bool,
-    pool: &BaseColumnPool<Self>,
-    memory_mode: ProverMemoryMode,
-) -> (Vec<Poly<Self>>, Vec<EvalMmapGuard>) {
-    if memory_mode != ProverMemoryMode::LowMemory {
-        let buffers: Vec<_> = polynomials
-            .iter()
-            .map(|poly_coeffs| {
-                let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
-                pool.take_or_alloc(log_eval_size)
-            })
-            .collect();
+    fn evaluate_polynomials(
+        polynomials: ColumnVec<CircleCoefficients<Self>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+        store_polynomials_coefficients: bool,
+        pool: &BaseColumnPool<Self>,
+        memory_mode: ProverMemoryMode,
+    ) -> (Vec<Poly<Self>>, Vec<EvalMmapGuard>) {
+        if memory_mode != ProverMemoryMode::LowMemory {
+            let buffers: Vec<_> = polynomials
+                .iter()
+                .map(|poly_coeffs| {
+                    let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
+                    pool.take_or_alloc(log_eval_size)
+                })
+                .collect();
 
-        #[cfg(feature = "parallel")]
-        let iter = polynomials.into_par_iter().zip(buffers.into_par_iter());
-        #[cfg(not(feature = "parallel"))]
-        let iter = polynomials.into_iter().zip(buffers);
+            #[cfg(feature = "parallel")]
+            let iter = polynomials.into_par_iter().zip(buffers.into_par_iter());
+            #[cfg(not(feature = "parallel"))]
+            let iter = polynomials.into_iter().zip(buffers);
 
-        return (
-            iter.map(|(poly_coeffs, buffer)| {
-                let domain =
-                    CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
-                let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
-                Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
-            })
-            .collect(),
-            Vec::new(),
-        );
-    }
+            return (
+                iter.map(|(poly_coeffs, buffer)| {
+                    let domain = CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor)
+                        .circle_domain();
+                    let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+                    Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+                })
+                .collect(),
+                Vec::new(),
+            );
+        }
 
-    let spill_batch_threshold_bytes = low_memory_eval_spill_batch_bytes();
-    let mut spilled_guards = Vec::new();
-    let mut spilled_polynomials = Vec::with_capacity(polynomials.len());
-    let mut batch = Vec::new();
-    let mut batch_bytes = 0usize;
+        let spill_batch_threshold_bytes = low_memory_eval_spill_batch_bytes();
+        let mut spilled_guards = Vec::new();
+        let mut spilled_polynomials = Vec::with_capacity(polynomials.len());
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0usize;
 
-    for poly_coeffs in polynomials {
-        let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
-        let buffer = pool.take_or_alloc(log_eval_size);
-        let domain = CanonicCoset::new(log_eval_size).circle_domain();
-        let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
-        batch_bytes += evals.values.data.len() * std::mem::size_of::<PackedBaseField>();
-        batch.push(Poly::new(
-            store_polynomials_coefficients.then_some(poly_coeffs),
-            evals,
-        ));
+        for poly_coeffs in polynomials {
+            let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
+            let buffer = pool.take_or_alloc(log_eval_size);
+            let domain = CanonicCoset::new(log_eval_size).circle_domain();
+            let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+            batch_bytes += evals.values.data.len() * std::mem::size_of::<PackedBaseField>();
+            batch.push(Poly::new(
+                store_polynomials_coefficients.then_some(poly_coeffs),
+                evals,
+            ));
 
-        if batch_bytes >= spill_batch_threshold_bytes {
+            if batch_bytes >= spill_batch_threshold_bytes {
+                let batch_start = spilled_polynomials.len();
+                if let Some(mut guard) = spill_eval_columns(&mut batch) {
+                    guard.offset_indices(batch_start);
+                    spilled_guards.push(guard);
+                }
+                spilled_polynomials.append(&mut batch);
+                batch_bytes = 0;
+            }
+        }
+
+        if !batch.is_empty() {
             let batch_start = spilled_polynomials.len();
             if let Some(mut guard) = spill_eval_columns(&mut batch) {
                 guard.offset_indices(batch_start);
                 spilled_guards.push(guard);
             }
             spilled_polynomials.append(&mut batch);
-            batch_bytes = 0;
         }
-    }
 
-    if !batch.is_empty() {
-        let batch_start = spilled_polynomials.len();
-        if let Some(mut guard) = spill_eval_columns(&mut batch) {
-            guard.offset_indices(batch_start);
-            spilled_guards.push(guard);
-        }
-        spilled_polynomials.append(&mut batch);
+        (spilled_polynomials, spilled_guards)
     }
-
-    (spilled_polynomials, spilled_guards)
-}
 
     fn interpolate(
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,

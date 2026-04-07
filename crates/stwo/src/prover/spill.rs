@@ -9,11 +9,11 @@
 //! 1. **Spill-and-reload**: Write data to file, drop the in-memory copy, reload later via mmap.
 //!    Used for polynomial coefficients that aren't needed during Merkle tree building.
 //!
-//! 2. **Page replacement (MAP_FIXED)**: Write data to file, then use `mmap(MAP_FIXED)` to
-//!    replace the anonymous heap pages backing a Vec with file-backed pages *in place*. The Vec
-//!    pointer/length/capacity are unchanged, but the OS can now evict pages under memory
-//!    pressure and re-fault them from the file. Used for evaluation data that must remain
-//!    addressable during Merkle tree building.
+//! 2. **Page replacement (MAP_FIXED)**: Write data to file, then use `mmap(MAP_FIXED)` to replace
+//!    the anonymous heap pages backing a Vec with file-backed pages *in place*. The Vec
+//!    pointer/length/capacity are unchanged, but the OS can now evict pages under memory pressure
+//!    and re-fault them from the file. Used for evaluation data that must remain addressable during
+//!    Merkle tree building.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -288,7 +288,9 @@ pub struct EvalMmapGuard {
 
 impl EvalMmapGuard {
     pub fn offset_indices(&mut self, offset: usize) {
-        self.spilled_indices.iter_mut().for_each(|index| *index += offset);
+        self.spilled_indices
+            .iter_mut()
+            .for_each(|index| *index += offset);
     }
 }
 
@@ -321,8 +323,8 @@ pub fn spill_eval_columns(
         let packed_len = heap_data.len();
 
         // Write to temp file as raw bytes, mmap it back.
-        let byte_len = packed_len
-            * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
+        let byte_len =
+            packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
         let byte_ptr = heap_data.as_ptr() as *const u8;
         let bytes = unsafe { std::slice::from_raw_parts(byte_ptr, byte_len) };
 
@@ -368,8 +370,10 @@ pub fn spill_eval_columns(
         };
 
         #[cfg(not(unix))]
-        let mmap_result: Result<*mut libc::c_void, std::io::Error> =
-            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not unix"));
+        let mmap_result: Result<*mut libc::c_void, std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "not unix",
+        ));
 
         let mmap_ptr = match mmap_result {
             Ok(ptr) => ptr,

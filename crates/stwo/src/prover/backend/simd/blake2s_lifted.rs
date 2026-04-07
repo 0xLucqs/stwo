@@ -255,7 +255,9 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             let cpu_cols = columns.iter().map(|c| c.to_cpu()).collect_vec();
             let leaves = <CpuBackend as MerkleOpsLifted<
                 Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
-            >>::build_leaves(&cpu_cols.iter().collect_vec(), lifting_log_size);
+            >>::build_leaves(
+                &cpu_cols.iter().collect_vec(), lifting_log_size
+            );
             return <CpuBackend as MerkleOpsLifted<
                 Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>,
             >>::build_next_layer(&leaves);
@@ -305,8 +307,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                     to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
                 });
                 *state = compress_unfinalized(prev_state, msgs, local_byte_count);
-                for chunk_columns in
-                    &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
+                for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
                 {
                     let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
                         std::array::from_fn(|j| chunk_columns[j].data[i].into_simd());
@@ -417,8 +418,11 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             });
 
             // Hash the 32 leaf hashes into 16 next-layer hashes (same as build_next_layer).
-            let state =
-                compress_finalize(INITIAL_STATE, transpose_msgs(msgs), N_BYTES_IN_BLAKE_MESSAGE);
+            let state = compress_finalize(
+                INITIAL_STATE,
+                transpose_msgs(msgs),
+                N_BYTES_IN_BLAKE_MESSAGE,
+            );
             let mut untransposed = untranspose_states(state);
             if IS_M31_OUTPUT {
                 untransposed = std::array::from_fn(|i| reduce_to_m31_simd(untransposed[i]));
@@ -679,8 +683,7 @@ mod tests {
             .map(M31::from_u32_unchecked)
             .collect_vec();
 
-        let cols_simd: Vec<BaseColumn> =
-            cols_cpu.iter().map(|c| BaseColumn::from_cpu(c)).collect();
+        let cols_simd: Vec<BaseColumn> = cols_cpu.iter().map(|c| BaseColumn::from_cpu(c)).collect();
 
         // Sort by length (ascending) as required by the trait contract.
         let mut sorted_cpu = cols_cpu.iter().collect_vec();
@@ -694,8 +697,7 @@ mod tests {
             let lifting_log_size = MAX_LOG_N_ROWS + 2; // extra lifting
             let leaves =
                 <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
-            let expected =
-                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let expected = <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
             let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
                 &sorted_simd,
                 lifting_log_size,
@@ -709,8 +711,7 @@ mod tests {
             let lifting_log_size = MAX_LOG_N_ROWS; // no extra lifting
             let leaves =
                 <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
-            let expected =
-                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let expected = <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
             let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
                 &sorted_simd,
                 lifting_log_size,
@@ -724,8 +725,7 @@ mod tests {
             let lifting_log_size = MAX_LOG_N_ROWS + 3; // extra lifting
             let leaves =
                 <SimdBackend as MerkleOpsLifted<H>>::build_leaves(&sorted_simd, lifting_log_size);
-            let expected =
-                <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
+            let expected = <SimdBackend as MerkleOpsLifted<H>>::build_next_layer(&leaves);
             let actual = <SimdBackend as MerkleOpsLifted<H>>::build_first_layer_above_leaves(
                 &sorted_simd,
                 lifting_log_size,
