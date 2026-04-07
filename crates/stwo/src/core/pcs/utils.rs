@@ -9,7 +9,7 @@ use crate::core::pcs::PcsConfig;
 use crate::core::ColumnVec;
 
 /// A container that holds an element for each commitment tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TreeVec<T>(pub Vec<T>);
 
 impl<T> TreeVec<T> {

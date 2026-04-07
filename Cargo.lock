@@ -1362,6 +1362,7 @@ dependencies = [
  "rand",
  "rayon",
  "serde",
+ "serde_json",
  "stwo",
  "stwo-constraint-framework",
  "test-log",

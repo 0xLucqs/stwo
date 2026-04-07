@@ -614,13 +614,9 @@ mod tests {
         // Both should verify successfully.
         let mut verifier_channel_fast = Blake2sChannel::default();
         let mut verifier_channel_low = Blake2sChannel::default();
-        let mut verifier_fast =
-            CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
-        let mut verifier_low =
-            CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
-        let sizes: Vec<u32> = (0..N_COLS_PER_TREE)
-            .map(|_| LIFTING_LOG_SIZE)
-            .collect_vec();
+        let mut verifier_fast = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        let mut verifier_low = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        let sizes: Vec<u32> = (0..N_COLS_PER_TREE).map(|_| LIFTING_LOG_SIZE).collect_vec();
         verifier_fast.commit(
             fast_proof.proof.commitments[0],
             &sizes,
@@ -653,11 +649,7 @@ mod tests {
         );
         assert!(
             verifier_low
-                .verify_values(
-                    sampled_points,
-                    low_proof.proof,
-                    &mut verifier_channel_low
-                )
+                .verify_values(sampled_points, low_proof.proof, &mut verifier_channel_low)
                 .is_ok(),
             "low-memory mode verification failed (multi-tree regression)"
         );

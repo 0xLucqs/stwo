@@ -10,6 +10,8 @@ use crate::core::ColumnVec;
 use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::{Col, ColumnOps};
 use crate::prover::mempool::BaseColumnPool;
+use crate::prover::pcs::ProverMemoryMode;
+use crate::prover::spill::EvalMmapGuard;
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 
@@ -98,7 +100,8 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         twiddles: &TwiddleTree<Self>,
         store_polynomials_coefficients: bool,
         pool: &BaseColumnPool<Self>,
-    ) -> Vec<Poly<Self>>
+        _memory_mode: ProverMemoryMode,
+    ) -> (Vec<Poly<Self>>, Vec<EvalMmapGuard>)
     where
         Self: crate::prover::backend::Backend,
     {
@@ -116,13 +119,16 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         #[cfg(not(feature = "parallel"))]
         let iter = polynomials.into_iter().zip(buffers);
 
-        iter.map(|(poly_coeffs, buffer)| {
-            let domain =
-                CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
-            let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
-            Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
-        })
-        .collect()
+        (
+            iter.map(|(poly_coeffs, buffer)| {
+                let domain =
+                    CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
+                let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+                Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+            })
+            .collect(),
+            Vec::new(),
+        )
     }
 
     /// Precomputes twiddles for a given coset.

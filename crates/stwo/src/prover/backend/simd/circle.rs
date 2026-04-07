@@ -22,13 +22,18 @@ use crate::core::fields::{batch_inverse, Field, FieldExpOps};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding_alphas};
 use crate::core::utils::bit_reverse_index;
+use crate::core::ColumnVec;
 use crate::prover::backend::cpu::circle::slow_precompute_twiddles;
 use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::fft::transpose_vecs;
 use crate::prover::backend::simd::fri::fold_circle_evaluation_into_line;
+use crate::prover::air::component_prover::Poly;
 use crate::prover::backend::simd::m31::PackedM31;
 use crate::prover::backend::{Col, Column, CpuBackend};
 use crate::prover::fri::FriOps;
+use crate::prover::mempool::BaseColumnPool;
+use crate::prover::pcs::ProverMemoryMode;
+use crate::prover::spill::{spill_eval_columns, EvalMmapGuard};
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
@@ -129,11 +134,135 @@ impl SimdBackend {
 
 // TODO(shahars): Everything is returned in redundant representation, where values can also be P.
 // Decide if and when it's ok and what to do if it's not.
+
+/// Default batch threshold (in bytes) at which `evaluate_polynomials` flushes accumulated
+/// in-memory evaluation columns to file-backed mmap when running in
+/// [`ProverMemoryMode::LowMemory`].
+///
+/// Smaller values reduce peak resident memory at the cost of more frequent spill-to-disk
+/// operations. The default is conservative for memory-constrained targets (e.g. mobile phones):
+/// at 1 MiB, the prover effectively spills after every polynomial, so the in-flight heap
+/// footprint stays bounded by the size of the largest single column plus the FFT working set.
+///
+/// Workstations and CI runners that prefer fewer spill round-trips should override via the
+/// `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` environment variable (e.g. `268435456` for the
+/// historical 256 MiB value).
+const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 1 << 20;
+
+/// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`].
+const LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV: &str = "STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES";
+
+/// Parses the spill batch threshold from a raw env var value (decimal bytes).
+///
+/// Returns `None` for empty, non-numeric, or negative inputs. Kept as a pure function so the
+/// parsing logic can be unit-tested without touching process-global env state.
+fn parse_low_memory_eval_spill_batch_bytes(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok()
+}
+
+/// Returns the eval-column spill batch threshold in bytes for the current process,
+/// honoring [`LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV`].
+///
+/// Falls back to [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`] when the env var is unset
+/// or unparseable. An unparseable value emits a `tracing::warn!` so misconfiguration is
+/// surfaced rather than silently ignored.
+fn low_memory_eval_spill_batch_bytes() -> usize {
+    match std::env::var(LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV) {
+        Ok(raw) => match parse_low_memory_eval_spill_batch_bytes(&raw) {
+            Some(bytes) => bytes,
+            None => {
+                tracing::warn!(
+                    env_var = LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV,
+                    env_value = raw.as_str(),
+                    default_bytes = DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
+                    "Invalid spill batch threshold, using default"
+                );
+                DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES
+            }
+        },
+        Err(_) => DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
+    }
+}
+
 impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
     //  requires one of the numbers to be shifted left by 1 bit. This is not a reduced
     //  representation of the field.
-    type Twiddles = Vec<u32>;
+type Twiddles = Vec<u32>;
+
+fn evaluate_polynomials(
+    polynomials: ColumnVec<CircleCoefficients<Self>>,
+    log_blowup_factor: u32,
+    twiddles: &TwiddleTree<Self>,
+    store_polynomials_coefficients: bool,
+    pool: &BaseColumnPool<Self>,
+    memory_mode: ProverMemoryMode,
+) -> (Vec<Poly<Self>>, Vec<EvalMmapGuard>) {
+    if memory_mode != ProverMemoryMode::LowMemory {
+        let buffers: Vec<_> = polynomials
+            .iter()
+            .map(|poly_coeffs| {
+                let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
+                pool.take_or_alloc(log_eval_size)
+            })
+            .collect();
+
+        #[cfg(feature = "parallel")]
+        let iter = polynomials.into_par_iter().zip(buffers.into_par_iter());
+        #[cfg(not(feature = "parallel"))]
+        let iter = polynomials.into_iter().zip(buffers);
+
+        return (
+            iter.map(|(poly_coeffs, buffer)| {
+                let domain =
+                    CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
+                let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+                Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+            })
+            .collect(),
+            Vec::new(),
+        );
+    }
+
+    let spill_batch_threshold_bytes = low_memory_eval_spill_batch_bytes();
+    let mut spilled_guards = Vec::new();
+    let mut spilled_polynomials = Vec::with_capacity(polynomials.len());
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for poly_coeffs in polynomials {
+        let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
+        let buffer = pool.take_or_alloc(log_eval_size);
+        let domain = CanonicCoset::new(log_eval_size).circle_domain();
+        let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+        batch_bytes += evals.values.data.len() * std::mem::size_of::<PackedBaseField>();
+        batch.push(Poly::new(
+            store_polynomials_coefficients.then_some(poly_coeffs),
+            evals,
+        ));
+
+        if batch_bytes >= spill_batch_threshold_bytes {
+            let batch_start = spilled_polynomials.len();
+            if let Some(mut guard) = spill_eval_columns(&mut batch) {
+                guard.offset_indices(batch_start);
+                spilled_guards.push(guard);
+            }
+            spilled_polynomials.append(&mut batch);
+            batch_bytes = 0;
+        }
+    }
+
+    if !batch.is_empty() {
+        let batch_start = spilled_polynomials.len();
+        if let Some(mut guard) = spill_eval_columns(&mut batch) {
+            guard.offset_indices(batch_start);
+            spilled_guards.push(guard);
+        }
+        spilled_polynomials.append(&mut batch);
+    }
+
+    (spilled_polynomials, spilled_guards)
+}
 
     fn interpolate(
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
@@ -627,6 +756,9 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
+    use super::{
+        parse_low_memory_eval_spill_batch_bytes, DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
+    };
     use crate::core::circle::CirclePoint;
     use crate::core::fields::m31::BaseField;
     use crate::core::poly::circle::CanonicCoset;
@@ -637,6 +769,47 @@ mod tests {
     use crate::prover::backend::simd::SimdBackend;
     use crate::prover::backend::{Column, CpuBackend};
     use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
+
+    #[test]
+    fn parse_spill_batch_bytes_accepts_decimal() {
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("0"), Some(0));
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1"), Some(1));
+        assert_eq!(
+            parse_low_memory_eval_spill_batch_bytes("1048576"),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            parse_low_memory_eval_spill_batch_bytes("268435456"),
+            Some(256 << 20)
+        );
+    }
+
+    #[test]
+    fn parse_spill_batch_bytes_trims_whitespace() {
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("  42  "), Some(42));
+        assert_eq!(
+            parse_low_memory_eval_spill_batch_bytes("\t1024\n"),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn parse_spill_batch_bytes_rejects_invalid_inputs() {
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes(""), None);
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("abc"), None);
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("-1"), None);
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1.5"), None);
+        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1MB"), None);
+    }
+
+    #[test]
+    fn default_spill_batch_bytes_is_phone_friendly() {
+        // The default must be substantially smaller than the historical 256 MiB tuning so
+        // that mobile targets do not OOM during the LowMemory eval phase. If you bump
+        // this, also reconcile the doc comment on DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES.
+        assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES > 0);
+        assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES <= 16 << 20);
+    }
     use crate::prover::poly::{BitReversedOrder, NaturalOrder};
 
     #[test]

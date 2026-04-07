@@ -34,6 +34,7 @@ pub struct CommitmentSchemeProof<H: MerkleHasherLifted> {
     pub fri_proof: FriProof<H>,
 }
 
+
 /// Auxiliary data for a [CommitmentSchemeProof].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitmentSchemeProofAux<H: MerkleHasherLifted> {

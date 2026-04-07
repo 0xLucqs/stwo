@@ -17,7 +17,10 @@ pub use air::component_prover::{
 pub use air::{AccumulationOps, ColumnAccumulator, DomainEvaluationAccumulator, EvaluationMode};
 pub mod pcs;
 pub use pcs::quotient_ops::QuotientOps;
-pub use pcs::{CommitmentSchemeProver, CommitmentTreeProver, ProverMemoryMode, TreeBuilder};
+pub use pcs::{
+    set_default_prover_memory_mode, CommitmentSchemeProver, CommitmentTreeProver, ProverMemoryMode,
+    TreeBuilder,
+};
 pub mod backend;
 pub mod channel;
 pub mod fri;

@@ -283,6 +283,13 @@ impl Drop for MmapRegion {
 /// `forget_mmap_backed_evals()` on the polynomials before dropping this guard.
 pub struct EvalMmapGuard {
     _regions: Vec<MmapRegion>,
+    spilled_indices: Vec<usize>,
+}
+
+impl EvalMmapGuard {
+    pub fn offset_indices(&mut self, offset: usize) {
+        self.spilled_indices.iter_mut().for_each(|index| *index += offset);
+    }
 }
 
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
@@ -299,8 +306,9 @@ pub fn spill_eval_columns(
     >],
 ) -> Option<EvalMmapGuard> {
     let mut mmap_regions = Vec::new();
+    let mut spilled_indices = Vec::new();
 
-    for poly in polynomials.iter_mut() {
+    for (idx, poly) in polynomials.iter_mut().enumerate() {
         let evals = match &mut poly.evals {
             Some(e) => e,
             None => continue,
@@ -389,6 +397,7 @@ pub fn spill_eval_columns(
             byte_len,
             _file: file,
         });
+        spilled_indices.push(idx);
     }
 
     if mmap_regions.is_empty() {
@@ -402,6 +411,7 @@ pub fn spill_eval_columns(
 
     Some(EvalMmapGuard {
         _regions: mmap_regions,
+        spilled_indices,
     })
 }
 
@@ -412,9 +422,10 @@ pub fn forget_mmap_backed_evals(
     polynomials: &mut [crate::prover::air::component_prover::Poly<
         crate::prover::backend::simd::SimdBackend,
     >],
+    guards: &[EvalMmapGuard],
 ) {
-    for poly in polynomials.iter_mut() {
-        if let Some(evals) = poly.evals.take() {
+    for &index in guards.iter().flat_map(|guard| guard.spilled_indices.iter()) {
+        if let Some(evals) = polynomials[index].evals.take() {
             // Forget the CircleEvaluation to prevent Vec::drop on mmap memory.
             // The EvalMmapGuard will handle munmap.
             std::mem::forget(evals);

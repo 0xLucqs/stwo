@@ -96,6 +96,48 @@ pub enum ProverMemoryMode {
 
 const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 
+/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: no override set.
+const PROVER_MEMORY_MODE_OVERRIDE_UNSET: u8 = 0;
+/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: pin to
+/// [`ProverMemoryMode::Fast`].
+const PROVER_MEMORY_MODE_OVERRIDE_FAST: u8 = 1;
+/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: pin to
+/// [`ProverMemoryMode::LowMemory`].
+const PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY: u8 = 2;
+
+/// Process-wide override for the default prover memory mode.
+///
+/// Set via [`set_default_prover_memory_mode`]. When non-zero, this takes precedence over the
+/// `STWO_PROVER_MEMORY_MODE` environment variable in [`default_prover_memory_mode`]. Encoded
+/// as a `u8` so the override is lock-free and cheap to consult on every prover construction.
+static DEFAULT_PROVER_MEMORY_MODE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(PROVER_MEMORY_MODE_OVERRIDE_UNSET);
+
+/// Sets a process-wide override for the default prover memory mode.
+///
+/// This takes precedence over the `STWO_PROVER_MEMORY_MODE` environment variable and applies
+/// to every [`CommitmentSchemeProver`] constructed *after* this call. Existing provers retain
+/// their original mode unless explicitly updated via [`CommitmentSchemeProver::set_memory_mode`].
+///
+/// Designed for embedded targets where shell environment variables do not propagate into the
+/// app process — for example, iOS apps that need to opt into [`ProverMemoryMode::LowMemory`]
+/// at startup. Call this once early in your `main`/`AppDelegate` before any prover is built:
+///
+/// ```ignore
+/// stwo::prover::set_default_prover_memory_mode(stwo::prover::ProverMemoryMode::LowMemory);
+/// ```
+///
+/// Calling this multiple times is permitted; the most recent call wins. Concurrent callers see
+/// linearizable updates via release/acquire ordering on an atomic `u8`.
+pub fn set_default_prover_memory_mode(mode: ProverMemoryMode) {
+    let encoded = match mode {
+        ProverMemoryMode::Fast => PROVER_MEMORY_MODE_OVERRIDE_FAST,
+        ProverMemoryMode::LowMemory => PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
+    };
+    DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Release);
+    tracing::info!(?mode, "stwo prover memory mode override set");
+}
+
 fn parse_prover_memory_mode(value: &str) -> Option<ProverMemoryMode> {
     if value.eq_ignore_ascii_case("fast") {
         Some(ProverMemoryMode::Fast)
@@ -110,20 +152,40 @@ fn parse_prover_memory_mode(value: &str) -> Option<ProverMemoryMode> {
     }
 }
 
+/// Resolves the prover memory mode for a freshly constructed [`CommitmentSchemeProver`].
+///
+/// Resolution order (first match wins):
+/// 1. Process-wide override set via [`set_default_prover_memory_mode`].
+/// 2. The `STWO_PROVER_MEMORY_MODE` environment variable.
+/// 3. [`ProverMemoryMode::Fast`] as the conservative default.
+///
+/// The resolved mode is logged at `info` level along with its source so the active mode is
+/// observable in production logs (e.g. iOS Console.app). This avoids silently falling back to
+/// `Fast` on platforms where the env var does not propagate to the app process.
 fn default_prover_memory_mode() -> ProverMemoryMode {
-    match std::env::var("STWO_PROVER_MEMORY_MODE") {
-        Ok(value) => match parse_prover_memory_mode(&value) {
-            Some(mode) => mode,
-            None => {
-                tracing::warn!(
-                    env_value = value.as_str(),
-                    "Unknown STWO_PROVER_MEMORY_MODE, defaulting to fast mode"
-                );
-                ProverMemoryMode::Fast
-            }
+    let override_value =
+        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+    let (mode, source) = match override_value {
+        PROVER_MEMORY_MODE_OVERRIDE_FAST => (ProverMemoryMode::Fast, "override"),
+        PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY => (ProverMemoryMode::LowMemory, "override"),
+        // PROVER_MEMORY_MODE_OVERRIDE_UNSET (and defensively any unknown sentinel) — fall back
+        // to the env var, then to the conservative default.
+        _ => match std::env::var("STWO_PROVER_MEMORY_MODE") {
+            Ok(value) => match parse_prover_memory_mode(&value) {
+                Some(mode) => (mode, "env"),
+                None => {
+                    tracing::warn!(
+                        env_value = value.as_str(),
+                        "Unknown STWO_PROVER_MEMORY_MODE, defaulting to fast mode"
+                    );
+                    (ProverMemoryMode::Fast, "default")
+                }
+            },
+            Err(_) => (ProverMemoryMode::Fast, "default"),
         },
-        Err(_) => ProverMemoryMode::Fast,
-    }
+    };
+    tracing::info!(?mode, source, "stwo prover memory mode resolved");
+    mode
 }
 
 pub enum CommitmentTreeMerkleProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
@@ -340,8 +402,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         &mut self,
         access_pattern: Option<&TraceEvalAccessPattern>,
     ) {
+        let low_memory = self.memory_mode == ProverMemoryMode::LowMemory;
         match access_pattern {
             Some(access_pattern) => {
+                // The range/indices materialize variants currently always use the eager path.
+                // They typically only touch a small subset of polys (one component's slice),
+                // so the heap spike is bounded by `span.col_end - span.col_start` rather than
+                // the entire tree. If profiling later shows even that subset is too large on
+                // mobile, plumb the per-poly spill helper through these two methods as well.
                 for span in &access_pattern.tree_spans {
                     if let Some(MaybeOwned::Owned(tree)) = self.trees.0.get_mut(span.tree_index) {
                         tree.materialize_evaluation_range(
@@ -367,7 +435,17 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             None => {
                 for tree in &mut self.trees.0 {
                     if let MaybeOwned::Owned(tree) = tree {
-                        tree.materialize_evaluations(self.twiddles, &self.base_column_pool);
+                        if low_memory {
+                            // Per-poly materialize-and-spill: bounds the anonymous heap working
+                            // set to one column at a time instead of the full tree's worth of
+                            // re-materialized evals.
+                            tree.materialize_evaluations_low_memory(
+                                self.twiddles,
+                                &self.base_column_pool,
+                            );
+                        } else {
+                            tree.materialize_evaluations(self.twiddles, &self.base_column_pool);
+                        }
                     }
                 }
             }
@@ -583,12 +661,23 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                     if self.memory_mode == ProverMemoryMode::LowMemory
                         && tree.can_recompute_openings()
                     {
-                        tree.materialize_evaluations(self.twiddles, &self.base_column_pool);
+                        // Per-poly materialize-and-spill keeps the anonymous heap working set
+                        // bounded to one column at a time. The previous eager
+                        // `materialize_evaluations` allocated every column simultaneously,
+                        // producing the multi-hundred-MB spike that OOM-killed the iOS app
+                        // during decommit re-materialization.
+                        tree.materialize_evaluations_low_memory(
+                            self.twiddles,
+                            &self.base_column_pool,
+                        );
                     }
                     let result = tree.decommit(query_positions);
                     if self.memory_mode == ProverMemoryMode::LowMemory
                         && tree.can_recompute_openings()
                     {
+                        // `drop_evaluations` knows how to forget any mmap-backed eval Vecs
+                        // before letting them drop, then unmaps the regions via
+                        // `eval_mmap_guards.clear()`.
                         tree.drop_evaluations();
                     }
                     result
@@ -680,6 +769,13 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
 pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
     pub polynomials: ColumnVec<Poly<B>>,
     pub commitment: CommitmentTreeMerkleProver<B, MC>,
+    /// File-backed mmap regions backing any polynomial evals that were re-materialized in
+    /// `LowMemory` mode after the initial commit phase. These guards must outlive the
+    /// polynomials' eval Vecs and must be drained via
+    /// [`crate::prover::spill::forget_mmap_backed_evals`] in [`Self::drop_evaluations`] before
+    /// the polynomials are dropped or returned to the pool — otherwise `Vec::drop` would
+    /// attempt to free the mmap pages through the global allocator.
+    eval_mmap_guards: Vec<crate::prover::spill::EvalMmapGuard>,
 }
 
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
@@ -715,12 +811,13 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         phase_memory_checkpoint("pcs:tree:new:before_extension");
         let retain_coefficients =
             store_polynomials_coefficients || memory_mode == ProverMemoryMode::LowMemory;
-        let mut polynomials = B::evaluate_polynomials(
+        let (mut polynomials, mut eval_mmap_guards) = B::evaluate_polynomials(
             polynomials,
             log_blowup_factor,
             twiddles,
             retain_coefficients,
             base_column_pool,
+            memory_mode,
         );
         span.exit();
         phase_memory_checkpoint("pcs:tree:new:after_extension");
@@ -743,21 +840,19 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // This converts ~5 GB of anonymous heap into OS-managed pages that can be evicted
         // under memory pressure and re-faulted from disk. Only the Merkle builder's working
         // set (~256 MB) needs to be physically resident.
-        let _eval_mmap_guard = if memory_mode == ProverMemoryMode::LowMemory {
-            // The spill function works with concrete SimdBackend types. Check if we can
-            // downcast. In practice, B is always SimdBackend in the proving pipeline.
-            let polys_ptr = &mut polynomials as *mut Vec<Poly<B>> as *mut Vec<
-                Poly<crate::prover::backend::simd::SimdBackend>,
-            >;
+        if memory_mode == ProverMemoryMode::LowMemory && eval_mmap_guards.is_empty() {
+            // Fallback for backends that do not eagerly convert evaluation buffers to mmap-backed
+            // storage during extension.
+            let polys_ptr = &mut polynomials as *mut Vec<Poly<B>>
+                as *mut Vec<Poly<crate::prover::backend::simd::SimdBackend>>;
             // SAFETY: This is only called when B = SimdBackend (the only backend that
             // implements BackendForChannel). The cast is sound because Poly<B> and
             // Poly<SimdBackend> have identical layout when B = SimdBackend.
-            let guard = unsafe { crate::prover::spill::spill_eval_columns(&mut *polys_ptr) };
+            if let Some(guard) = unsafe { crate::prover::spill::spill_eval_columns(&mut *polys_ptr) } {
+                eval_mmap_guards.push(guard);
+            }
             phase_memory_checkpoint("pcs:tree:new:after_eval_mmap_spill");
-            guard
-        } else {
-            None
-        };
+        }
 
         let _span = span!(Level::INFO, "Merkle").entered();
         let max_log_domain_size = polynomials
@@ -786,18 +881,19 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             };
 
         if memory_mode == ProverMemoryMode::LowMemory {
-            if _eval_mmap_guard.is_some() {
-                // Evals are mmap-backed: forget them to prevent Vec::drop on mmap memory.
-                let polys_ptr = &mut polynomials as *mut Vec<Poly<B>> as *mut Vec<
-                    Poly<crate::prover::backend::simd::SimdBackend>,
-                >;
-                unsafe { crate::prover::spill::forget_mmap_backed_evals(&mut *polys_ptr) };
-            } else {
-                // Evals are heap-backed: drop normally.
-                for poly in &mut polynomials {
-                    if poly.evals.is_some() {
-                        let _ = poly.take_evals();
-                    }
+            if !eval_mmap_guards.is_empty() {
+                let polys_ptr = &mut polynomials as *mut Vec<Poly<B>>
+                    as *mut Vec<Poly<crate::prover::backend::simd::SimdBackend>>;
+                unsafe {
+                    crate::prover::spill::forget_mmap_backed_evals(
+                        &mut *polys_ptr,
+                        &eval_mmap_guards,
+                    )
+                };
+            }
+            for poly in &mut polynomials {
+                if poly.evals.is_some() {
+                    let _ = poly.take_evals();
                 }
             }
             phase_memory_checkpoint("pcs:tree:new:after_low_memory_eval_release");
@@ -807,6 +903,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         CommitmentTreeProver {
             polynomials,
             commitment: tree,
+            eval_mmap_guards: Vec::new(),
         }
     }
 
@@ -856,7 +953,19 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         }
     }
 
+    pub fn materialize_evaluations_for_reuse(
+        &mut self,
+        twiddles: &TwiddleTree<B>,
+        base_column_pool: &BaseColumnPool<B>,
+    ) {
+        self.materialize_evaluations(twiddles, base_column_pool);
+    }
+
     fn release_evaluations(&mut self, base_column_pool: &BaseColumnPool<B>) {
+        // If any evals are mmap-backed, do not give them back to the pool — they would corrupt
+        // the heap-buffer pool with file-backed memory. Forget those Vecs first so the per-poly
+        // loop below skips them, then fall through to the normal give-back path for the rest.
+        self.forget_mmap_backed_evals_if_any();
         for poly in &mut self.polynomials {
             if poly.evals.is_some() {
                 let log_size = poly.log_size();
@@ -864,12 +973,106 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 base_column_pool.give_back(log_size, evals.values);
             }
         }
+        // Munmap regions whose Vecs we just forgot.
+        self.eval_mmap_guards.clear();
     }
 
     fn drop_evaluations(&mut self) {
+        // Forget mmap-backed eval Vecs before they're dropped, so `Vec::drop` does not attempt
+        // to free file-backed pages through the global allocator. The corresponding `MmapRegion`s
+        // are then unmapped when `self.eval_mmap_guards` is cleared at the end of this function.
+        self.forget_mmap_backed_evals_if_any();
         for poly in &mut self.polynomials {
             if poly.evals.is_some() {
                 let _ = poly.take_evals();
+            }
+        }
+        self.eval_mmap_guards.clear();
+    }
+
+    /// Forgets the eval Vecs of every polynomial whose backing was spilled to mmap.
+    ///
+    /// No-op when [`Self::eval_mmap_guards`] is empty (the common case in
+    /// [`ProverMemoryMode::Fast`]). Must be called before any code path that drops or otherwise
+    /// hands ownership of an eval Vec back to the global allocator (e.g. `Vec::drop`,
+    /// [`BaseColumnPool::give_back`]).
+    ///
+    /// SAFETY: this performs an unchecked transmute of `Vec<Poly<B>>` to
+    /// `Vec<Poly<SimdBackend>>`. The cast is layout-sound only when `B = SimdBackend`, which is
+    /// the only backend that participates in the `LowMemory` re-materialization spill path
+    /// today. The same constraint already applies to the existing
+    /// [`crate::prover::spill::spill_eval_columns`] /
+    /// [`crate::prover::spill::forget_mmap_backed_evals`] pair at `Self::new_with_memory_mode`.
+    /// If a non-Simd backend ever populates `eval_mmap_guards`, this will be UB — the
+    /// early-return on the empty-guard fast path is what keeps `CpuBackend` callers safe today.
+    fn forget_mmap_backed_evals_if_any(&mut self) {
+        if self.eval_mmap_guards.is_empty() {
+            return;
+        }
+        let polys_simd_ptr = &mut self.polynomials as *mut Vec<Poly<B>>
+            as *mut Vec<Poly<crate::prover::backend::simd::SimdBackend>>;
+        unsafe {
+            crate::prover::spill::forget_mmap_backed_evals(
+                &mut *polys_simd_ptr,
+                &self.eval_mmap_guards,
+            );
+        }
+    }
+
+    /// `LowMemory`-aware variant of [`Self::materialize_evaluations`].
+    ///
+    /// Materializes each polynomial's evaluation into a fresh heap buffer, then **immediately**
+    /// spills that single polynomial to file-backed mmap before moving on to the next. The peak
+    /// anonymous heap during the loop is therefore bounded by the size of one column plus the
+    /// FFT working set, instead of the cumulative size of every re-materialized eval (which is
+    /// what the eager `materialize_evaluations` produces and what causes the multi-hundred-MB
+    /// spike on memory-constrained devices).
+    ///
+    /// The mmap [`crate::prover::spill::EvalMmapGuard`]s are appended to
+    /// [`Self::eval_mmap_guards`] so they live as long as the polynomials they back. Callers
+    /// MUST go through [`Self::drop_evaluations`] (or [`Self::release_evaluations`]) to release
+    /// the polynomials, since both helpers know how to forget mmap-backed Vecs before dropping
+    /// them.
+    ///
+    /// Safe for `B = SimdBackend` only — see [`Self::forget_mmap_backed_evals_if_any`] for the
+    /// reasoning. Non-Simd backends should fall back to the eager `materialize_evaluations`.
+    fn materialize_evaluations_low_memory(
+        &mut self,
+        twiddles: &TwiddleTree<B>,
+        base_column_pool: &BaseColumnPool<B>,
+    ) {
+        let total = self.polynomials.len();
+        for idx in 0..total {
+            if self.polynomials[idx].evals.is_some() {
+                continue;
+            }
+            // Materialize a single polynomial. Its evals Vec is heap-backed at this point.
+            let evals = self.polynomials[idx].materialize_evaluation(twiddles, base_column_pool);
+            self.polynomials[idx].evals = Some(evals);
+
+            // Immediately spill this single poly to file-backed mmap. After this call the
+            // BaseColumn's data Vec points at mmap memory and the original heap allocation
+            // has been freed; the next loop iteration starts again at ~0 anonymous bytes for
+            // the eval working set.
+            //
+            // SAFETY: spill_eval_columns expects `&mut [Poly<SimdBackend>]`. The cast is sound
+            // when `B = SimdBackend`, which is the only backend that runs the `LowMemory`
+            // re-materialization path. Same precondition as
+            // `Self::forget_mmap_backed_evals_if_any` and the existing cast in
+            // `Self::new_with_memory_mode`.
+            let single_simd: &mut [Poly<crate::prover::backend::simd::SimdBackend>] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (&mut self.polynomials[idx] as *mut Poly<B>)
+                        as *mut Poly<crate::prover::backend::simd::SimdBackend>,
+                    1,
+                )
+            };
+            if let Some(mut guard) = crate::prover::spill::spill_eval_columns(single_simd) {
+                // Translate the per-call slice-relative index (always 0) into the absolute
+                // index within `self.polynomials`, so the guard's bookkeeping points at the
+                // right poly when `forget_mmap_backed_evals` runs in `drop_evaluations`.
+                guard.offset_indices(idx);
+                self.eval_mmap_guards.push(guard);
             }
         }
     }
@@ -884,7 +1087,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         use crate::prover::spill::CoefficientSpillFile;
 
         // Collect only the polys that still have in-memory coefficients.
-        let n_to_spill = self.polynomials.iter().filter(|p| p.coeffs.is_some()).count();
+        let n_to_spill = self
+            .polynomials
+            .iter()
+            .filter(|p| p.coeffs.is_some())
+            .count();
         if n_to_spill == 0 {
             phase_memory_checkpoint("pcs:tree:after_coefficient_spill");
             return Ok(());
@@ -1085,14 +1292,17 @@ mod tests {
     use itertools::Itertools;
 
     use super::{
-        parse_prover_memory_mode, CommitmentTreeMerkleProver, CommitmentTreeProver,
-        ProverMemoryMode,
+        default_prover_memory_mode, parse_prover_memory_mode, set_default_prover_memory_mode,
+        CommitmentTreeMerkleProver, CommitmentTreeProver, ProverMemoryMode,
+        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE, PROVER_MEMORY_MODE_OVERRIDE_FAST,
+        PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY, PROVER_MEMORY_MODE_OVERRIDE_UNSET,
     };
     use crate::core::channel::MerkleChannel;
     use crate::core::fields::m31::M31;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-    use crate::prover::backend::{BackendForChannel, CpuBackend};
+    use crate::prover::backend::simd::SimdBackend;
+    use crate::prover::backend::{BackendForChannel, Column, CpuBackend};
     use crate::prover::mempool::BaseColumnPool;
     use crate::prover::poly::circle::{CircleCoefficients, PolyOps};
 
@@ -1146,6 +1356,191 @@ mod tests {
                 Some(ProverMemoryMode::LowMemory)
             );
         }
+    }
+
+    /// Exercises the process-wide [`set_default_prover_memory_mode`] override mechanism.
+    ///
+    /// All override scenarios are bundled into a single `#[test]` function to serialize them
+    /// against each other and against any other test in the binary that constructs a
+    /// [`CommitmentSchemeProver`] (which would otherwise observe a leaked override and read
+    /// the wrong default mode). The test saves and restores the override sentinel around each
+    /// scenario so concurrent tests in the same binary remain unaffected.
+    #[test]
+    fn test_set_default_prover_memory_mode_override() {
+        // Snapshot the current sentinel so we can restore it on every exit path, including
+        // panic propagation. We deliberately do not assert the initial state because parallel
+        // tests might have set it; we only require that we leave it as we found it.
+        let initial_override =
+            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+
+        // Scenario 1: setting LowMemory pins default_prover_memory_mode() to LowMemory
+        // regardless of the env var (we don't manipulate the env var here to keep this test
+        // free of process-global env interference).
+        set_default_prover_memory_mode(ProverMemoryMode::LowMemory);
+        assert_eq!(
+            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
+            PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
+            "override sentinel must encode LowMemory after set_default_prover_memory_mode(LowMemory)"
+        );
+        assert_eq!(
+            default_prover_memory_mode(),
+            ProverMemoryMode::LowMemory,
+            "resolver must honor LowMemory override"
+        );
+
+        // Scenario 2: overriding to Fast wins over a previous LowMemory override.
+        set_default_prover_memory_mode(ProverMemoryMode::Fast);
+        assert_eq!(
+            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
+            PROVER_MEMORY_MODE_OVERRIDE_FAST,
+            "override sentinel must encode Fast after set_default_prover_memory_mode(Fast)"
+        );
+        assert_eq!(
+            default_prover_memory_mode(),
+            ProverMemoryMode::Fast,
+            "resolver must honor Fast override"
+        );
+
+        // Scenario 3: re-setting to LowMemory works (the override is not single-shot).
+        set_default_prover_memory_mode(ProverMemoryMode::LowMemory);
+        assert_eq!(
+            default_prover_memory_mode(),
+            ProverMemoryMode::LowMemory,
+            "override must be replaceable, not single-shot"
+        );
+
+        // Scenario 4: clearing the override (via the unset sentinel) returns control to the
+        // env-var/default fallback path. We can't easily test the env var branch here without
+        // mutating process state, so we just verify the sentinel transitions correctly.
+        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.store(
+            PROVER_MEMORY_MODE_OVERRIDE_UNSET,
+            std::sync::atomic::Ordering::Release,
+        );
+        assert_eq!(
+            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
+            PROVER_MEMORY_MODE_OVERRIDE_UNSET,
+            "manual unset must clear the override sentinel"
+        );
+
+        // Restore the snapshot so unrelated tests in the same binary observe the same global
+        // state they started with.
+        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE
+            .store(initial_override, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Builds a SIMD `LowMemory` `CommitmentTreeProver` shaped like the privacy-demo workload:
+    /// many polynomials of varying log_size. Used by the round-trip tests below to exercise
+    /// the [`CommitmentTreeProver::materialize_evaluations_low_memory`] code path.
+    fn prepare_simd_low_memory_tree<MC: MerkleChannel>(
+        pool: &BaseColumnPool<SimdBackend>,
+    ) -> CommitmentTreeProver<SimdBackend, MC>
+    where
+        SimdBackend: BackendForChannel<MC>,
+    {
+        // Sizes are chosen to be large enough to exercise the SIMD path (>= N_LANES per column)
+        // while still completing instantly in CI.
+        let polys = (0..6)
+            .map(|i| {
+                let log_size = 5 + (i % 3);
+                CircleCoefficients::new(
+                    (0..1u32 << log_size)
+                        .map(|j| M31::from((j + 1) * (i + 1) as u32))
+                        .collect(),
+                )
+            })
+            .collect_vec();
+        let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
+
+        CommitmentTreeProver::new_with_memory_mode(
+            polys,
+            1,
+            &twiddles,
+            // Retain coefficients so the tree can re-materialize evals after the initial drop —
+            // this is the path the new spill helper targets.
+            true,
+            None,
+            pool,
+            ProverMemoryMode::LowMemory,
+        )
+    }
+
+    /// Verifies the `LowMemory` per-poly materialize-and-spill round-trip.
+    ///
+    /// 1. After construction the SIMD `LowMemory` tree has dropped its evals (precondition).
+    /// 2. `materialize_evaluations_low_memory` repopulates every poly's evals; the resulting tree
+    ///    must hold one mmap guard per polynomial.
+    /// 3. The mmap-backed eval values must equal the values produced by the eager
+    ///    `materialize_evaluations` path on a freshly constructed sibling tree, which transitively
+    ///    asserts that the spill round-trip preserves bytes.
+    /// 4. `drop_evaluations` must clear both the polys' evals and the guard list without crashing
+    ///    on `Vec::drop` of mmap-backed memory — this is the regression that breaks if
+    ///    [`CommitmentTreeProver::forget_mmap_backed_evals_if_any`] is wired incorrectly.
+    #[test]
+    fn test_simd_low_memory_materialize_round_trip() {
+        // Twiddle precomputation is shared between the two trees so the materialized values
+        // are byte-identical.
+        let pool = BaseColumnPool::<SimdBackend>::new();
+        let mut spilled_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
+
+        // Precondition: LowMemory construction drops evals.
+        assert!(
+            spilled_tree.polynomials.iter().all(|p| p.evals.is_none()),
+            "LowMemory construction must drop evals before re-materialization"
+        );
+        assert!(
+            spilled_tree.eval_mmap_guards.is_empty(),
+            "no eval mmap guards should exist before re-materialization"
+        );
+
+        // Step 2: materialize-and-spill per poly.
+        spilled_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        assert!(
+            spilled_tree.polynomials.iter().all(|p| p.evals.is_some()),
+            "every poly must have evals after materialize_evaluations_low_memory"
+        );
+        assert!(
+            !spilled_tree.eval_mmap_guards.is_empty(),
+            "at least one mmap guard should be recorded after spilling — \
+             a missing guard would mean drop_evaluations cannot recover the mmap state"
+        );
+
+        // Step 3: cross-check eval values against the eager re-materialization path.
+        let mut eager_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        eager_tree.materialize_evaluations(&twiddles, &pool);
+        for (idx, (a, b)) in spilled_tree
+            .polynomials
+            .iter()
+            .zip(eager_tree.polynomials.iter())
+            .enumerate()
+        {
+            let spilled_values = a.evals.as_ref().unwrap().values.to_cpu();
+            let eager_values = b.evals.as_ref().unwrap().values.to_cpu();
+            assert_eq!(
+                spilled_values, eager_values,
+                "mmap-backed and heap-backed evals must agree at poly index {idx}"
+            );
+        }
+
+        // Step 4: drop_evaluations must safely release mmap-backed Vecs.
+        spilled_tree.drop_evaluations();
+        assert!(
+            spilled_tree.polynomials.iter().all(|p| p.evals.is_none()),
+            "drop_evaluations must clear every poly's evals"
+        );
+        assert!(
+            spilled_tree.eval_mmap_guards.is_empty(),
+            "drop_evaluations must clear the guard list (which munmaps the regions)"
+        );
+
+        // Round-trip must be repeatable: a second materialize+drop cycle must also succeed.
+        spilled_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        assert!(spilled_tree.polynomials.iter().all(|p| p.evals.is_some()));
+        spilled_tree.drop_evaluations();
+        assert!(spilled_tree.polynomials.iter().all(|p| p.evals.is_none()));
+
+        // Cleanup of the eager tree (heap-backed) must also work via the same drop helper.
+        eager_tree.drop_evaluations();
     }
 
     #[test]

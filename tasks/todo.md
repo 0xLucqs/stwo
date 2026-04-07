@@ -1,0 +1,164 @@
+- [x] Inspect the existing end-to-end proof harness and choose the lowest-churn location for a fast-vs-low-memory byte-identity regression test
+- [x] Add a deterministic byte-identity STARK proof regression test for fast vs low-memory proving
+- [x] Run the targeted proof regression test and record the result
+
+- [x] Clarify target platform and success criteria for client-side proving
+- [x] Inspect prover memory-heavy data paths in commitment, quotient, and FRI stages
+- [x] Check current native prover build status
+- [x] Summarize concrete options for lowering RAM enough for native mobile proving
+- [x] Recommend next experiments and sequencing
+- [x] Add a clean prover memory-mode API
+- [x] Implement a low-memory FRI path that recomputes inner-layer evaluations during decommit
+- [x] Verify low-memory FRI and PCS proving paths with focused tests
+- [x] Add a checkpointed lifted Merkle prover for sparse retained layers
+- [x] Switch low-memory FRI inner layers to checkpointed Merkle storage
+- [x] Verify checkpointed Merkle decommitment matches the full-tree prover
+- [x] Re-run focused low-memory verification and manual memory measurement
+- [x] Add direct checkpointed Merkle commit without full-tree materialization
+- [x] Switch low-memory FRI first-layer commitment to checkpointed Merkle storage
+- [x] Re-run focused verification and manual memory measurement after the first-layer change
+- [x] Retain coefficients automatically in low-memory PCS mode
+- [x] Drop committed trace eval buffers after quotient construction in low-memory mode
+- [x] Recompute only queried trace values during low-memory PCS decommit
+- [x] Add focused verification and a manual PCS memory measurement harness
+- [x] Fix downstream real-proof harnesses for optional retained eval buffers
+- [x] Add a real end-to-end proof harness that runs in both Fast and LowMemory modes
+- [x] Measure RAM and runtime on a real proof and compare against the synthetic PCS harness
+- [x] Rework low-memory PCS so it only drops eval buffers early when coefficients are actually retained
+- [x] Verify that low-memory no longer regresses the release-mode Cairo builtins proof
+- [x] Make low-memory PCS avoid forced coefficient retention on large workloads
+- [x] Re-verify focused low-memory proving after the PCS strategy change
+- [x] Re-measure the release-mode Cairo builtins proof after the PCS strategy change
+- [x] Add a macOS phase-memory ledger that can snapshot process memory at prover phase boundaries
+- [x] Wire the phase ledger into the PCS path and the disposable Cairo proving harness
+- [x] Run release-mode Cairo proofs with the phase ledger enabled and compare Fast vs LowMemory
+- [x] Add checkpointed Merkle storage for low-memory PCS commitment trees
+- [x] Recompute checkpoint segments sparsely during PCS decommit without rebuilding full leaf layers
+- [x] Verify low-memory PCS decommit matches the full-tree witness after the checkpointed-tree change
+- [x] Re-run focused prover tests and the release-mode Cairo builtins measurement after the PCS Merkle change
+- [x] Retain coefficients automatically for low-memory PCS trees so trace evals can be dropped earlier
+- [x] Release recomputable trace eval buffers before OODS/FRI in low-memory mode
+- [x] Stream low-memory FRI quotient inputs by log-size group instead of materializing all trace evals at once
+- [x] Verify focused low-memory proving after the grouped quotient path change
+- [x] Re-measure the release-mode Cairo builtins proof after the grouped quotient path change
+- [x] Inspect the existing Instruments traces at the actual peak and identify the dominant allocation/callsite
+- [x] Map the peak allocation back to a concrete prover phase and code path
+- [x] Implement one targeted change against the peak owner
+- [x] Re-run the real release-mode Cairo proof and compare the same peak metric
+
+## Review
+
+- Added an end-to-end Plonk regression test that proves the same statement in `Fast` and `LowMemory` modes, serializes both proofs with `serde_json`, and asserts the resulting proof bytes are identical.
+- Updated the Plonk example's internal constraint sanity check so low-memory proving no longer depends on resident in-memory coefficient vectors; the assertion now remains compatible with the current coefficient spilling behavior.
+- Targeted verification passed: `cargo test -p stwo-examples test_simd_plonk_pro -- --nocapture`.
+- Native `cargo check -p stwo --features prover` passes locally.
+- The dominant work is architectural analysis of peak prover memory, not basic portability.
+- Native mobile is more plausible than wasm here because the SIMD field backend already contains `aarch64 + neon` paths, but iOS/Android cross-targets were not installed so they were not directly checked.
+- The main RAM hotspots are full trace evaluation retention, full Merkle layer retention, and FRI layer materialization across the whole quotient domain.
+- First implementation slice landed as a prover-only `LowMemory` mode that changes FRI internals without changing the proof format.
+- Focused verification passed: `cargo check -p stwo --features prover` and `cargo test -p stwo --features prover low_memory`.
+- The next slice targets retained Merkle layers in low-memory FRI by storing sparse checkpoints and reconstructing missing layers during decommit.
+- Checkpointed Merkle storage now backs low-memory FRI inner layers and matches the full-tree decommitment witness in focused tests.
+- Focused verification passed after the checkpointed change: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover checkpointed`, and `cargo test -p stwo --features prover low_memory`.
+- Manual FRI measurement moved only slightly: `Fast` was about 38.9 MiB peak footprint, `LowMemory` about 38.6 MiB, with `LowMemory` still materially slower. This suggests peak memory is still dominated by the first FRI layer and other retained state, not just inner-layer Merkle retention.
+- The next slice targets the largest Merkle allocation directly by making checkpointed commit avoid full-tree materialization and applying it to the first FRI layer in low-memory mode.
+- Direct checkpointed commit now avoids building full Merkle trees for low-memory FRI layers, including the first layer.
+- After the first-layer change, focused verification still passed: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover checkpointed`, and `cargo test -p stwo --features prover low_memory`.
+- Updated manual FRI measurement: `Fast` was `252,133,376` max RSS / `38,404,648` peak footprint / `16.86s`, while `LowMemory` was `245,219,328` max RSS / `38,519,312` peak footprint / `32.08s`. That indicates some reduction in resident-set pressure, but little to no improvement in Apple footprint and a large CPU cost.
+- The next target is trace/PCS evaluation retention: keep coefficients in low-memory mode, free large committed eval buffers after quotient construction, and recompute only the queried row values during trace decommit.
+- Low-memory PCS now retains coefficients automatically, releases committed trace eval buffers after quotient construction, and recomputes queried row values during decommit.
+- Focused verification passed for the PCS retention change: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover test_commitment_tree_decommit_after_releasing_evals`, and `cargo test -p stwo --features prover low_memory`.
+- PCS manual measurement on the larger apples-to-apples harness (`128` columns, `lifting_log_size=16`, coefficients stored in both modes) moved from `72,712,192` max RSS / `38,715,920` peak footprint / `7.60s` in `Fast` to `64,126,976` max RSS / `38,470,112` peak footprint / `10.73s` in `LowMemory`.
+- The real end-to-end Plonk proof path now also runs in both `Fast` and `LowMemory` modes. Compatibility fixes were needed in downstream callers that assumed `Poly.evals` was always present.
+- Real-proof verification passed: `cargo test -p stwo-examples plonk_prove -- --nocapture` ran both the fast and low-memory Plonk tests successfully.
+- Real-proof manual measurement on the Plonk harness (`log_n_rows=12`) moved from `59,260,928` max RSS / `39,060,008` peak footprint / `0.87s` wall time in `Fast` to `55,197,696` max RSS / `38,650,384` peak footprint / `2.29s` wall time in `LowMemory`.
+- Compared to the synthetic PCS harness, the real proof still shows a clear RSS reduction but also a larger end-to-end slowdown, which suggests recomputation is working while other untouched phases still dominate peak memory.
+- A release-mode Cairo builtins proof was measured through a disposable `stwo-cairo` copy patched to use this local `stwo` tree. That workload is genuinely in the multi-GB regime: `Fast` measured `18,753,454,080` max RSS / `28,227,539,320` peak footprint / `23.15s`.
+- The current `LowMemory` mode regressed on that Cairo proof after enabling a temporary compatibility patch for the preprocessed tree: `22,463,922,176` max RSS / `30,144,780,032` peak footprint / `37.16s`.
+- The Cairo run exposed an integration gap: direct `CommitmentTreeProver::new(...)` users, like `stwo-cairo` preprocessed-trace construction, must retain coefficients when low-memory decommit recomputation is expected. Without that, the low-memory path panicked on missing coefficients.
+- The Cairo numbers indicate that the current low-memory work is too narrow for the real target workload. On a large Cairo proof, coefficient retention plus untouched trace/witness/Merkle peaks dominate and currently outweigh the FRI/PCS eval-buffer savings.
+- Best next work/improvement ratio so far was to stop forcing coefficient retention in `LowMemory` PCS mode and only release eval buffers early for trees that already retain coefficients explicitly.
+- Focused verification still passed after that strategy change: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover low_memory`, and `cargo test -p stwo --features prover test_commitment_tree_decommit_after_releasing_evals`.
+- Re-measured release-mode Cairo builtins proof after the change. `Fast` remained `18,753,454,080` max RSS / `28,227,539,320` peak footprint / `23.15s`; `LowMemory` improved from the previous regression to `19,958,726,656` max RSS / `28,322,746,720` peak footprint / `26.41s`.
+- That means the change recovered about `2.7 GiB` of RSS versus the previous low-memory implementation on Cairo, but `LowMemory` is still slightly worse than `Fast` on this workload by about `1.1 GiB` RSS and about `95 MiB` Apple footprint.
+- Next measurement pass should use Xcode Instruments on the release-mode Cairo proof to attribute memory by category rather than relying only on `/usr/bin/time -l`.
+- Xcode Instruments `Activity Monitor` traces on the release-mode Cairo builtins proof now confirm the same qualitative result: `LowMemory` still spikes higher than `Fast` on peak footprint and much higher on peak resident memory, even though its average and final footprint are lower.
+- On the Instrumented runs, `Fast` peaked at `27,348,602,608` bytes of `Memory` (`~25.47 GiB`) and `12,759,040,000` bytes of `Real Mem` (`~11.88 GiB`), while `LowMemory` peaked at `28,468,433,320` bytes of `Memory` (`~26.51 GiB`) and `16,415,719,424` bytes of `Real Mem` (`~15.29 GiB`).
+- The sampled traces also show why the mode still loses on peak: `LowMemory` releases more by the end of the run, but it creates a larger early resident-memory spike and then leans harder on compression later, so mobile-relevant peak pressure is still worse.
+- Unprofiled direct release runs of the same binary still show `LowMemory` slower and slightly larger overall: `Fast` was `20.93s`, `21,589,065,728` max RSS, `28,194,394,560` peak footprint; `LowMemory` was `22.71s`, `22,119,661,568` max RSS, `28,482,015,704` peak footprint.
+- A macOS-only phase-memory ledger now exists in `stwo` and logs boundary snapshots when `STWO_PHASE_MEMORY_REPORT=1` is set.
+- On the Fast Cairo run with the phase ledger enabled, the largest boundary-sampled resident spike showed up during preprocessed-tree extension (`pcs:tree:new:after_extension`, `13,261,537,280` bytes resident), while the largest boundary-sampled footprint showed up later during PCS out-of-domain evaluation (`pcs:prove_values:after_oods`, `27,341,131,336` bytes footprint).
+- On the LowMemory Cairo run, the boundary-sampled footprint peak was still in PCS out-of-domain evaluation (`pcs:prove_values:after_oods`, `27,300,515,544` bytes), and the run still showed a very large early resident spike before the low-memory FRI path had a chance to help.
+- The checkpoint deltas reinforce the architecture conclusion: the biggest jumps are preprocessed interpolation, commitment-tree extension, and Merkle construction long before low-memory FRI cleanup becomes relevant. The next meaningful RAM reduction has to come from streaming preprocessed/base trace commitment, not more late-phase FRI tuning.
+- Low-memory PCS commitment trees now use checkpointed lifted Merkle storage, and checkpointed PCS decommit reconstructs only the tiny source blocks needed within each checkpoint segment instead of rebuilding a full leaf layer.
+- Focused verification passed for the new PCS tree path: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover low_memory`, and `cargo test -p stwo --features prover checkpointed`.
+- The checkpointed PCS tree path is proof-equivalent in focused tests both with retained eval buffers and after releasing them, which shows the sparse segment recomputation produces the same Merkle witness as the full in-memory tree.
+- Re-measured the release-mode Cairo builtins proof through the disposable `stwo-cairo` harness after switching the preprocessed tree to build directly in low-memory PCS mode. Direct macOS counters improved from `Fast` at `19,931,873,280` max RSS / `28,701,807,160` peak footprint / `22.47s` to `LowMemory` at `22,541,221,888` max RSS / `24,087,954,832` peak footprint / `16.89s`.
+- Xcode Instruments `Activity Monitor` confirms the same direction on process charge. `Fast` peaked at `27,953,450,976` bytes of `Memory` (`~26.03 GiB`) and `16,479,158,272` bytes of `Real Mem` (`~15.35 GiB`), while `LowMemory` peaked at `23,773,103,216` bytes of `Memory` (`~22.13 GiB`) and `18,786,467,840` bytes of `Real Mem` (`~17.50 GiB`).
+- The Instruments traces show what changed: low-memory reduced peak `Memory` by about `4.18 GiB`, reduced peak compressed memory by about `2.65 GiB`, and lowered average `Memory` by about `2.24 GiB`, but it increased peak `Real Mem` by about `2.15 GiB`. So the app is paying with more active resident memory while relying less on compression and total charged footprint.
+- Added a dedicated `profiling` Cargo profile in the disposable Cairo harness (`release` plus `debug = true` and packed split debuginfo) so `cargo instruments -t Allocations` can attribute the real release-mode proof to Rust symbols.
+- `cargo instruments -t Allocations` on the real Cairo builtins proof shows the dominant allocator category is large VM-backed malloc regions, not small heap objects. In the statistics view, `All VM Regions` persistent bytes dropped from `22,217,818,112` in `Fast` to `16,700,915,712` in `LowMemory`, and `VM: MALLOC_LARGE` dropped from `20,762,836,992` to `15,170,699,264`.
+- The same Allocations profile also shows why the low-memory path is not a free win: total heap allocation traffic increased. `All Heap & Anonymous VM` total bytes rose from `65,287,532,688` in `Fast` to `70,609,709,584` in `LowMemory`, which is consistent with recomputation replacing retained buffers.
+- Large-allocation buckets make the tradeoff concrete. Compared with `Fast`, `LowMemory` added another `+0.5 GiB` in the `Malloc 32 MiB` bucket, `+0.5 GiB` in `Malloc 64 MiB`, `+1.0 GiB` in `Malloc 128 MiB`, `+1.5 GiB` in `Malloc 256 MiB`, and `+2.0 GiB` in `Malloc 512 MiB` total traffic, while still reducing the amount that stayed resident in large VM regions.
+- The allocator evidence matches the Activity Monitor traces: checkpointed PCS is reducing long-lived large allocations and overall charged footprint, but the prover still burns substantial transient memory bandwidth and resident working set. The next mobile-relevant win has to come from streaming or chunking trace commitment and witness generation, not from tuning small allocations.
+- Low-memory PCS now retains coefficients automatically, releases trace eval buffers before OODS, computes quotient inputs by log-size group from pooled recomputation, and rematerializes evals only one tree at a time during decommit to avoid the previous multi-minute slowdown.
+- Focused verification still passed after the grouped quotient change: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover low_memory`, and `cargo test -p stwo --features prover checkpointed`.
+- On the real release-mode Cairo builtins proof, the current code now measures `Fast` at `16,965,025,792` max RSS / `28,362,576,344` peak footprint / `25.71s`, versus `LowMemory` at `19,274,924,032` max RSS / `26,460,245,120` peak footprint / `25.83s`.
+- That means the new low-memory path recovered the catastrophic decommit slowdown from the first grouped-quotient attempt, and now buys about `1.9 GiB` lower peak footprint at roughly equal wall time, but it still costs about `2.3 GiB` more RSS on the real Cairo workload.
+- Peak-focused tracing found that the previous low-memory path was still entering `prove_ex` with all committed trace evals resident. Releasing buffers from the pool was not enough; those buffers had to be dropped before the composition commit peak.
+- Low-memory composition generation now rematerializes only the tree spans each component actually touches, then drops them immediately after that component finishes. This moved the composition-generation footprint on the Cairo builtins proof from about `24.29 GiB` down to about `12.67 GiB` in the phase ledger.
+- To attack the earlier caller-side peaks, `TreeBuilder` now exposes `release_recomputable_evaluations()`, and `CommitmentTreeProver` exposes `release_recomputable_evaluations_low_memory()`. These let a caller drop recomputable evals right after committing or constructing a tree, instead of waiting until `prove_ex`.
+- Using those hooks in the disposable Cairo harness moved the later peak owners down substantially. The phase ledger now shows roughly `17.17 GiB` at base-trace commit, `16.13 GiB` at interaction-trace commit, `14.92 GiB` at composition commit, and `15.90 GiB` at FRI commit.
+- The remaining top peak is now the externally built preprocessed tree itself, at about `21.57 GiB` footprint immediately after its Merkle commit and before its evals are dropped.
+- Final apples-to-apples release-mode Cairo builtins comparison on the same harness build:
+- `Fast`: `18,623,315,968` max RSS / `28,572,389,848` peak footprint / `24.50s`
+- `LowMemory`: `19,086,573,568` max RSS / `21,570,518,616` peak footprint / `21.30s`
+- That is about `7.0 GiB` lower peak footprint for `LowMemory` on the real Cairo workload, while RSS is still about `0.43 GiB` higher. The next meaningful reduction target is the preprocessed-tree build path.
+- Low-memory commitment trees now drop recomputable eval buffers immediately inside `CommitmentTreeProver::new_with_memory_mode`, instead of waiting for the caller to remember to release them later.
+- Focused verification passed for that constructor change: `cargo check -p stwo --features prover`, `cargo test -p stwo --features prover low_memory`, and `cargo test -p stwo --features prover test_low_memory_tree_releases_evals_on_construction`.
+- The preprocessed-tree peak is no longer the top process peak. In the phase ledger, the preprocessed tree now drops from roughly `21.57 GiB` down to roughly `13.40 GiB` immediately inside the constructor, and the overall boundary-sampled peak moved to the later base-trace path at about `16.77 GiB`.
+- Updated release-mode Cairo builtins comparison after the preprocessed-tree fix:
+- `Fast`: `18,502,025,216` max RSS / `28,303,184,272` peak footprint / `25.84s`
+- `LowMemory`: `14,026,752,000` max RSS / `21,558,853,184` peak footprint / `23.57s`
+- That is about `6.7 GiB` lower peak footprint and about `4.5 GiB` lower RSS for `LowMemory` on the real Cairo workload, with about `2.3s` lower wall time on this run.
+- The next peak owner is now the base/interactions trace commitment path, not the preprocessed tree or composition generation. The next reduction should target whole-tree materialization during those commits.
+- [ ] Re-profile the latest low-memory Cairo release proof with Instruments to identify the true peak phase, not just boundary-sampled checkpoints
+- [ ] If the true peak is transient, add narrower prover checkpoints or remove the responsible transient allocation
+- [ ] If the true peak is retained state, reduce the dominant retained structure in the base/interactions path
+- [x] Re-profile the low-memory Cairo release proof after tightening the interaction-trace path
+- [x] Implement a low-memory Cairo interaction path that consumes interaction generators sequentially instead of materializing every component result in parallel
+- [x] Compact the biggest fixed-table interaction generators (`range_check_20` and `range_check_9_9`) so they no longer retain duplicated preprocessed columns between base and interaction phases
+- [x] Measure the Cairo peak again with Activity Monitor after the interaction-path changes
+- [x] Try the same compact-generator pattern on `pedersen_points_table_window_bits_18` and keep it only if the peak improves
+- Instruments plus per-component phase checkpoints showed the true remaining peak is transient inside composition generation, not at the coarser `after_interaction_draw` boundary.
+- The concrete peak owner is `pedersen_points_table_window_bits_18`: in the latest low-memory Cairo run it rises from `16,029,658,776` bytes before materialization to `18,715,981,336` bytes after materialization and peaks at `19,085,424,416` bytes after evaluation before dropping back to `14,404,643,448`.
+- A grouped-evaluation-mode experiment inside core `stwo` did not reduce that peak because all Cairo components still fell into the same mode. That experiment was removed.
+- The next high-ROI reduction is Cairo-specific rather than generic PCS/FRI work: `pedersen_points_table_window_bits_18` is a deterministic table-backed component driven entirely by `preprocessed_trace`, so it should move toward preprocessed or regenerable data instead of behaving like a large dynamic trace that must be rematerialized during composition.
+- The latest boundary-sampled phase log still peaks at `cairo:prove:after_interaction_draw` (`16,751,079,592` bytes), but Activity Monitor shows the real process peak is a higher transient in the same early base/interactions window. That confirms the current bottleneck is retained Cairo interaction state rather than late FRI/PCS work.
+- Making `CairoInteractionClaimGenerator::write_interaction_trace` sequential in low-memory mode reduced the Activity Monitor `Memory` peak from `20,950,875,352` bytes to `20,310,293,264` bytes on the same Cairo builtins proof, about `611 MiB` lower.
+- Compacting the two largest fixed-table interaction generators that duplicated preprocessed columns, `range_check_20` and `range_check_9_9`, lowered the same peak slightly further to `20,301,462,336` bytes.
+- Applying the same on-demand preprocessed replay pattern to `pedersen_points_table_window_bits_18` did not help on the Activity Monitor peak; that experiment measured `20,448,869,208` bytes and is not the direction to keep following.
+- The best current disposable Cairo harness variant from this round is therefore: sequential low-memory interaction generation plus compact `range_check_20` and `range_check_9_9` interaction generators.
+- The next meaningful reduction is architectural inside `stwo-cairo`: shrink the retained bridge from base trace generation to interaction trace generation so Cairo does not have to hold a giant `CairoInteractionClaimGenerator` full of lookup tuples across the base-commit peak.
+- Added a new end-to-end Plonk regression in `stwo-examples` that proves the same STARK in `Fast` and `LowMemory` modes and asserts the serialized proof bytes are identical via `serde_json`.
+- While wiring that test, the existing low-memory Plonk example failure turned out to come from a fast-path-only debug assertion (`assert_constraints_on_polys`) inside the example harness. That assertion is now gated to `Fast`, and focused verification passed with `cargo test -p stwo-examples test_simd_plonk_prove_low_memory -- --nocapture` and `cargo test -p stwo-examples test_simd_plonk_proof_bytes_match_low_memory -- --nocapture`.
+- [x] Inspect the current offline SNOS proof target and latest low-memory `stwo` paths to isolate mobile-relevant peak owners
+- [x] Reproduce or inspect a release-with-debug measurement path for the offline SNOS proof, preferring Instruments `Allocations` when symbolization is usable
+- [x] Map dominant RAM owners to concrete retained structures or transient allocations in base/interactions, PCS, and FRI code
+- [x] Decide whether there is a clearly safe high-ROI `stwo`-only RAM reduction worth implementing immediately
+- [x] Record review notes with measured evidence, safe optimization candidates, and the next highest-ROI reduction
+
+## Review
+
+- Reproduced the real target workload directly from the sequencer release test harness patched to `/Users/lucas/stwo/.claude/worktrees/beautiful-chandrasekhar`.
+- Current apples-to-apples `/usr/bin/time -l` numbers on `proving::virtual_snos_prover_test::test_prove_privacy_demo_transaction`:
+- `Fast`: `14.76s` wall, `11,552,292,864` max RSS, `15,216,864,560` peak footprint.
+- `LowMemory` via `STWO_PROVER_MEMORY_MODE=low_memory`: `26.75s` wall, `7,505,510,400` max RSS, `8,025,921,776` peak footprint.
+- That means the existing low-memory path already removes about `4.0 GiB` of RSS and about `7.2 GiB` of peak footprint on the real privacy-demo proof, with no protocol-format change.
+- Static code inspection of the patched `stwo` worktree shows the main generic prover levers are already active: checkpointed low-memory Merkle trees, early eval release, coefficient spilling, grouped quotient recomputation, and component-scoped trace rematerialization in `prove_ex`.
+- I did not find a comparably large remaining `stwo`-only win that stays clearly below the soundness-risk line. The remaining obvious generic ideas are incremental and complex rather than drastic.
+- The highest-ROI remaining reduction is still outside core `stwo`, in `stwo-cairo`'s retained base-to-interaction bridge. `CairoInteractionClaimGenerator::write_interaction_trace` still uses `scope(...)` to materialize many interaction traces in parallel before feeding them into the tree builder, which keeps multiple large trace payloads live at once.
+- The generated Cairo witness code for heavy fixed-table components such as `pedersen_points_table_window_bits_18`, `range_check_20`, and `range_check_9_9` still builds large `LookupData` vectors that duplicate preprocessed-column payloads instead of replaying or streaming them. That is safe to change because it affects witness generation and retention strategy, not verifier challenges or proof semantics.
+- Existing Allocations exports from the closely related full Cairo proof still show the dominant memory class is large VM-backed malloc regions, not small-object churn. In the saved `cairo_alloc_*_stats.xml` traces, `VM: MALLOC_LARGE` and `Malloc 32/64/128/256/512 MiB` buckets dominate both persistent bytes and total traffic, which matches the observed wide-trace and Merkle materialization architecture.
+- Existing Allocations list exports from that Cairo proof also show many live `Malloc 32,00 MiB` regions owned by Rayon worker `call_once` frames during the early proof window, reinforcing that parallel witness/trace generation is a real contributor to peak memory.
+- Conclusion: if the goal is "mobile-feasible" memory, keep the current low-memory `stwo` path enabled and spend the next optimization round on Cairo-specific interaction generation and fixed-table replay/streaming, not on deeper FRI or verifier-path surgery.
