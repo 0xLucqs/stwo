@@ -107,12 +107,13 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// effectively equivalent to the eager `materialize_evaluations` path.
 ///
 /// Raising this budget trades RAM for wall-clock: each mmap flush costs a file write, a
-/// sync, and a mmap call (tens of ms per column on mobile flash). A 1 GiB default lets the
-/// typical phone workload complete with zero spills during the tail phase when the initial
-/// commit spike has already been released. Devices with less than ~2 GiB of app budget should
-/// override via [`set_low_memory_materialize_budget_bytes`] or
+/// sync, and a mmap call (tens of ms per column on mobile flash). A 2 GiB default lets a
+/// privacy-demo-size phone workload complete with effectively zero spills during the tail
+/// phase, when the initial commit spike has already been released and the jetsam budget has
+/// opened back up. Devices with less than ~3 GiB of app budget should override via
+/// [`set_low_memory_materialize_budget_bytes`] or
 /// `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`.
-const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 1 << 30;
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 2 << 30;
 
 /// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
 const LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV: &str = "STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES";
@@ -1115,10 +1116,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     /// this function is effectively the eager `materialize_evaluations` path with one extra
     /// atomic load.
     ///
-    /// This lets callers with generous memory budgets (e.g. phones with 1-2 GiB of headroom
+    /// This lets callers with generous memory budgets (e.g. phones with 2+ GiB of headroom
     /// during the decommit tail phase) trade RAM for wall-clock: each mmap flush costs a
     /// file write, a sync, and a mmap call, which adds up to seconds of wall-clock on
-    /// mobile flash for a full privacy-demo-size trace. Defaulting the budget to 1 GiB
+    /// mobile flash for a full privacy-demo-size trace. Defaulting the budget to 2 GiB
     /// eliminates the spill overhead during the tail phase on phones that can afford it,
     /// while still bounding the spike for memory-constrained devices that override the
     /// budget down.
@@ -1731,7 +1732,7 @@ mod tests {
         let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
 
         // ---- Scenario 1: huge budget → no spill, everything heap-backed ---------------
-        set_low_memory_materialize_budget_bytes(1usize << 30); // 1 GiB — far exceeds test data
+        set_low_memory_materialize_budget_bytes(2usize << 30); // 2 GiB — far exceeds test data
         let mut huge_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
         assert!(
             huge_budget_tree
