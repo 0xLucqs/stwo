@@ -12,7 +12,7 @@ use crate::core::pcs::quotients::{
 };
 use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::bit_reverse_index;
-use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
+use crate::prover::pcs::quotient_ops::{AccumulatedNumerators, ComputedFriQuotients};
 use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
@@ -54,7 +54,7 @@ impl QuotientOps for CpuBackend {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
         _memory_mode: ProverMemoryMode,
-    ) -> SecureEvaluation<Self, BitReversedOrder> {
+    ) -> ComputedFriQuotients<Self, BitReversedOrder> {
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
         let subdomain_log_size = eval_subdomain.log_size();
@@ -98,6 +98,6 @@ impl QuotientOps for CpuBackend {
                 poly.evaluate_with_twiddles(eval_domain, twiddles).values
             }),
         };
-        SecureEvaluation::new(eval_domain, evals)
+        ComputedFriQuotients::new(SecureEvaluation::new(eval_domain, evals))
     }
 }

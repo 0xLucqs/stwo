@@ -22,11 +22,12 @@ use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::prover::backend::simd::cm31::PackedCM31;
 use crate::prover::backend::simd::utils::to_lifted_simd;
 use crate::prover::backend::{Column, CpuBackend};
-use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
+use crate::prover::pcs::quotient_ops::{AccumulatedNumerators, ComputedFriQuotients};
 use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
+use crate::prover::spill::{mmap_base_column, mmap_secure_column_by_coords};
 use crate::prover::{ProverMemoryMode, QuotientOps};
 
 pub struct QuotientConstants {
@@ -88,7 +89,7 @@ impl QuotientOps for SimdBackend {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
         memory_mode: ProverMemoryMode,
-    ) -> SecureEvaluation<Self, BitReversedOrder> {
+    ) -> ComputedFriQuotients<Self, BitReversedOrder> {
         // This constant is chosen empirically by benchmarking.
         const COMBINE_CHUNK_SIZE: usize = 16;
 
@@ -113,10 +114,10 @@ impl QuotientOps for SimdBackend {
                 &cpu_twiddles,
                 memory_mode,
             );
-            return SecureEvaluation::new(
+            return ComputedFriQuotients::new(SecureEvaluation::new(
                 cpu_result.domain,
-                SecureColumnByCoords::from_cpu(cpu_result.values),
-            );
+                SecureColumnByCoords::from_cpu(cpu_result.values.clone()),
+            ));
         }
         let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
             CircleDomainBitRevIterator::new(eval_subdomain).collect();
@@ -145,26 +146,62 @@ impl QuotientOps for SimdBackend {
         };
 
         if memory_mode == ProverMemoryMode::LowMemory {
-            let evals = SecureColumnByCoords {
-                columns: array::from_fn(|coordinate| {
-                    let quotient_coordinate = compute_quotient_coordinate_column(
-                        &accumulations,
-                        &denominators_inverses,
-                        &subdomain_points,
-                        subdomain_log_size,
-                        &log_ratios,
-                        &first_linear_terms,
-                        coordinate,
-                    );
-                    let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                        eval_subdomain,
-                        quotient_coordinate,
-                    )
-                    .interpolate_with_twiddles(&subdomain_twiddles);
-                    poly.evaluate_with_twiddles(eval_domain, twiddles).values
-                }),
-            };
-            return SecureEvaluation::new(eval_domain, evals);
+            if let Ok((mut eval_buffers, mmap_guard)) =
+                mmap_secure_column_by_coords(eval_domain.size())
+            {
+                let evals = SecureColumnByCoords {
+                    columns: array::from_fn(|coordinate| {
+                        let (quotient_coordinate, quotient_guard) = match mmap_base_column(
+                            1 << subdomain_log_size,
+                        ) {
+                            Ok((column, guard)) => (column, Some(guard)),
+                            Err(err) => {
+                                tracing::warn!(
+                                        "Failed to mmap low-memory quotient subdomain column: {err}. Falling back to heap."
+                                    );
+                                (
+                                    unsafe { BaseColumn::uninitialized(1 << subdomain_log_size) },
+                                    None,
+                                )
+                            }
+                        };
+                        let quotient_coordinate = compute_quotient_coordinate_column(
+                            &accumulations,
+                            &denominators_inverses,
+                            &subdomain_points,
+                            &log_ratios,
+                            &first_linear_terms,
+                            coordinate,
+                            quotient_coordinate,
+                        );
+                        let poly =
+                            CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                                eval_subdomain,
+                                quotient_coordinate,
+                            )
+                            .interpolate_with_twiddles(&subdomain_twiddles);
+                        let eval_buffer = std::mem::replace(
+                            &mut eval_buffers.columns[coordinate],
+                            BaseColumn::zeros(0),
+                        );
+                        let eval =
+                            SimdBackend::evaluate_into(&poly, eval_domain, twiddles, eval_buffer)
+                                .values;
+                        if quotient_guard.is_some() {
+                            std::mem::forget(poly);
+                        }
+                        eval
+                    }),
+                };
+                return ComputedFriQuotients::with_mmap_guard(
+                    SecureEvaluation::new(eval_domain, evals),
+                    mmap_guard,
+                );
+            }
+
+            tracing::warn!(
+                "Failed to mmap low-memory quotient evaluation columns. Falling back to heap."
+            );
         }
 
         let mut quotients: SecureColumnByCoords<SimdBackend> =
@@ -226,7 +263,7 @@ impl QuotientOps for SimdBackend {
             }),
         };
 
-        SecureEvaluation::new(eval_domain, evals)
+        ComputedFriQuotients::new(SecureEvaluation::new(eval_domain, evals))
     }
 }
 
@@ -234,15 +271,13 @@ fn compute_quotient_coordinate_column(
     accumulations: &[AccumulatedNumerators<SimdBackend>],
     denominators_inverses: &[Vec<PackedCM31>],
     subdomain_points: &[CirclePoint<PackedBaseField>],
-    subdomain_log_size: u32,
     log_ratios: &[u32],
     first_linear_terms: &[PackedSecureField],
     coordinate: usize,
+    mut quotient_coordinate: BaseColumn,
 ) -> BaseColumn {
     // This constant is chosen empirically by benchmarking.
     const COMBINE_CHUNK_SIZE: usize = 16;
-
-    let mut quotient_coordinate = unsafe { BaseColumn::uninitialized(1 << subdomain_log_size) };
 
     #[cfg(not(feature = "parallel"))]
     let iter = quotient_coordinate

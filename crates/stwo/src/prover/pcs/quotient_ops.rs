@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::iter::zip;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 
 use itertools::Itertools;
 use tracing::{span, Level};
@@ -18,7 +20,60 @@ use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
+use crate::prover::spill::SecureEvaluationMmapGuard;
 use crate::prover::{AccumulationOps, ProverMemoryMode};
+
+pub struct ComputedFriQuotients<B: ColumnOps<BaseField>, EvalOrder> {
+    evaluation: ManuallyDrop<SecureEvaluation<B, EvalOrder>>,
+    mmap_guard: Option<SecureEvaluationMmapGuard>,
+}
+
+impl<B: ColumnOps<BaseField>, EvalOrder> ComputedFriQuotients<B, EvalOrder> {
+    pub fn new(evaluation: SecureEvaluation<B, EvalOrder>) -> Self {
+        Self {
+            evaluation: ManuallyDrop::new(evaluation),
+            mmap_guard: None,
+        }
+    }
+
+    pub fn with_mmap_guard(
+        evaluation: SecureEvaluation<B, EvalOrder>,
+        mmap_guard: SecureEvaluationMmapGuard,
+    ) -> Self {
+        Self {
+            evaluation: ManuallyDrop::new(evaluation),
+            mmap_guard: Some(mmap_guard),
+        }
+    }
+}
+
+impl<B: ColumnOps<BaseField>, EvalOrder> Deref for ComputedFriQuotients<B, EvalOrder> {
+    type Target = SecureEvaluation<B, EvalOrder>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            &*((&self.evaluation as *const ManuallyDrop<SecureEvaluation<B, EvalOrder>>)
+                as *const SecureEvaluation<B, EvalOrder>)
+        }
+    }
+}
+
+impl<B: ColumnOps<BaseField>, EvalOrder> DerefMut for ComputedFriQuotients<B, EvalOrder> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            &mut *((&mut self.evaluation as *mut ManuallyDrop<SecureEvaluation<B, EvalOrder>>)
+                as *mut SecureEvaluation<B, EvalOrder>)
+        }
+    }
+}
+
+impl<B: ColumnOps<BaseField>, EvalOrder> Drop for ComputedFriQuotients<B, EvalOrder> {
+    fn drop(&mut self) {
+        if self.mmap_guard.is_none() {
+            unsafe { ManuallyDrop::drop(&mut self.evaluation) };
+        }
+    }
+}
 
 pub trait QuotientOps: PolyOps {
     /// Receives a non-empty set of columns of the *same* size, and populates the vector
@@ -53,7 +108,7 @@ pub trait QuotientOps: PolyOps {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
         memory_mode: ProverMemoryMode,
-    ) -> SecureEvaluation<Self, BitReversedOrder>;
+    ) -> ComputedFriQuotients<Self, BitReversedOrder>;
 }
 
 /// Helper struct that keeps track of the accumulation of the numerators involved in the FRI
@@ -95,7 +150,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     twiddles: &TwiddleTree<B>,
     log_blowup_factor: u32,
     memory_mode: ProverMemoryMode,
-) -> SecureEvaluation<B, BitReversedOrder> {
+) -> ComputedFriQuotients<B, BitReversedOrder> {
     let _span = span!(Level::INFO, "Compute FRI quotients", class = "FRIQuotients").entered();
     let mut accumulated_numerators_vec: Vec<AccumulatedNumerators<B>> = vec![];
     let samples_with_randomness = build_samples_with_randomness_and_periodicity(
@@ -188,7 +243,7 @@ pub fn compute_fri_quotients_from_polys<B: QuotientOps + AccumulationOps + Backe
     log_blowup_factor: u32,
     base_column_pool: &BaseColumnPool<B>,
     memory_mode: ProverMemoryMode,
-) -> SecureEvaluation<B, BitReversedOrder> {
+) -> ComputedFriQuotients<B, BitReversedOrder> {
     let _span = span!(
         Level::INFO,
         "Compute FRI quotients (low memory)",

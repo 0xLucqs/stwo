@@ -161,6 +161,60 @@ unsafe impl<T: Pod> Send for MmapVec<T> {}
 unsafe impl<T: Pod> Sync for MmapVec<T> {}
 
 impl<T: Pod> MmapVec<T> {
+    /// Creates a file-backed mmap of uninitialized storage for `len` elements.
+    #[cfg(unix)]
+    pub fn uninitialized(len: usize) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let byte_len = len * std::mem::size_of::<T>();
+
+        if byte_len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::NonNull::dangling().as_ptr(),
+                len: 0,
+                byte_len: 0,
+                _file: NamedTempFile::new()?,
+            });
+        }
+
+        let file = NamedTempFile::new()?;
+        file.as_file().set_len(byte_len as u64)?;
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            ptr: ptr as *mut T,
+            len,
+            byte_len,
+            _file: file,
+        })
+    }
+
+    /// Allocates uninitialized backing storage on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn uninitialized(len: usize) -> std::io::Result<Self> {
+        #[allow(clippy::uninit_vec)]
+        let data = unsafe {
+            let mut data = Vec::with_capacity(len);
+            data.set_len(len);
+            data
+        };
+        Self::from_vec(data)
+    }
+
     /// Converts a Vec to file-backed mmap storage.
     ///
     /// Writes the Vec's data to a temp file, mmaps it, and returns the mmap-backed view.
@@ -286,12 +340,70 @@ pub struct EvalMmapGuard {
     spilled_indices: Vec<usize>,
 }
 
+pub struct BaseColumnMmapGuard {
+    _mmap: MmapVec<crate::prover::backend::simd::m31::PackedBaseField>,
+}
+
+pub struct SecureEvaluationMmapGuard {
+    _columns: [BaseColumnMmapGuard; crate::core::fields::qm31::SECURE_EXTENSION_DEGREE],
+}
+
 impl EvalMmapGuard {
     pub fn offset_indices(&mut self, offset: usize) {
         self.spilled_indices
             .iter_mut()
             .for_each(|index| *index += offset);
     }
+}
+
+pub fn mmap_base_column(
+    length: usize,
+) -> std::io::Result<(
+    crate::prover::backend::simd::column::BaseColumn,
+    BaseColumnMmapGuard,
+)> {
+    let packed_len = length.div_ceil(crate::prover::backend::simd::m31::N_LANES);
+    let mmap = MmapVec::uninitialized(packed_len)?;
+    let data = unsafe {
+        Vec::from_raw_parts(
+            mmap.as_ptr() as *mut crate::prover::backend::simd::m31::PackedBaseField,
+            packed_len,
+            packed_len,
+        )
+    };
+    Ok((
+        crate::prover::backend::simd::column::BaseColumn { data, length },
+        BaseColumnMmapGuard { _mmap: mmap },
+    ))
+}
+
+pub fn mmap_secure_column_by_coords(
+    length: usize,
+) -> std::io::Result<(
+    crate::prover::secure_column::SecureColumnByCoords<crate::prover::backend::simd::SimdBackend>,
+    SecureEvaluationMmapGuard,
+)> {
+    let mut columns = Vec::with_capacity(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE);
+    let mut guards = Vec::with_capacity(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE);
+    for _ in 0..crate::core::fields::qm31::SECURE_EXTENSION_DEGREE {
+        let (column, guard) = mmap_base_column(length)?;
+        columns.push(column);
+        guards.push(guard);
+    }
+
+    let columns = match columns.try_into() {
+        Ok(columns) => columns,
+        Err(_) => unreachable!("secure evaluation coordinate count is fixed"),
+    };
+    let guards = match guards.try_into() {
+        Ok(guards) => guards,
+        Err(_) => unreachable!("secure evaluation coordinate count is fixed"),
+    };
+
+    Ok((
+        crate::prover::secure_column::SecureColumnByCoords { columns },
+        SecureEvaluationMmapGuard { _columns: guards },
+    ))
 }
 
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
