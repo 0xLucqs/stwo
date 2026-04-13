@@ -670,6 +670,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 self.twiddles,
                 self.config.fri_config.log_blowup_factor,
                 &self.base_column_pool,
+                self.memory_mode,
             )
         } else {
             let columns = self.evaluations();
@@ -681,6 +682,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 lifting_log_size,
                 self.twiddles,
                 self.config.fri_config.log_blowup_factor,
+                self.memory_mode,
             )
         };
         phase_memory_checkpoint("pcs:prove_values:after_fri_quotients");

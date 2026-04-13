@@ -18,7 +18,7 @@ use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
-use crate::prover::AccumulationOps;
+use crate::prover::{AccumulationOps, ProverMemoryMode};
 
 pub trait QuotientOps: PolyOps {
     /// Receives a non-empty set of columns of the *same* size, and populates the vector
@@ -52,6 +52,7 @@ pub trait QuotientOps: PolyOps {
         lifting_log_size: u32,
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
+        memory_mode: ProverMemoryMode,
     ) -> SecureEvaluation<Self, BitReversedOrder>;
 }
 
@@ -93,6 +94,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     lifting_log_size: u32,
     twiddles: &TwiddleTree<B>,
     log_blowup_factor: u32,
+    memory_mode: ProverMemoryMode,
 ) -> SecureEvaluation<B, BitReversedOrder> {
     let _span = span!(Level::INFO, "Compute FRI quotients", class = "FRIQuotients").entered();
     let mut accumulated_numerators_vec: Vec<AccumulatedNumerators<B>> = vec![];
@@ -168,6 +170,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
         lifting_log_size,
         log_blowup_factor,
         twiddles,
+        memory_mode,
     )
 }
 
@@ -184,6 +187,7 @@ pub fn compute_fri_quotients_from_polys<B: QuotientOps + AccumulationOps + Backe
     twiddles: &TwiddleTree<B>,
     log_blowup_factor: u32,
     base_column_pool: &BaseColumnPool<B>,
+    memory_mode: ProverMemoryMode,
 ) -> SecureEvaluation<B, BitReversedOrder> {
     let _span = span!(
         Level::INFO,
@@ -286,6 +290,7 @@ pub fn compute_fri_quotients_from_polys<B: QuotientOps + AccumulationOps + Backe
         lifting_log_size,
         log_blowup_factor,
         twiddles,
+        memory_mode,
     )
 }
 
@@ -344,6 +349,7 @@ mod tests {
             LOG_SIZE + LOG_BLOWUP_FACTOR,
             &CpuBackend::precompute_twiddles(eval_domain.half_coset),
             LOG_BLOWUP_FACTOR,
+            ProverMemoryMode::Fast,
         );
         let mut coeffs = quot_eval
             .values
@@ -494,6 +500,7 @@ mod tests {
             LOG_SIZE + LOG_BLOWUP_FACTOR,
             &twiddles,
             LOG_BLOWUP_FACTOR,
+            ProverMemoryMode::Fast,
         );
         let mut coeffs = quot_eval
             .values
@@ -504,6 +511,62 @@ mod tests {
         let zeros = coeffs[0].coeffs.split_off((1 << LOG_SIZE) - 1);
 
         assert!(zeros.iter().all(|c| c.is_zero()));
+    }
+
+    #[test]
+    fn test_simd_low_memory_compute_fri_quotients_matches_fast() {
+        let mut rng = SmallRng::seed_from_u64(0);
+        const LOG_SIZE: u32 = 6;
+        const LOG_BLOWUP_FACTOR: u32 = 2;
+
+        let polynomial = CpuCirclePoly::new((0..1 << LOG_SIZE).map(M31::from).collect());
+        let eval_domain = CanonicCoset::new(LOG_SIZE + LOG_BLOWUP_FACTOR).circle_domain();
+        let cpu_eval = polynomial.evaluate(eval_domain);
+        let simd_eval = CircleEvaluation::new(eval_domain, BaseColumn::from_cpu(&cpu_eval.values));
+
+        let sample_points = [
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+            SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>()),
+        ];
+        let samples = sample_points
+            .into_iter()
+            .map(|x| PointSample {
+                point: x,
+                value: polynomial.eval_at_point(x),
+            })
+            .collect_vec();
+        let rand_coeff =
+            SecureField::from_m31_array(std::array::from_fn(|_| M31::from(rng.gen::<u32>())));
+        let twiddles = SimdBackend::precompute_twiddles(eval_domain.half_coset);
+
+        let fast = compute_fri_quotients(
+            &TreeVec(vec![vec![&simd_eval]]),
+            &TreeVec(vec![vec![samples.clone()]]),
+            rand_coeff,
+            LOG_SIZE + LOG_BLOWUP_FACTOR,
+            &twiddles,
+            LOG_BLOWUP_FACTOR,
+            ProverMemoryMode::Fast,
+        );
+        let low_memory = compute_fri_quotients(
+            &TreeVec(vec![vec![&simd_eval]]),
+            &TreeVec(vec![vec![samples]]),
+            rand_coeff,
+            LOG_SIZE + LOG_BLOWUP_FACTOR,
+            &twiddles,
+            LOG_BLOWUP_FACTOR,
+            ProverMemoryMode::LowMemory,
+        );
+
+        assert_eq!(fast.domain, low_memory.domain);
+        for (fast_col, low_col) in fast
+            .values
+            .columns
+            .iter()
+            .zip(low_memory.values.columns.iter())
+        {
+            assert_eq!(fast_col.to_cpu(), low_col.to_cpu());
+        }
     }
 
     fn run_manual_pcs_memory_measurement(memory_mode: ProverMemoryMode) {

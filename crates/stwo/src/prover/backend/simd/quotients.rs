@@ -1,11 +1,14 @@
+use std::array;
 use std::iter::zip;
 
 use itertools::{zip_eq, Itertools};
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+#[cfg(feature = "parallel")]
+use rayon::slice::ParallelSliceMut;
 
-use super::column::CM31Column;
+use super::column::{BaseColumn, CM31Column};
 use super::domain::CircleDomainBitRevIterator;
 use super::m31::{PackedBaseField, LOG_N_LANES};
 use super::qm31::PackedSecureField;
@@ -18,13 +21,13 @@ use crate::core::pcs::quotients::{quotient_constants, ColumnSampleBatch};
 use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::prover::backend::simd::cm31::PackedCM31;
 use crate::prover::backend::simd::utils::to_lifted_simd;
-use crate::prover::backend::CpuBackend;
+use crate::prover::backend::{Column, CpuBackend};
 use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
 use crate::prover::poly::circle::{CircleEvaluation, PolyOps, SecureEvaluation};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
-use crate::prover::QuotientOps;
+use crate::prover::{ProverMemoryMode, QuotientOps};
 
 pub struct QuotientConstants {
     pub line_coeffs: Vec<Vec<(SecureField, SecureField, SecureField)>>,
@@ -84,6 +87,7 @@ impl QuotientOps for SimdBackend {
         lifting_log_size: u32,
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
+        memory_mode: ProverMemoryMode,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
         // This constant is chosen empirically by benchmarking.
         const COMBINE_CHUNK_SIZE: usize = 16;
@@ -107,6 +111,7 @@ impl QuotientOps for SimdBackend {
                 lifting_log_size,
                 log_blowup_factor,
                 &cpu_twiddles,
+                memory_mode,
             );
             return SecureEvaluation::new(
                 cpu_result.domain,
@@ -116,8 +121,6 @@ impl QuotientOps for SimdBackend {
         let subdomain_points: Vec<CirclePoint<PackedBaseField>> =
             CircleDomainBitRevIterator::new(eval_subdomain).collect();
         let subdomain_log_size = eval_subdomain.log_size();
-        let mut quotients: SecureColumnByCoords<SimdBackend> =
-            unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
         let sample_points: Vec<CirclePoint<SecureField>> =
             accumulations.iter().map(|x| x.sample_point).collect();
         let denominators_inverses = denominator_inverses(&sample_points, eval_subdomain);
@@ -131,6 +134,41 @@ impl QuotientOps for SimdBackend {
             .iter()
             .map(|acc| PackedSecureField::broadcast(acc.first_linear_term_acc))
             .collect();
+
+        let subdomain_twiddles = TwiddleTree {
+            root_coset: eval_subdomain.half_coset,
+            // Only itwiddles are needed for interpolation.
+            twiddles: TwiddleBuffer::empty(),
+            itwiddles: twiddles
+                .itwiddles
+                .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
+        };
+
+        if memory_mode == ProverMemoryMode::LowMemory {
+            let evals = SecureColumnByCoords {
+                columns: array::from_fn(|coordinate| {
+                    let quotient_coordinate = compute_quotient_coordinate_column(
+                        &accumulations,
+                        &denominators_inverses,
+                        &subdomain_points,
+                        subdomain_log_size,
+                        &log_ratios,
+                        &first_linear_terms,
+                        coordinate,
+                    );
+                    let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                        eval_subdomain,
+                        quotient_coordinate,
+                    )
+                    .interpolate_with_twiddles(&subdomain_twiddles);
+                    poly.evaluate_with_twiddles(eval_domain, twiddles).values
+                }),
+            };
+            return SecureEvaluation::new(eval_domain, evals);
+        }
+
+        let mut quotients: SecureColumnByCoords<SimdBackend> =
+            unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
 
         // Populate `quotients`.
         #[cfg(not(feature = "parallel"))]
@@ -177,14 +215,6 @@ impl QuotientOps for SimdBackend {
                 }
             }
         });
-        let subdomain_twiddles = TwiddleTree {
-            root_coset: eval_subdomain.half_coset,
-            // Only itwiddles are needed for interpolation.
-            twiddles: TwiddleBuffer::empty(),
-            itwiddles: twiddles
-                .itwiddles
-                .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
-        };
         let evals = SecureColumnByCoords {
             columns: quotients.columns.map(|eval| {
                 let poly = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
@@ -198,6 +228,72 @@ impl QuotientOps for SimdBackend {
 
         SecureEvaluation::new(eval_domain, evals)
     }
+}
+
+fn compute_quotient_coordinate_column(
+    accumulations: &[AccumulatedNumerators<SimdBackend>],
+    denominators_inverses: &[Vec<PackedCM31>],
+    subdomain_points: &[CirclePoint<PackedBaseField>],
+    subdomain_log_size: u32,
+    log_ratios: &[u32],
+    first_linear_terms: &[PackedSecureField],
+    coordinate: usize,
+) -> BaseColumn {
+    // This constant is chosen empirically by benchmarking.
+    const COMBINE_CHUNK_SIZE: usize = 16;
+
+    let mut quotient_coordinate = unsafe { BaseColumn::uninitialized(1 << subdomain_log_size) };
+
+    #[cfg(not(feature = "parallel"))]
+    let iter = quotient_coordinate
+        .data
+        .chunks_mut(COMBINE_CHUNK_SIZE)
+        .enumerate();
+
+    #[cfg(feature = "parallel")]
+    let iter = quotient_coordinate
+        .data
+        .par_chunks_mut(COMBINE_CHUNK_SIZE)
+        .enumerate();
+
+    iter.for_each(|(chunk_idx, value_dst)| {
+        let chunk_start = chunk_idx * COMBINE_CHUNK_SIZE;
+        let packed_chunk_len = value_dst.len();
+
+        let mut chunk_acc = [PackedSecureField::zero(); COMBINE_CHUNK_SIZE];
+        let chunk_acc = &mut chunk_acc[..packed_chunk_len];
+
+        for (((acc, den_inv), log_ratio), first_linear_term) in accumulations
+            .iter()
+            .zip_eq(denominators_inverses.iter())
+            .zip_eq(log_ratios.iter())
+            .zip_eq(first_linear_terms.iter())
+        {
+            for (i, accumulator) in chunk_acc.iter_mut().enumerate() {
+                let domain_idx = chunk_start + i;
+                let lifted_partial_numerator =
+                    PackedSecureField::from_packed_m31s(std::array::from_fn(|j| {
+                        let lifted_simd = to_lifted_simd(
+                            acc.partial_numerators_acc.columns[j].data[domain_idx >> log_ratio]
+                                .into_simd(),
+                            *log_ratio,
+                            domain_idx,
+                        );
+                        unsafe { PackedBaseField::from_simd_unchecked(lifted_simd) }
+                    }));
+
+                let numerator =
+                    lifted_partial_numerator - *first_linear_term * subdomain_points[domain_idx].y;
+                *accumulator += numerator * den_inv[domain_idx];
+            }
+        }
+
+        for (i, accumulator) in chunk_acc.iter().enumerate() {
+            value_dst[i] = accumulator.into_packed_m31s()[coordinate];
+        }
+    });
+
+    quotient_coordinate
 }
 
 /// Performs the pointwise accumulation of the numerators on `subdomain`.

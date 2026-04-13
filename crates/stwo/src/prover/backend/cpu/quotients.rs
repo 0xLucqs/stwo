@@ -17,7 +17,7 @@ use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
-use crate::prover::QuotientOps;
+use crate::prover::{ProverMemoryMode, QuotientOps};
 
 impl QuotientOps for CpuBackend {
     fn accumulate_numerators(
@@ -53,6 +53,7 @@ impl QuotientOps for CpuBackend {
         lifting_log_size: u32,
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
+        _memory_mode: ProverMemoryMode,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
