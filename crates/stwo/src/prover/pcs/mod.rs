@@ -54,9 +54,7 @@ where
 
     for poly in polys.iter() {
         if let Some(coeffs) = &poly.coeffs {
-            let cpu_data = coeffs.coeffs.to_cpu();
-            let bytes: &[u8] = bytemuck::cast_slice(&cpu_data);
-            spill.write_coefficients_raw(bytes)?;
+            write_spilled_coefficients(coeffs, &mut spill)?;
             n_spilled += 1;
         }
     }
@@ -69,8 +67,8 @@ where
 
     let mut spill_idx: usize = 0;
     for poly in polys.iter_mut() {
-        if poly.coeffs.is_some() {
-            let log_size = poly.log_size();
+        if let Some(coeffs) = &poly.coeffs {
+            let log_size = coeffs.log_size();
             poly.spilled_coeffs = Some(SpilledPolyCoeffs {
                 spill_file: frozen.clone(),
                 spill_index: SpillIndex(spill_idx),
@@ -83,6 +81,30 @@ where
 
     phase_memory_checkpoint("pcs:tree:after_coefficient_spill");
     Ok(())
+}
+
+/// Writes coefficient bytes to the spill file without forcing SIMD columns through `to_cpu()`.
+///
+/// For CPU-backed coefficients we keep the existing raw `BaseField` encoding. For SIMD-backed
+/// coefficients we instead persist the already-packed `PackedBaseField` buffer directly, which
+/// avoids materializing a transient full-size `Vec<BaseField>` before the write. The reader trims
+/// any padding lanes using the stored `log_size`.
+fn write_spilled_coefficients<B: crate::prover::backend::Backend>(
+    coeffs: &CircleCoefficients<B>,
+    spill: &mut crate::prover::spill::CoefficientSpillFile,
+) -> std::io::Result<crate::prover::spill::SpillIndex> {
+    if std::any::type_name::<B>()
+        == std::any::type_name::<crate::prover::backend::simd::SimdBackend>()
+    {
+        let simd_coeffs = unsafe {
+            &*(coeffs as *const CircleCoefficients<B>
+                as *const CircleCoefficients<crate::prover::backend::simd::SimdBackend>)
+        };
+        spill.write_coefficients(&simd_coeffs.coeffs.data)
+    } else {
+        let cpu_data = coeffs.coeffs.to_cpu();
+        spill.write_coefficients(&cpu_data)
+    }
 }
 
 /// Controls prover memory usage strategies.
@@ -1248,9 +1270,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // Write in-memory coefficient data to the spill file, skipping already-spilled polys.
         for poly in &self.polynomials {
             if let Some(coeffs) = &poly.coeffs {
-                let cpu_data = coeffs.coeffs.to_cpu();
-                let bytes: &[u8] = bytemuck::cast_slice(&cpu_data);
-                spill.write_coefficients_raw(bytes)?;
+                write_spilled_coefficients(coeffs, &mut spill)?;
             }
         }
 
@@ -1260,8 +1280,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // Replace in-memory coefficients with spill references; preserve existing spill refs.
         let mut spill_idx: usize = 0;
         for poly in self.polynomials.iter_mut() {
-            if poly.coeffs.is_some() {
-                let log_size = poly.log_size();
+            if let Some(coeffs) = &poly.coeffs {
+                let log_size = coeffs.log_size();
                 poly.spilled_coeffs = Some(SpilledPolyCoeffs {
                     spill_file: frozen.clone(),
                     spill_index: crate::prover::spill::SpillIndex(spill_idx),
@@ -1610,6 +1630,36 @@ mod tests {
             pool,
             ProverMemoryMode::LowMemory,
         )
+    }
+
+    #[test]
+    fn test_simd_coefficient_spill_round_trip_with_partial_last_lane() {
+        let pool = BaseColumnPool::<SimdBackend>::new();
+        let coeffs: CircleCoefficients<SimdBackend> =
+            CircleCoefficients::new((0..1 << 3).map(M31::from).collect());
+        let expected = coeffs
+            .clone()
+            .evaluate(CanonicCoset::new(4).circle_domain());
+        let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(4).half_coset());
+
+        let mut tree =
+            CommitmentTreeProver::<SimdBackend, Blake2sMerkleChannel>::new_with_memory_mode(
+                vec![coeffs],
+                1,
+                &twiddles,
+                true,
+                None,
+                &pool,
+                ProverMemoryMode::Fast,
+            );
+
+        tree.spill_coefficients().unwrap();
+
+        assert!(tree.polynomials[0].coeffs.is_none());
+        assert!(tree.polynomials[0].spilled_coeffs.is_some());
+
+        let reloaded = tree.polynomials[0].get_evaluation_on_domain(expected.domain, &twiddles);
+        assert_eq!(reloaded.values.to_cpu(), expected.values.to_cpu());
     }
 
     /// Verifies the `LowMemory` per-poly materialize-and-spill round-trip.

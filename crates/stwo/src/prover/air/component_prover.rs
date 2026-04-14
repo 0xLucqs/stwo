@@ -178,10 +178,33 @@ impl<B: Backend> Poly<B> {
     where
         B: ColumnOps<BaseField>,
     {
-        let bytes = spilled.spill_file.get_bytes(spilled.spill_index);
-        let base_fields: &[BaseField] = bytemuck::cast_slice(bytes);
-        let col = Col::<B, BaseField>::from_iter(base_fields.iter().copied());
-        CircleCoefficients::new(col)
+        let coeff_len = 1usize << spilled.log_size;
+        if std::any::type_name::<B>()
+            == std::any::type_name::<crate::prover::backend::simd::SimdBackend>()
+        {
+            let packed = spilled
+                .spill_file
+                .load_vec::<crate::prover::backend::simd::m31::PackedBaseField>(
+                    spilled.spill_index,
+                );
+            let coeffs = CircleCoefficients::<crate::prover::backend::simd::SimdBackend>::new(
+                crate::prover::backend::simd::column::BaseColumn {
+                    data: packed,
+                    length: coeff_len,
+                },
+            );
+            let coeffs_ptr = &coeffs
+                as *const CircleCoefficients<crate::prover::backend::simd::SimdBackend>
+                as *const CircleCoefficients<B>;
+            let result = unsafe { coeffs_ptr.read() };
+            std::mem::forget(coeffs);
+            result
+        } else {
+            let bytes = spilled.spill_file.get_bytes(spilled.spill_index);
+            let base_fields: &[BaseField] = &bytemuck::cast_slice(bytes)[..coeff_len];
+            let col = Col::<B, BaseField>::from_iter(base_fields.iter().copied());
+            CircleCoefficients::new(col)
+        }
     }
 }
 
