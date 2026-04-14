@@ -1,3 +1,5 @@
+use std::mem::ManuallyDrop;
+
 use hashbrown::HashMap;
 use itertools::Itertools;
 use tracing::{span, Level};
@@ -11,6 +13,7 @@ use crate::core::vcs_lifted::verifier::{
 };
 use crate::core::ColumnVec;
 use crate::prover::backend::{Col, Column};
+use crate::prover::spill::HashLayerMmapGuard;
 
 /// Represents the prover side of a Merkle commitment scheme.
 #[derive(Debug)]
@@ -23,7 +26,8 @@ pub struct MerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
 #[derive(Debug)]
 struct StoredMerkleCheckpoint<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> {
     log_size: u32,
-    hashes: Col<B, H::Hash>,
+    hashes: ManuallyDrop<Col<B, H::Hash>>,
+    mmap_guard: Option<HashLayerMmapGuard>,
 }
 
 /// A lifted Merkle prover that keeps only sparse checkpoint layers in memory and reconstructs the
@@ -33,6 +37,33 @@ pub struct CheckpointedMerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasher
     root: H::Hash,
     height: u32,
     checkpoints: Vec<StoredMerkleCheckpoint<B, H>>,
+}
+
+impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> StoredMerkleCheckpoint<B, H> {
+    fn new(log_size: u32, hashes: Col<B, H::Hash>, mmap_guard: Option<HashLayerMmapGuard>) -> Self {
+        Self {
+            log_size,
+            hashes: ManuallyDrop::new(hashes),
+            mmap_guard,
+        }
+    }
+
+    fn hashes(&self) -> &Col<B, H::Hash> {
+        unsafe {
+            &*((&self.hashes) as *const ManuallyDrop<Col<B, H::Hash>> as *const Col<B, H::Hash>)
+        }
+    }
+}
+
+impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> Drop for StoredMerkleCheckpoint<B, H> {
+    fn drop(&mut self) {
+        if self.mmap_guard.is_some() {
+            let hashes = unsafe { ManuallyDrop::take(&mut self.hashes) };
+            std::mem::forget(hashes);
+        } else {
+            unsafe { ManuallyDrop::drop(&mut self.hashes) };
+        }
+    }
 }
 
 impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
@@ -174,35 +205,55 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         // For the standard trace-tree path (log_rows_per_leaf == 0, non-empty columns, height > 0)
         // use `build_first_layer_above_leaves` which avoids materialising the full leaf hash
         // layer.  This can save up to 6 GiB of peak anonymous memory for lifting_log_size = 27.
-        let (mut current_layer, mut current_log_size) =
+        let mut skipped_initial_checkpoint = false;
+        let ((mut current_layer, mut current_guard), mut current_log_size) =
             if log_rows_per_leaf == 0 && lifting_log_size > 0 && !columns.is_empty() {
                 let sorted_columns = columns.into_iter().sorted_by_key(|c| c.len()).collect_vec();
+                skipped_initial_checkpoint = true;
                 (
-                    B::build_first_layer_above_leaves(&sorted_columns, lifting_log_size),
+                    B::build_first_layer_above_leaves_with_guard(&sorted_columns, lifting_log_size),
                     lifting_log_size - 1,
                 )
             } else {
                 (
-                    build_leaf_layer::<B, H>(columns, lifting_log_size, log_rows_per_leaf),
+                    (
+                        build_leaf_layer::<B, H>(columns, lifting_log_size, log_rows_per_leaf),
+                        None,
+                    ),
                     lifting_log_size,
                 )
             };
 
         while current_log_size > 0 {
-            let next_layer = B::build_next_layer(&current_layer);
-            current_log_size -= 1;
-            if should_store_checkpoint(current_log_size, height, checkpoint_stride) {
-                checkpoints.push(StoredMerkleCheckpoint {
-                    log_size: current_log_size,
-                    hashes: next_layer.clone(),
-                });
+            let (next_layer, next_guard) = B::build_next_layer_with_guard(&current_layer);
+
+            let should_store_current =
+                should_store_checkpoint(current_log_size, height, checkpoint_stride)
+                    && !(skipped_initial_checkpoint && current_log_size == lifting_log_size - 1);
+
+            if should_store_current {
+                checkpoints.push(StoredMerkleCheckpoint::new(
+                    current_log_size,
+                    current_layer,
+                    current_guard.take(),
+                ));
+            } else if current_guard.is_some() {
+                std::mem::forget(current_layer);
             }
+
             current_layer = next_layer;
+            current_guard = next_guard;
+            current_log_size -= 1;
         }
         checkpoints.reverse();
 
+        let root = current_layer.at(0);
+        if current_guard.is_some() {
+            std::mem::forget(current_layer);
+        }
+
         Self {
-            root: current_layer.at(0),
+            root,
             height,
             checkpoints,
         }
@@ -220,7 +271,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
             .filter_map(|(log_size, hashes)| {
                 let log_size = log_size as u32;
                 should_store_checkpoint(log_size, height, checkpoint_stride)
-                    .then_some(StoredMerkleCheckpoint { log_size, hashes })
+                    .then_some(StoredMerkleCheckpoint::new(log_size, hashes, None))
             })
             .collect();
 
@@ -244,9 +295,9 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         prev_layer_queries.dedup();
 
         let mut current_source_log_size = self.height;
-        let mut current_source_hashes = leaves;
+        let mut current_source_hashes = &leaves;
 
-        for checkpoint in self.checkpoints.into_iter().rev() {
+        for checkpoint in self.checkpoints.iter().rev() {
             Self::decommit_segment(
                 current_source_hashes,
                 current_source_log_size,
@@ -255,7 +306,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
                 &mut decommitment,
                 &mut all_node_values,
             );
-            current_source_hashes = checkpoint.hashes;
+            current_source_hashes = checkpoint.hashes();
             current_source_log_size = checkpoint.log_size;
         }
 
@@ -310,7 +361,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
             );
 
             let mut current_source_log_size = checkpoint.log_size;
-            let mut current_source_hashes = &checkpoint.hashes;
+            let mut current_source_hashes = checkpoint.hashes();
             for checkpoint in checkpoints {
                 Self::decommit_sparse_segment_from_layer(
                     current_source_hashes,
@@ -321,7 +372,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
                     &mut all_node_values,
                 );
                 current_source_log_size = checkpoint.log_size;
-                current_source_hashes = &checkpoint.hashes;
+                current_source_hashes = checkpoint.hashes();
             }
 
             if current_source_log_size > 0 {
@@ -356,12 +407,12 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         1 + self
             .checkpoints
             .iter()
-            .map(|checkpoint| checkpoint.hashes.len())
+            .map(|checkpoint| checkpoint.hashes().len())
             .sum::<usize>()
     }
 
     fn decommit_segment(
-        mut prev_layer_hashes: Col<B, H::Hash>,
+        prev_layer_hashes: &Col<B, H::Hash>,
         source_log_size: u32,
         target_log_size: u32,
         prev_layer_queries: &mut Vec<usize>,
@@ -374,7 +425,12 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         );
 
         let mut current_source_log_size = source_log_size;
+        let mut current_layers = Vec::new();
+        let mut current_layer_idx = None;
         while current_source_log_size > target_log_size {
+            let current_layer_ref = current_layer_idx
+                .map(|idx| &current_layers[idx])
+                .unwrap_or(prev_layer_hashes);
             let mut all_node_values_for_layer = HashMap::<usize, H::Hash>::new();
             let mut curr_layer_queries: Vec<usize> = vec![];
 
@@ -383,22 +439,23 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
                 if queries_chunk.len() == 1 {
                     decommitment
                         .hash_witness
-                        .push(prev_layer_hashes.at(first ^ 1));
+                        .push(current_layer_ref.at(first ^ 1));
                 }
 
                 let curr_index = first >> 1;
                 curr_layer_queries.push(curr_index);
                 all_node_values_for_layer
-                    .insert(2 * curr_index, prev_layer_hashes.at(2 * curr_index));
+                    .insert(2 * curr_index, current_layer_ref.at(2 * curr_index));
                 all_node_values_for_layer
-                    .insert(2 * curr_index + 1, prev_layer_hashes.at(2 * curr_index + 1));
+                    .insert(2 * curr_index + 1, current_layer_ref.at(2 * curr_index + 1));
             }
 
             all_node_values.push(all_node_values_for_layer);
             *prev_layer_queries = curr_layer_queries;
             current_source_log_size -= 1;
             if current_source_log_size > target_log_size {
-                prev_layer_hashes = B::build_next_layer(&prev_layer_hashes);
+                current_layers.push(B::build_next_layer(current_layer_ref));
+                current_layer_idx = Some(current_layers.len() - 1);
             }
         }
     }

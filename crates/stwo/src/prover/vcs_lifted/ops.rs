@@ -5,6 +5,7 @@ use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::spill::HashLayerMmapGuard;
 
 /// Trait for performing Merkle operations on a commitment scheme.
 pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
@@ -17,6 +18,16 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Low-memory variant of [`Self::build_next_layer`].
+    ///
+    /// Backends may override this to place the resulting layer on file-backed mmap storage rather
+    /// than anonymous heap. The default implementation preserves the existing in-memory behavior.
+    fn build_next_layer_with_guard(
+        prev_layer: &Col<Self, H::Hash>,
+    ) -> (Col<Self, H::Hash>, Option<HashLayerMmapGuard>) {
+        (Self::build_next_layer(prev_layer), None)
+    }
 
     /// Builds the first internal Merkle layer directly from columns without materializing the full
     /// leaf hash array. Returns a layer of `2^(lifting_log_size - 1)` hashes.
@@ -33,6 +44,19 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     ) -> Col<Self, H::Hash> {
         let leaves = Self::build_leaves(columns, lifting_log_size);
         Self::build_next_layer(&leaves)
+    }
+
+    /// Low-memory variant of [`Self::build_first_layer_above_leaves`].
+    ///
+    /// Backends may override this to store the returned hash layer on file-backed mmap storage.
+    fn build_first_layer_above_leaves_with_guard(
+        columns: &[&Col<Self, BaseField>],
+        lifting_log_size: u32,
+    ) -> (Col<Self, H::Hash>, Option<HashLayerMmapGuard>) {
+        (
+            Self::build_first_layer_above_leaves(columns, lifting_log_size),
+            None,
+        )
     }
 }
 

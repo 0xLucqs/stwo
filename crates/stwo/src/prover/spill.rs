@@ -348,6 +348,16 @@ pub struct SecureEvaluationMmapGuard {
     _columns: [BaseColumnMmapGuard; crate::core::fields::qm31::SECURE_EXTENSION_DEGREE],
 }
 
+pub struct HashLayerMmapGuard {
+    _mmap: MmapVec<crate::core::vcs::blake2_hash::Blake2sHash>,
+}
+
+impl std::fmt::Debug for HashLayerMmapGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HashLayerMmapGuard(..)")
+    }
+}
+
 impl EvalMmapGuard {
     pub fn offset_indices(&mut self, offset: usize) {
         self.spilled_indices
@@ -404,6 +414,23 @@ pub fn mmap_secure_column_by_coords(
         crate::prover::secure_column::SecureColumnByCoords { columns },
         SecureEvaluationMmapGuard { _columns: guards },
     ))
+}
+
+pub fn mmap_blake2s_hash_layer(
+    length: usize,
+) -> std::io::Result<(
+    Vec<crate::core::vcs::blake2_hash::Blake2sHash>,
+    HashLayerMmapGuard,
+)> {
+    let mmap = MmapVec::uninitialized(length)?;
+    let data = unsafe {
+        Vec::from_raw_parts(
+            mmap.as_ptr() as *mut crate::core::vcs::blake2_hash::Blake2sHash,
+            length,
+            length,
+        )
+    };
+    Ok((data, HashLayerMmapGuard { _mmap: mmap }))
 }
 
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
