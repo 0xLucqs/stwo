@@ -199,7 +199,7 @@ impl<T: Pod> MmapVec<T> {
                 std::ptr::null_mut(),
                 byte_len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 file.as_file().as_raw_fd(),
                 0,
             )
@@ -263,7 +263,7 @@ impl<T: Pod> MmapVec<T> {
                 std::ptr::null_mut(),
                 byte_len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 file.as_file().as_raw_fd(),
                 0,
             )
@@ -542,7 +542,7 @@ pub fn spill_eval_columns(
         // Drop the heap allocation.
         drop(heap_data);
 
-        // Mmap the file with read-write access (MAP_PRIVATE: writes create COW pages).
+        // Mmap the file with read-write access (MAP_SHARED: pages are evictable to file).
         #[cfg(unix)]
         let mmap_result = unsafe {
             use std::os::unix::io::AsRawFd;
@@ -550,7 +550,7 @@ pub fn spill_eval_columns(
                 std::ptr::null_mut(),
                 byte_len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 file.as_file().as_raw_fd(),
                 0,
             );
