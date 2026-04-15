@@ -526,9 +526,10 @@ pub fn mmap_blake2s_hash_layer(
 
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
 ///
-/// For each polynomial with evaluations, the BaseColumn's Vec data is written to a temp file,
-/// mmapped, and the Vec is swapped to point to the mmap data. The original heap allocation is
-/// freed. The returned guard must outlive the polynomials.
+/// All columns are written contiguously to a **single** temp file and mapped with one `mmap`
+/// call. Each column's `Vec` is then pointed at its offset within the mapping. This keeps the
+/// kernel vm_map entry count low (1 instead of N) which is critical on iOS where the per-process
+/// mapping limit is tight.
 ///
 /// After using the evaluations (e.g., for Merkle tree building), call
 /// `forget_mmap_backed_evals()` to prevent the Vecs from deallocating mmap memory on drop.
@@ -537,118 +538,130 @@ pub fn spill_eval_columns(
         crate::prover::backend::simd::SimdBackend,
     >],
 ) -> Option<EvalMmapGuard> {
-    let mut mmap_regions = Vec::new();
-    let mut spilled_indices = Vec::new();
+    use crate::prover::backend::simd::m31::PackedBaseField;
 
-    for (idx, poly) in polynomials.iter_mut().enumerate() {
-        let evals = match &mut poly.evals {
+    // Phase 1: write all column data to a single temp file without dropping heap copies.
+    struct ColEntry {
+        idx: usize,
+        byte_offset: usize,
+        byte_len: usize,
+        packed_len: usize,
+    }
+    let mut entries = Vec::new();
+    let mut file = match NamedTempFile::new() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("Eval mmap spill failed (create file): {e}");
+            return None;
+        }
+    };
+    let mut total_bytes: usize = 0;
+
+    for (idx, poly) in polynomials.iter().enumerate() {
+        let evals = match &poly.evals {
             Some(e) => e,
             None => continue,
         };
 
-        let col = &mut evals.values;
-        // Take the current Vec data out (heap-backed).
-        let heap_data: Vec<crate::prover::backend::simd::m31::PackedBaseField> =
-            std::mem::take(&mut col.data);
-        let packed_len = heap_data.len();
+        let col = &evals.values;
+        let packed_len = col.data.len();
+        let byte_len = packed_len * std::mem::size_of::<PackedBaseField>();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(col.data.as_ptr() as *const u8, byte_len) };
 
-        // Write to temp file as raw bytes, mmap it back.
-        let byte_len =
-            packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
-        let byte_ptr = heap_data.as_ptr() as *const u8;
-        let bytes = unsafe { std::slice::from_raw_parts(byte_ptr, byte_len) };
-
-        let mut file = match NamedTempFile::new() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("Eval mmap spill failed (create file): {e}");
-                col.data = heap_data;
-                continue;
-            }
-        };
         if let Err(e) = file.write_all(bytes) {
-            tracing::warn!("Eval mmap spill failed (write): {e}");
-            col.data = heap_data;
-            continue;
-        }
-        if let Err(e) = file.as_file().sync_all() {
-            tracing::warn!("Eval mmap spill failed (sync): {e}");
-            col.data = heap_data;
-            continue;
+            tracing::warn!("Eval mmap spill failed (write column {idx}): {e}");
+            // Abort the entire batch — partial writes can't be mapped coherently.
+            return None;
         }
 
-        // Drop the heap allocation.
-        drop(heap_data);
+        entries.push(ColEntry {
+            idx,
+            byte_offset: total_bytes,
+            byte_len,
+            packed_len,
+        });
+        total_bytes += byte_len;
+    }
 
-        // Mmap the file with read-write access (MAP_SHARED: pages are evictable to file).
-        #[cfg(unix)]
-        let mmap_result = unsafe {
-            use std::os::unix::io::AsRawFd;
-            let ptr = libc::mmap(
+    if entries.is_empty() || total_bytes == 0 {
+        return None;
+    }
+
+    if let Err(e) = file.as_file().sync_all() {
+        tracing::warn!("Eval mmap spill failed (sync): {e}");
+        return None;
+    }
+
+    // Phase 2: single mmap over the entire file.
+    #[cfg(unix)]
+    let mmap_ptr = {
+        use std::os::unix::io::AsRawFd;
+        let ptr = unsafe {
+            libc::mmap(
                 std::ptr::null_mut(),
-                byte_len,
+                total_bytes,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 file.as_file().as_raw_fd(),
                 0,
-            );
-            if ptr == libc::MAP_FAILED {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ptr)
-            }
-        };
-
-        #[cfg(not(unix))]
-        let mmap_result: Result<*mut libc::c_void, std::io::Error> = Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "not unix",
-        ));
-
-        let mmap_ptr = match mmap_result {
-            Ok(ptr) => {
-                track_mmap(byte_len);
-                ptr
-            }
-            Err(e) => {
-                tracing::warn!("Eval mmap failed: {e}");
-                continue;
-            }
-        };
-
-        // Create a Vec pointing to the mmap data.
-        // SAFETY: mmap returned a valid, aligned pointer. The file is synced and the
-        // data has the exact same layout as the original Vec<PackedBaseField>.
-        col.data = unsafe {
-            Vec::from_raw_parts(
-                mmap_ptr as *mut crate::prover::backend::simd::m31::PackedBaseField,
-                packed_len,
-                packed_len,
             )
         };
+        if ptr == libc::MAP_FAILED {
+            tracing::warn!(
+                "Eval mmap failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        ptr
+    };
 
-        // Store file + mmap info for cleanup. The MmapVec isn't used here; we store
-        // the raw info needed for munmap.
-        mmap_regions.push(MmapRegion {
-            ptr: mmap_ptr,
-            byte_len,
-            _file: file,
-        });
-        spilled_indices.push(idx);
-    }
-
-    if mmap_regions.is_empty() {
+    #[cfg(not(unix))]
+    {
+        tracing::warn!("Eval mmap spill not supported on this platform");
         return None;
     }
 
+    track_mmap(total_bytes);
+
+    // Phase 3: mmap succeeded — now swap each column's Vec to point at the mmap and
+    // drop the heap copies.
+    let mut spilled_indices = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let col = &mut polynomials[entry.idx]
+            .evals
+            .as_mut()
+            .expect("eval was present during write phase")
+            .values;
+        // Drop the heap-backed Vec.
+        let _old = std::mem::replace(
+            &mut col.data,
+            unsafe {
+                Vec::from_raw_parts(
+                    (mmap_ptr as *mut u8).add(entry.byte_offset) as *mut PackedBaseField,
+                    entry.packed_len,
+                    entry.packed_len,
+                )
+            },
+        );
+        // _old is dropped here, freeing the heap allocation.
+        spilled_indices.push(entry.idx);
+    }
+
     tracing::info!(
-        "Spilled {} evaluation columns to file-backed mmap",
-        mmap_regions.len()
+        "Spilled {} evaluation columns to file-backed mmap ({:.1} MB, 1 mapping)",
+        entries.len(),
+        total_bytes as f64 / (1024.0 * 1024.0),
     );
     log_mmap_stats("after spill_eval_columns");
 
     Some(EvalMmapGuard {
-        _regions: mmap_regions,
+        _regions: vec![MmapRegion {
+            ptr: mmap_ptr,
+            byte_len: total_bytes,
+            _file: file,
+        }],
         spilled_indices,
     })
 }
