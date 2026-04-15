@@ -122,21 +122,39 @@ fn allocate_hash_layer(
 ) -> (Vec<Blake2sHash>, Option<HashLayerMmapGuard>) {
     let allocation_bytes = length.saturating_mul(std::mem::size_of::<Blake2sHash>());
     if allocation_bytes >= (128 << 20) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let avail_mb = {
+            extern "C" { fn os_proc_available_memory() -> u64; }
+            (unsafe { os_proc_available_memory() }) / (1024 * 1024)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let avail_mb = 0u64;
         eprintln!(
-            "ALLOC probe {}:{} fn=allocate_hash_layer bytes={} logical_len={} element_type={} backing={}",
+            "ALLOC probe {}:{} fn=allocate_hash_layer bytes={} logical_len={} element_type={} backing={} available_mb={}",
             file!(),
             line!(),
             allocation_bytes,
             length,
             std::any::type_name::<Blake2sHash>(),
             if use_mmap { "mmap_attempt" } else { "heap" },
+            avail_mb,
         );
     }
     if use_mmap {
-        if let Ok((res, guard)) = mmap_blake2s_hash_layer(length) {
-            return (res, Some(guard));
+        match mmap_blake2s_hash_layer(length) {
+            Ok((res, guard)) => return (res, Some(guard)),
+            Err(e) => {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=allocate_hash_layer mmap_failed: {e}",
+                    file!(), line!(),
+                );
+            }
         }
     }
+    eprintln!(
+        "ALLOC probe {}:{} fn=allocate_hash_layer heap_fallback bytes={}",
+        file!(), line!(), allocation_bytes,
+    );
     (unsafe { uninit_vec(length) }, None)
 }
 
