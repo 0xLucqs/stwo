@@ -645,6 +645,7 @@ pub fn spill_eval_columns(
         "Spilled {} evaluation columns to file-backed mmap",
         mmap_regions.len()
     );
+    log_mmap_stats("after spill_eval_columns");
 
     Some(EvalMmapGuard {
         _regions: mmap_regions,
