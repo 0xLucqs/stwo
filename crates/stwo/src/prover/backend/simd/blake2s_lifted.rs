@@ -188,14 +188,154 @@ fn build_first_layer_above_leaves_inner<const IS_M31_OUTPUT: bool>(
     // ── Phase 1: compute SIMD states ────────────────────────────────────────────
     let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
     let state_len = 1usize << max_log_size;
+    if use_mmap {
+        let (mut states, states_guard) = allocate_state_layer(
+            state_len,
+            true,
+            "build_first_layer_above_leaves_inner prev_layer_states",
+        );
+
+        // Low-memory path: keep only a single state buffer alive and update it in place.
+        // Iterating indices in reverse preserves correctness because every write only depends on
+        // source indices `i >> log_ratio`, which are read before those lower indices are
+        // overwritten.
+        #[cfg(not(feature = "parallel"))]
+        states.fill(Blake2StateWords::from_simd(INITIAL_STATE));
+        #[cfg(feature = "parallel")]
+        states
+            .par_iter_mut()
+            .for_each(|uninit| *uninit = Blake2StateWords::from_simd(INITIAL_STATE));
+
+        let last_chunk_index =
+            (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
+        let lifting_indices =
+            get_lifting_indices(columns.iter().map(|c| c.data.len()), last_chunk_index);
+        let mut byte_count = 0_u64;
+        let mut prev_chunk_max_log_size = 0;
+
+        for (start, end) in lifting_indices.into_iter().tuple_windows() {
+            let chunk_max_log_size: u32 = columns[end - 1].data.len().ilog2();
+            let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
+
+            for i in (0..(1usize << chunk_max_log_size)).rev() {
+                let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
+                let prev_state = std::array::from_fn(|j| {
+                    let prev_state_limb = states[i >> log_ratio].into_simd()[j];
+                    to_lifted_simd(prev_state_limb, log_ratio, i)
+                });
+                let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                    let column = columns[start + j];
+                    let log_size = column.data.len().ilog2();
+                    let log_ratio = chunk_max_log_size - log_size;
+                    to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
+                });
+                let mut next_state = compress_unfinalized(prev_state, msgs, local_byte_count);
+                for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
+                {
+                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
+                        std::array::from_fn(|j| chunk_columns[j].data[i].into_simd());
+                    local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+                    next_state = compress_unfinalized(next_state, msgs, local_byte_count);
+                }
+                states[i] = Blake2StateWords::from_simd(next_state);
+            }
+
+            byte_count += 4 * (end - start) as u64;
+            prev_chunk_max_log_size = chunk_max_log_size;
+        }
+
+        let chunk_max_log_size: u32 = max_log_size;
+        let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
+        byte_count += ((columns.len() - last_chunk_index) * N_BYTES_FELT) as u64;
+        for i in (0..(1usize << chunk_max_log_size)).rev() {
+            let prev_state = std::array::from_fn(|j| {
+                let prev_state_limb = states[i >> log_ratio].into_simd()[j];
+                to_lifted_simd(prev_state_limb, log_ratio, i)
+            });
+            let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
+            for (j, column) in columns[last_chunk_index..].iter().enumerate() {
+                let log_size = column.data.len().ilog2();
+                let log_ratio = chunk_max_log_size - log_size;
+                msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
+            }
+            states[i] = Blake2StateWords::from_simd(compress_finalize(prev_state, msgs, byte_count));
+        }
+
+        let lifting_log_size_packed = lifting_log_size - LOG_N_LANES;
+        let lift_ratio = lifting_log_size_packed - max_log_size;
+        let n_output_chunks = 1usize << (lifting_log_size_packed - 1);
+        let (mut res, mmap_guard) =
+            allocate_hash_layer(n_output_chunks << LOG_N_HASHES_PER_SIMD_STATE, true);
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = res.chunks_mut(1 << LOG_N_HASHES_PER_SIMD_STATE);
+        #[cfg(feature = "parallel")]
+        let iter = res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE);
+
+        iter.enumerate().for_each(|(k, dst)| {
+            let i_even = 2 * k;
+            let i_odd = 2 * k + 1;
+
+            let lifted_even: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let base = states[i_even >> lift_ratio].into_simd();
+                std::array::from_fn(|j| to_lifted_simd(base[j], lift_ratio, i_even))
+            };
+            let lifted_odd: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let base = states[i_odd >> lift_ratio].into_simd();
+                std::array::from_fn(|j| to_lifted_simd(base[j], lift_ratio, i_odd))
+            };
+
+            let u_even: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let mut u = untranspose_states(lifted_even);
+                if IS_M31_OUTPUT {
+                    u = std::array::from_fn(|i| reduce_to_m31_simd(u[i]));
+                }
+                u
+            };
+            let u_odd: [u32x16; N_FELTS_IN_BLAKE_STATE] = {
+                let mut u = untranspose_states(lifted_odd);
+                if IS_M31_OUTPUT {
+                    u = std::array::from_fn(|i| reduce_to_m31_simd(u[i]));
+                }
+                u
+            };
+
+            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = array::from_fn(|j| {
+                if j < N_FELTS_IN_BLAKE_STATE {
+                    u_even[j]
+                } else {
+                    u_odd[j - N_FELTS_IN_BLAKE_STATE]
+                }
+            });
+
+            let state = compress_finalize(
+                INITIAL_STATE,
+                transpose_msgs(msgs),
+                N_BYTES_IN_BLAKE_MESSAGE,
+            );
+            let mut untransposed = untranspose_states(state);
+            if IS_M31_OUTPUT {
+                untransposed = std::array::from_fn(|i| reduce_to_m31_simd(untransposed[i]));
+            }
+            let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
+            *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
+        });
+
+        if states_guard.is_some() {
+            std::mem::forget(states);
+        }
+
+        return (res, mmap_guard);
+    }
+
     let (mut prev_layer_states, prev_layer_states_guard) = allocate_state_layer(
         state_len,
-        use_mmap,
+        false,
         "build_first_layer_above_leaves_inner prev_layer_states",
     );
     let (mut next_layer_states, next_layer_states_guard) = allocate_state_layer(
         state_len,
-        use_mmap,
+        false,
         "build_first_layer_above_leaves_inner next_layer_states",
     );
 
@@ -288,7 +428,7 @@ fn build_first_layer_above_leaves_inner<const IS_M31_OUTPUT: bool>(
 
     let n_output_chunks = 1usize << (lifting_log_size_packed - 1);
     let (mut res, mmap_guard) =
-        allocate_hash_layer(n_output_chunks << LOG_N_HASHES_PER_SIMD_STATE, use_mmap);
+        allocate_hash_layer(n_output_chunks << LOG_N_HASHES_PER_SIMD_STATE, false);
 
     #[cfg(not(feature = "parallel"))]
     let iter = res.chunks_mut(1 << LOG_N_HASHES_PER_SIMD_STATE);

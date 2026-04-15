@@ -6,7 +6,7 @@
 ## Review
 
 - On-device allocation probes identified the exact failing request: the low-memory FRI first-layer checkpointed Merkle commit was still allocating `prev_layer_states` in `build_first_layer_above_leaves_inner`, and that buffer was exactly `268,435,456` bytes (`524,288 * 512`).
-- Applied fix: `build_first_layer_above_leaves_inner` now stores those large temporary Blake2s SIMD state buffers in file-backed mmap when the low-memory checkpointed path requests guarded storage, instead of anonymous heap. This directly targets the confirmed OOM site without changing proof semantics.
+- Applied fix: the low-memory branch of `build_first_layer_above_leaves_inner` now uses a single reusable state buffer updated in place, instead of allocating both `prev_layer_states` and `next_layer_states` at full size. That removes the second back-to-back `256 MiB` state-buffer request from the confirmed failing path, while preserving the Merkle result in focused tests.
 - Replaced the generic tracing-based allocation instrumentation with direct pre-allocation `eprintln!` probes so the iPhone run can be diagnosed by the last emitted stderr line before the OOM.
 - The low-level SIMD column constructors now use `#[track_caller]` and print the caller file/line for large allocations, so if a shared helper like `BaseColumn::uninitialized` is the allocating primitive the log still points back to the higher-level call site.
 - Kept caller-oriented `eprintln!` probes on the remaining high-value low-memory allocation paths in `component_prover`, `pcs`, `spill`, `mempool`, SIMD FRI folding, SIMD quotient fallback, and the Blake2s lifted-Merkle state/hash builders.
