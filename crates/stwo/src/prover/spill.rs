@@ -526,10 +526,10 @@ pub fn mmap_blake2s_hash_layer(
 
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
 ///
-/// All columns are written contiguously to a **single** temp file and mapped with one `mmap`
-/// call. Each column's `Vec` is then pointed at its offset within the mapping. This keeps the
-/// kernel vm_map entry count low (1 instead of N) which is critical on iOS where the per-process
-/// mapping limit is tight.
+/// Columns are grouped into consolidated chunks (up to `CHUNK_BYTES` each). Each chunk is
+/// written to a single temp file and mapped with one `mmap` call. This keeps the kernel
+/// vm_map entry count low (tens instead of thousands) while keeping individual files small
+/// enough to succeed under disk/memory pressure.
 ///
 /// After using the evaluations (e.g., for Merkle tree building), call
 /// `forget_mmap_backed_evals()` to prevent the Vecs from deallocating mmap memory on drop.
@@ -540,129 +540,159 @@ pub fn spill_eval_columns(
 ) -> Option<EvalMmapGuard> {
     use crate::prover::backend::simd::m31::PackedBaseField;
 
-    // Phase 1: write all column data to a single temp file without dropping heap copies.
+    // Target ~128 MB per consolidated file. Small enough to succeed on tight devices,
+    // large enough to consolidate hundreds of columns into a handful of mmaps.
+    const CHUNK_BYTES: usize = 128 << 20;
+
     struct ColEntry {
         idx: usize,
         byte_offset: usize,
-        byte_len: usize,
         packed_len: usize,
     }
-    let mut entries = Vec::new();
-    let mut file = match NamedTempFile::new() {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("Eval mmap spill failed (create file): {e}");
-            return None;
-        }
-    };
-    let mut total_bytes: usize = 0;
 
-    for (idx, poly) in polynomials.iter().enumerate() {
-        let evals = match &poly.evals {
-            Some(e) => e,
-            None => continue,
+    let mut all_regions = Vec::new();
+    let mut all_spilled_indices = Vec::new();
+
+    // Collect indices of polynomials that have evaluations.
+    let eval_indices: Vec<usize> = polynomials
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.evals.as_ref().map(|_| i))
+        .collect();
+
+    let mut pos = 0;
+    while pos < eval_indices.len() {
+        // Build one chunk: accumulate columns until we hit CHUNK_BYTES.
+        let mut entries = Vec::new();
+        let mut file = match NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Eval mmap spill failed (create file): {e}");
+                break;
+            }
         };
+        let mut chunk_bytes: usize = 0;
+        let chunk_start = pos;
 
-        let col = &evals.values;
-        let packed_len = col.data.len();
-        let byte_len = packed_len * std::mem::size_of::<PackedBaseField>();
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(col.data.as_ptr() as *const u8, byte_len) };
+        while pos < eval_indices.len() {
+            let idx = eval_indices[pos];
+            let col = &polynomials[idx].evals.as_ref().unwrap().values;
+            let packed_len = col.data.len();
+            let byte_len = packed_len * std::mem::size_of::<PackedBaseField>();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(col.data.as_ptr() as *const u8, byte_len)
+            };
 
-        if let Err(e) = file.write_all(bytes) {
-            tracing::warn!("Eval mmap spill failed (write column {idx}): {e}");
-            // Abort the entire batch — partial writes can't be mapped coherently.
-            return None;
+            if let Err(e) = file.write_all(bytes) {
+                tracing::warn!("Eval mmap spill failed (write): {e}");
+                // Stop filling this chunk but try to mmap what we have so far.
+                break;
+            }
+
+            entries.push(ColEntry {
+                idx,
+                byte_offset: chunk_bytes,
+                packed_len,
+            });
+            chunk_bytes += byte_len;
+            pos += 1;
+
+            if chunk_bytes >= CHUNK_BYTES {
+                break;
+            }
         }
 
-        entries.push(ColEntry {
-            idx,
-            byte_offset: total_bytes,
-            byte_len,
-            packed_len,
-        });
-        total_bytes += byte_len;
-    }
-
-    if entries.is_empty() || total_bytes == 0 {
-        return None;
-    }
-
-    if let Err(e) = file.as_file().sync_all() {
-        tracing::warn!("Eval mmap spill failed (sync): {e}");
-        return None;
-    }
-
-    // Phase 2: single mmap over the entire file.
-    #[cfg(unix)]
-    let mmap_ptr = {
-        use std::os::unix::io::AsRawFd;
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_file().as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            tracing::warn!(
-                "Eval mmap failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
+        if entries.is_empty() || chunk_bytes == 0 {
+            break;
         }
-        ptr
-    };
 
-    #[cfg(not(unix))]
-    {
-        tracing::warn!("Eval mmap spill not supported on this platform");
-        return None;
-    }
+        if let Err(e) = file.as_file().sync_all() {
+            tracing::warn!("Eval mmap spill failed (sync): {e}");
+            // Skip this chunk, columns stay heap-backed. Try next chunk.
+            continue;
+        }
 
-    track_mmap(total_bytes);
-
-    // Phase 3: mmap succeeded — now swap each column's Vec to point at the mmap and
-    // drop the heap copies.
-    let mut spilled_indices = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let col = &mut polynomials[entry.idx]
-            .evals
-            .as_mut()
-            .expect("eval was present during write phase")
-            .values;
-        // Drop the heap-backed Vec.
-        let _old = std::mem::replace(
-            &mut col.data,
-            unsafe {
-                Vec::from_raw_parts(
-                    (mmap_ptr as *mut u8).add(entry.byte_offset) as *mut PackedBaseField,
-                    entry.packed_len,
-                    entry.packed_len,
+        // Mmap the chunk file.
+        #[cfg(unix)]
+        let mmap_result = {
+            use std::os::unix::io::AsRawFd;
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    chunk_bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_file().as_raw_fd(),
+                    0,
                 )
-            },
-        );
-        // _old is dropped here, freeing the heap allocation.
-        spilled_indices.push(entry.idx);
+            };
+            if ptr == libc::MAP_FAILED {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ptr)
+            }
+        };
+
+        #[cfg(not(unix))]
+        let mmap_result: Result<*mut libc::c_void, std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "not unix",
+        ));
+
+        let mmap_ptr = match mmap_result {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                tracing::warn!("Eval mmap failed ({} cols, {:.1} MB): {e}",
+                    entries.len(), chunk_bytes as f64 / (1024.0 * 1024.0));
+                // Rewind so the caller's batch keeps these columns heap-backed.
+                pos = chunk_start;
+                break;
+            }
+        };
+
+        track_mmap(chunk_bytes);
+
+        // Mmap succeeded — swap each column's Vec to the mmap and drop heap copies.
+        for entry in &entries {
+            let col = &mut polynomials[entry.idx]
+                .evals
+                .as_mut()
+                .unwrap()
+                .values;
+            let _old = std::mem::replace(
+                &mut col.data,
+                unsafe {
+                    Vec::from_raw_parts(
+                        (mmap_ptr as *mut u8).add(entry.byte_offset) as *mut PackedBaseField,
+                        entry.packed_len,
+                        entry.packed_len,
+                    )
+                },
+            );
+            all_spilled_indices.push(entry.idx);
+        }
+
+        all_regions.push(MmapRegion {
+            ptr: mmap_ptr,
+            byte_len: chunk_bytes,
+            _file: file,
+        });
+    }
+
+    if all_regions.is_empty() {
+        return None;
     }
 
     tracing::info!(
-        "Spilled {} evaluation columns to file-backed mmap ({:.1} MB, 1 mapping)",
-        entries.len(),
-        total_bytes as f64 / (1024.0 * 1024.0),
+        "Spilled {} evaluation columns to file-backed mmap ({} mappings)",
+        all_spilled_indices.len(),
+        all_regions.len(),
     );
     log_mmap_stats("after spill_eval_columns");
 
     Some(EvalMmapGuard {
-        _regions: vec![MmapRegion {
-            ptr: mmap_ptr,
-            byte_len: total_bytes,
-            _file: file,
-        }],
-        spilled_indices,
+        _regions: all_regions,
+        spilled_indices: all_spilled_indices,
     })
 }
 
