@@ -62,8 +62,15 @@ fn allocate_state_layer(
 ) -> (Vec<Blake2StateWords>, Option<Blake2StateLayerMmapGuard>) {
     let allocation_bytes = length.saturating_mul(std::mem::size_of::<Blake2StateWords>());
     if allocation_bytes >= (128 << 20) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let avail_mb = {
+            extern "C" { fn os_proc_available_memory() -> u64; }
+            unsafe { os_proc_available_memory() } / (1024 * 1024)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let avail_mb = 0u64;
         eprintln!(
-            "ALLOC probe {}:{} fn={} bytes={} logical_len={} element_type={} backing={}",
+            "ALLOC probe {}:{} fn={} bytes={} logical_len={} element_type={} backing={} available_mb={}",
             file!(),
             line!(),
             allocation_label,
@@ -71,19 +78,30 @@ fn allocate_state_layer(
             length,
             std::any::type_name::<Blake2StateWords>(),
             if use_mmap { "mmap_attempt" } else { "heap" },
+            avail_mb,
         );
     }
 
     if use_mmap {
-        if let Ok(mmap) = MmapVec::uninitialized(length) {
-            let data = unsafe {
-                Vec::from_raw_parts(
-                    mmap.as_ptr() as *mut Blake2StateWords,
-                    length,
-                    length,
-                )
-            };
-            return (data, Some(Blake2StateLayerMmapGuard { _mmap: mmap }));
+        match MmapVec::uninitialized(length) {
+            Ok(mmap) => {
+                let data = unsafe {
+                    Vec::from_raw_parts(
+                        mmap.as_ptr() as *mut Blake2StateWords,
+                        length,
+                        length,
+                    )
+                };
+                return (data, Some(Blake2StateLayerMmapGuard { _mmap: mmap }));
+            }
+            Err(e) => {
+                eprintln!(
+                    "ALLOC probe {}:{} fn={} mmap_failed: {e}",
+                    file!(),
+                    line!(),
+                    allocation_label,
+                );
+            }
         }
     }
 
