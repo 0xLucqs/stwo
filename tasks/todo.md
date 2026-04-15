@@ -5,6 +5,8 @@
 
 ## Review
 
+- On-device allocation probes identified the exact failing request: the low-memory FRI first-layer checkpointed Merkle commit was still allocating `prev_layer_states` in `build_first_layer_above_leaves_inner`, and that buffer was exactly `268,435,456` bytes (`524,288 * 512`).
+- Applied fix: `build_first_layer_above_leaves_inner` now stores those large temporary Blake2s SIMD state buffers in file-backed mmap when the low-memory checkpointed path requests guarded storage, instead of anonymous heap. This directly targets the confirmed OOM site without changing proof semantics.
 - Replaced the generic tracing-based allocation instrumentation with direct pre-allocation `eprintln!` probes so the iPhone run can be diagnosed by the last emitted stderr line before the OOM.
 - The low-level SIMD column constructors now use `#[track_caller]` and print the caller file/line for large allocations, so if a shared helper like `BaseColumn::uninitialized` is the allocating primitive the log still points back to the higher-level call site.
 - Kept caller-oriented `eprintln!` probes on the remaining high-value low-memory allocation paths in `component_prover`, `pcs`, `spill`, `mempool`, SIMD FRI folding, SIMD quotient fallback, and the Blake2s lifted-Merkle state/hash builders.
@@ -13,7 +15,7 @@
 - `cargo test -p stwo --features prover test_build_first_layer_above_leaves_matches_default -- --nocapture`
 - `cargo test -p stwo --features prover test_checkpointed_decommitment_matches_full_tree -- --nocapture`
 - `cargo test -p stwo --features prover test_pcs_prove_and_verify_simd_low_memory_multi_tree_many_columns -- --nocapture`
-- This is still instrumentation only, not a confirmed memory fix. The next step is on-device: rebuild, rerun the failing transaction sequence, and capture the last `ALLOC probe ...` stderr line emitted before `memory allocation of 268435456 bytes failed`.
+- This is now a targeted fix plus instrumentation, but it is still unconfirmed until the iPhone rerun. The next step is on-device: rebuild, rerun the failing transaction sequence, and confirm either that the crash disappears or that the last `ALLOC probe ...` line changes to a new site after this one.
 - The probes currently only print for allocations at or above `128 MiB`, so the output stays focused on the candidate large allocations that can plausibly match the failing `256 MiB` request.
 
 - [x] Inspect the existing end-to-end proof harness and choose the lowest-churn location for a fast-vs-low-memory byte-identity regression test
