@@ -65,7 +65,7 @@ fn allocate_state_layer(
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let avail_mb = {
             extern "C" { fn os_proc_available_memory() -> u64; }
-            unsafe { os_proc_available_memory() } / (1024 * 1024)
+            (unsafe { os_proc_available_memory() }) / (1024 * 1024)
         };
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let avail_mb = 0u64;
