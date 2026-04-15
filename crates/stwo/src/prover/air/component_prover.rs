@@ -158,6 +158,20 @@ impl<B: Backend> Poly<B> {
     where
         B: PolyOps + ColumnOps<BaseField>,
     {
+        let allocation_bytes = self
+            .eval_domain
+            .size()
+            .saturating_mul(std::mem::size_of::<BaseField>());
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=Poly::materialize_evaluation bytes={} logical_len={} element_type={} backing=heap_or_pool",
+                file!(),
+                line!(),
+                allocation_bytes,
+                self.eval_domain.size(),
+                std::any::type_name::<BaseField>(),
+            );
+        }
         if let Some(coeffs) = &self.coeffs {
             let buffer = base_column_pool.take_or_alloc(self.log_size());
             B::evaluate_into(coeffs, self.eval_domain, twiddles, buffer)

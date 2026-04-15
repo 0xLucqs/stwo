@@ -51,7 +51,20 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
         self.pools
             .get_mut(&log_size)
             .and_then(|mut pool| pool.pop())
-            .unwrap_or_else(|| unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) })
+            .unwrap_or_else(|| {
+                let allocation_bytes = (1usize << log_size).saturating_mul(std::mem::size_of::<BaseField>());
+                if allocation_bytes >= (128 << 20) {
+                    eprintln!(
+                        "ALLOC probe {}:{} fn=BaseColumnPool::take_or_alloc bytes={} logical_len={} element_type={} backing=heap",
+                        file!(),
+                        line!(),
+                        allocation_bytes,
+                        1usize << log_size,
+                        std::any::type_name::<BaseField>(),
+                    );
+                }
+                unsafe { Col::<B, BaseField>::uninitialized(1 << log_size) }
+            })
     }
 
     /// Returns a buffer to the pool. The caller is responsible for ensuring the buffer's log_size

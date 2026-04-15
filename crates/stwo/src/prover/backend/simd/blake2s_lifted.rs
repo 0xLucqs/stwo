@@ -39,6 +39,18 @@ fn allocate_hash_layer(
     length: usize,
     use_mmap: bool,
 ) -> (Vec<Blake2sHash>, Option<HashLayerMmapGuard>) {
+    let allocation_bytes = length.saturating_mul(std::mem::size_of::<Blake2sHash>());
+    if allocation_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=allocate_hash_layer bytes={} logical_len={} element_type={} backing={}",
+            file!(),
+            line!(),
+            allocation_bytes,
+            length,
+            std::any::type_name::<Blake2sHash>(),
+            if use_mmap { "mmap_attempt" } else { "heap" },
+        );
+    }
     if use_mmap {
         if let Ok((res, guard)) = mmap_blake2s_hash_layer(length) {
             return (res, Some(guard));
@@ -119,8 +131,31 @@ fn build_first_layer_above_leaves_inner<const IS_M31_OUTPUT: bool>(
 
     // ── Phase 1: compute SIMD states ────────────────────────────────────────────
     let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
+    let state_len = 1usize << max_log_size;
+    let state_bytes =
+        state_len.saturating_mul(std::mem::size_of::<[u32x16; N_FELTS_IN_BLAKE_STATE]>());
+    if state_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=build_first_layer_above_leaves_inner prev_layer_states bytes={} logical_len={} element_type={} backing=heap",
+            file!(),
+            line!(),
+            state_bytes,
+            state_len,
+            std::any::type_name::<[u32x16; N_FELTS_IN_BLAKE_STATE]>(),
+        );
+    }
     let mut prev_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
         unsafe { uninit_vec(1 << max_log_size) };
+    if state_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=build_first_layer_above_leaves_inner next_layer_states bytes={} logical_len={} element_type={} backing=heap",
+            file!(),
+            line!(),
+            state_bytes,
+            state_len,
+            std::any::type_name::<[u32x16; N_FELTS_IN_BLAKE_STATE]>(),
+        );
+    }
     let mut next_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
         unsafe { uninit_vec(1 << max_log_size) };
 
@@ -291,6 +326,19 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
         let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
+        let state_len = 1usize << max_log_size;
+        let state_bytes =
+            state_len.saturating_mul(std::mem::size_of::<[u32x16; N_FELTS_IN_BLAKE_STATE]>());
+        if state_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::build_leaves prev_layer_states bytes={} logical_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                state_bytes,
+                state_len,
+                std::any::type_name::<[u32x16; N_FELTS_IN_BLAKE_STATE]>(),
+            );
+        }
 
         // Initialize the vector of Blake2s states. The state is of type `[u32x16; 8]`.
         //
@@ -301,6 +349,16 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // having been written to before.
         let mut prev_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
             unsafe { uninit_vec(1 << max_log_size) };
+        if state_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::build_leaves next_layer_states bytes={} logical_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                state_bytes,
+                state_len,
+                std::any::type_name::<[u32x16; N_FELTS_IN_BLAKE_STATE]>(),
+            );
+        }
         let mut next_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
             unsafe { uninit_vec(1 << max_log_size) };
 
@@ -399,6 +457,19 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // transmute `next_layer_states`, but there are alignment issues. Think about how to avoid
         // this copy.
         // Safety: we never read from `res`, only write to it.
+        let leaf_hashes_len = 1usize << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE);
+        let leaf_hashes_bytes =
+            leaf_hashes_len.saturating_mul(std::mem::size_of::<Blake2sHash>());
+        if leaf_hashes_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::build_leaves leaf_hashes bytes={} logical_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                leaf_hashes_bytes,
+                leaf_hashes_len,
+                std::any::type_name::<Blake2sHash>(),
+            );
+        }
         let mut res =
             unsafe { uninit_vec(1 << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE)) };
 
@@ -406,6 +477,19 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let mut trasposed_states = if lifting_log_size_packed == max_log_size {
             next_layer_states
         } else {
+            let lifted_state_len = 1usize << lifting_log_size_packed;
+            let lifted_state_bytes = lifted_state_len
+                .saturating_mul(std::mem::size_of::<[u32x16; N_FELTS_IN_BLAKE_STATE]>());
+            if lifted_state_bytes >= (128 << 20) {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=SimdBackend::build_leaves lifted_state_buffer bytes={} logical_len={} element_type={} backing=heap",
+                    file!(),
+                    line!(),
+                    lifted_state_bytes,
+                    lifted_state_len,
+                    std::any::type_name::<[u32x16; N_FELTS_IN_BLAKE_STATE]>(),
+                );
+            }
             let mut buf: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
                 unsafe { uninit_vec(1 << lifting_log_size_packed) };
             let log_ratio = lifting_log_size_packed - max_log_size;

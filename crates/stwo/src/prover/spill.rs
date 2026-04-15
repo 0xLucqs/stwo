@@ -128,8 +128,22 @@ impl FrozenSpillFile {
     /// Creates a `Vec<T>` by copying data from the mmap. Use this when you need an owned
     /// copy (e.g., to create a `BaseColumn` for SIMD operations that require mutable access
     /// or specific alignment guarantees beyond what mmap provides).
+    #[track_caller]
     pub fn load_vec<T: Pod + Clone>(&self, index: SpillIndex) -> Vec<T> {
-        self.get_slice::<T>(index).to_vec()
+        let slice = self.get_slice::<T>(index);
+        let allocation_bytes = std::mem::size_of_val(slice);
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=FrozenSpillFile::load_vec bytes={} logical_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                slice.len(),
+                std::any::type_name::<T>(),
+            );
+        }
+        slice.to_vec()
     }
 
     /// Returns the number of entries in the spill file.
@@ -373,6 +387,19 @@ pub fn mmap_base_column(
     BaseColumnMmapGuard,
 )> {
     let packed_len = length.div_ceil(crate::prover::backend::simd::m31::N_LANES);
+    let allocation_bytes =
+        packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
+    if allocation_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=mmap_base_column bytes={} logical_len={} packed_len={} element_type={} backing=mmap",
+            file!(),
+            line!(),
+            allocation_bytes,
+            length,
+            packed_len,
+            std::any::type_name::<crate::prover::backend::simd::m31::PackedBaseField>(),
+        );
+    }
     let mmap = MmapVec::uninitialized(packed_len)?;
     let data = unsafe {
         Vec::from_raw_parts(
@@ -393,6 +420,21 @@ pub fn mmap_secure_column_by_coords(
     crate::prover::secure_column::SecureColumnByCoords<crate::prover::backend::simd::SimdBackend>,
     SecureEvaluationMmapGuard,
 )> {
+    let packed_len = length.div_ceil(crate::prover::backend::simd::m31::N_LANES);
+    let coordinate_bytes =
+        packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
+    let allocation_bytes = coordinate_bytes * crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+    if allocation_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=mmap_secure_column_by_coords bytes={} logical_len={} packed_len={} element_type={} backing=mmap",
+            file!(),
+            line!(),
+            allocation_bytes,
+            length,
+            packed_len * crate::core::fields::qm31::SECURE_EXTENSION_DEGREE,
+            std::any::type_name::<crate::prover::backend::simd::m31::PackedBaseField>(),
+        );
+    }
     let mut columns = Vec::with_capacity(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE);
     let mut guards = Vec::with_capacity(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE);
     for _ in 0..crate::core::fields::qm31::SECURE_EXTENSION_DEGREE {
@@ -422,6 +464,17 @@ pub fn mmap_blake2s_hash_layer(
     Vec<crate::core::vcs::blake2_hash::Blake2sHash>,
     HashLayerMmapGuard,
 )> {
+    let allocation_bytes = length * std::mem::size_of::<crate::core::vcs::blake2_hash::Blake2sHash>();
+    if allocation_bytes >= (128 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=mmap_blake2s_hash_layer bytes={} logical_len={} element_type={} backing=mmap",
+            file!(),
+            line!(),
+            allocation_bytes,
+            length,
+            std::any::type_name::<crate::core::vcs::blake2_hash::Blake2sHash>(),
+        );
+    }
     let mmap = MmapVec::uninitialized(length)?;
     let data = unsafe {
         Vec::from_raw_parts(

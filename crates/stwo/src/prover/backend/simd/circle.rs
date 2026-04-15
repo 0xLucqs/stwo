@@ -232,6 +232,19 @@ impl PolyOps for SimdBackend {
 
         for poly_coeffs in polynomials {
             let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
+            let packed_len = (1usize << log_eval_size).div_ceil(N_LANES);
+            let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
+            if allocation_bytes >= (128 << 20) {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=SimdBackend::evaluate_polynomials bytes={} logical_len={} packed_len={} element_type={} backing=heap_or_pool",
+                    file!(),
+                    line!(),
+                    allocation_bytes,
+                    1usize << log_eval_size,
+                    packed_len,
+                    std::any::type_name::<PackedBaseField>(),
+                );
+            }
             let buffer = pool.take_or_alloc(log_eval_size);
             let domain = CanonicCoset::new(log_eval_size).circle_domain();
             let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
@@ -242,6 +255,15 @@ impl PolyOps for SimdBackend {
             ));
 
             if batch_bytes >= spill_batch_threshold_bytes {
+                if batch_bytes >= (128 << 20) {
+                    eprintln!(
+                        "ALLOC probe {}:{} fn=SimdBackend::evaluate_polynomials spill_batch_bytes={} batch_len={} backing=mmap",
+                        file!(),
+                        line!(),
+                        batch_bytes,
+                        batch.len(),
+                    );
+                }
                 let batch_start = spilled_polynomials.len();
                 if let Some(mut guard) = spill_eval_columns(&mut batch) {
                     guard.offset_indices(batch_start);
@@ -503,12 +525,25 @@ impl PolyOps for SimdBackend {
             .interpolate()
     }
 
-    fn evaluate(
+        fn evaluate(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
         // SAFETY: evaluate_into writes all values via FFT before they are read.
+        let packed_len = domain.size().div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::evaluate bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                allocation_bytes,
+                domain.size(),
+                packed_len,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
         let buffer = unsafe { Col::<Self, BaseField>::uninitialized(domain.size()) };
         Self::evaluate_into(poly, domain, twiddles, buffer)
     }

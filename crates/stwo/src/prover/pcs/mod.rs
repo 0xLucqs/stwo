@@ -1185,12 +1185,21 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
                 continue;
             }
 
+            let logical_len = 1usize << self.polynomials[idx].log_size();
+            let bytes = logical_len * std::mem::size_of::<BaseField>();
+            if bytes >= (128 << 20) {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=CommitmentTreeProver::materialize_evaluations_low_memory poly_idx={} bytes={} logical_len={} element_type={} backing=heap",
+                    file!(),
+                    line!(),
+                    idx,
+                    bytes,
+                    logical_len,
+                    std::any::type_name::<BaseField>(),
+                );
+            }
             // Materialize this polynomial's evaluation into a fresh heap buffer.
             let evals = self.polynomials[idx].materialize_evaluation(twiddles, base_column_pool);
-            // Approximate heap-backed byte count as `len * sizeof(BaseField)`. The actual
-            // SIMD allocation is slightly larger due to packed lane alignment, but this is
-            // within a few percent and is fine for a coarse-grained budget threshold.
-            let bytes = evals.values.len() * std::mem::size_of::<BaseField>();
             self.polynomials[idx].evals = Some(evals);
 
             if pending_start.is_none() {
@@ -1213,6 +1222,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // spilling it would incur disk I/O for no benefit and would force every subsequent
         // read to fault through the page cache. It will be released normally by
         // `drop_evaluations` or `release_evaluations` at the end of the current PCS phase.
+        let _ = pending_start;
     }
 
     /// Spills a contiguous range of **newly-materialized, heap-backed** polynomials
@@ -1225,6 +1235,22 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     /// any pending batch before stepping over a pre-existing poly.
     fn spill_newly_materialized_range(&mut self, start: usize, end: usize) {
         debug_assert!(end > start, "empty spill range");
+        let allocation_bytes: usize = self.polynomials[start..end]
+            .iter()
+            .filter_map(|poly| poly.evals.as_ref())
+            .map(|evals| evals.values.len() * std::mem::size_of::<BaseField>())
+            .sum();
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=CommitmentTreeProver::spill_newly_materialized_range bytes={} poly_range=[{}, {}) element_type={} backing=mmap",
+                file!(),
+                line!(),
+                allocation_bytes,
+                start,
+                end,
+                std::any::type_name::<BaseField>(),
+            );
+        }
         // SAFETY: cast from `&mut [Poly<B>]` to `&mut [Poly<SimdBackend>]` is sound when
         // `B = SimdBackend`, the only backend that runs the LowMemory re-materialization
         // path. Same precondition as `Self::forget_mmap_backed_evals_if_any` and the

@@ -80,15 +80,45 @@ unsafe impl Send for BaseColumn {}
 unsafe impl Sync for BaseColumn {}
 
 impl Column<BaseField> for BaseColumn {
+    #[track_caller]
     fn zeros(length: usize) -> Self {
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=BaseColumn::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
         let data = vec![PackedBaseField::zeroed(); length.div_ceil(N_LANES)];
         Self { data, length }
     }
 
     #[allow(clippy::uninit_vec)]
+    #[track_caller]
     unsafe fn uninitialized(length: usize) -> Self {
-        let mut data = Vec::with_capacity(length.div_ceil(N_LANES));
-        data.set_len(length.div_ceil(N_LANES));
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=BaseColumn::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
+        let mut data = Vec::with_capacity(packed_len);
+        data.set_len(packed_len);
         Self { data, length }
     }
 
@@ -160,7 +190,22 @@ unsafe impl Send for CM31Column {}
 unsafe impl Sync for CM31Column {}
 
 impl Column<CM31> for CM31Column {
+    #[track_caller]
     fn zeros(length: usize) -> Self {
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedCM31>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=CM31Column::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedCM31>(),
+            );
+        }
         Self {
             data: vec![PackedCM31::zeroed(); length.div_ceil(N_LANES)],
             length,
@@ -168,9 +213,24 @@ impl Column<CM31> for CM31Column {
     }
 
     #[allow(clippy::uninit_vec)]
+    #[track_caller]
     unsafe fn uninitialized(length: usize) -> Self {
-        let mut data = Vec::with_capacity(length.div_ceil(N_LANES));
-        data.set_len(length.div_ceil(N_LANES));
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedCM31>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=CM31Column::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedCM31>(),
+            );
+        }
+        let mut data = Vec::with_capacity(packed_len);
+        data.set_len(packed_len);
         Self { data, length }
     }
 
@@ -292,7 +352,22 @@ unsafe impl Send for SecureColumn {}
 unsafe impl Sync for SecureColumn {}
 
 impl Column<SecureField> for SecureColumn {
+    #[track_caller]
     fn zeros(length: usize) -> Self {
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedSecureField>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=SecureColumn::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedSecureField>(),
+            );
+        }
         Self {
             data: vec![PackedSecureField::zeroed(); length.div_ceil(N_LANES)],
             length,
@@ -300,9 +375,24 @@ impl Column<SecureField> for SecureColumn {
     }
 
     #[allow(clippy::uninit_vec)]
+    #[track_caller]
     unsafe fn uninitialized(length: usize) -> Self {
-        let mut data = Vec::with_capacity(length.div_ceil(N_LANES));
-        data.set_len(length.div_ceil(N_LANES));
+        let packed_len = length.div_ceil(N_LANES);
+        let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedSecureField>());
+        if allocation_bytes >= (128 << 20) {
+            let caller = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC probe caller={}:{} callee=SecureColumn::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                caller.file(),
+                caller.line(),
+                allocation_bytes,
+                length,
+                packed_len,
+                std::any::type_name::<PackedSecureField>(),
+            );
+        }
+        let mut data = Vec::with_capacity(packed_len);
+        data.set_len(packed_len);
         Self { data, length }
     }
 

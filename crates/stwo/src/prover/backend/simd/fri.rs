@@ -57,6 +57,22 @@ impl FriOps for SimdBackend {
 
         let domain = eval.domain();
         let all_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles);
+        let folded_len = 1usize << (log_size - fold_step);
+        let allocation_bytes = folded_len
+            .div_ceil(N_LANES)
+            .saturating_mul(4)
+            .saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::fold_line bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                allocation_bytes,
+                folded_len,
+                folded_len.div_ceil(N_LANES) * 4,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
         let mut folded_values =
             unsafe { SecureColumnByCoords::uninitialized(1 << (log_size - fold_step)) };
 
@@ -139,6 +155,22 @@ impl FriOps for SimdBackend {
         // Create the destination buffer.
         let line_log_size = src.domain.log_size() - 1;
         let dst_domain = LineDomain::new(Coset::half_odds(line_log_size));
+        let dst_len = 1usize << line_log_size;
+        let allocation_bytes = dst_len
+            .div_ceil(N_LANES)
+            .saturating_mul(4)
+            .saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::fold_circle_into_line bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                allocation_bytes,
+                dst_len,
+                dst_len.div_ceil(N_LANES) * 4,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
         let values = unsafe { SecureColumnByCoords::uninitialized(1 << line_log_size) };
         let mut dst = LineEvaluation::new(dst_domain, values);
         let itwiddles = domain_line_twiddles_from_tree(src.domain, &twiddles.itwiddles)[0];
@@ -171,6 +203,22 @@ impl FriOps for SimdBackend {
     ) -> (SecureEvaluation<Self, BitReversedOrder>, SecureField) {
         let lambda = decomposition_coefficient(eval);
         let broadcasted_lambda = PackedSecureField::broadcast(lambda);
+        let allocation_bytes = eval
+            .len()
+            .div_ceil(N_LANES)
+            .saturating_mul(4)
+            .saturating_mul(std::mem::size_of::<PackedBaseField>());
+        if allocation_bytes >= (128 << 20) {
+            eprintln!(
+                "ALLOC probe {}:{} fn=SimdBackend::decompose bytes={} logical_len={} packed_len={} element_type={} backing=heap",
+                file!(),
+                line!(),
+                allocation_bytes,
+                eval.len(),
+                eval.len().div_ceil(N_LANES) * 4,
+                std::any::type_name::<PackedBaseField>(),
+            );
+        }
         let mut g_values = SecureColumnByCoords::<Self>::zeros(eval.len());
 
         let range = eval.len().div_ceil(N_LANES);

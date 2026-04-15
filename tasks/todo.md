@@ -1,3 +1,21 @@
+- [x] Add targeted low-memory allocation tracing for remaining plausible 256 MiB prover allocations
+- [x] Instrument heap-vs-mmap decisions in PCS, FRI, mempool, and lifted-Merkle paths with exact byte-size logs
+- [x] Run focused prover verification to ensure the instrumentation compiles and preserves low-memory regressions
+- [x] Record the instrumented sites and the exact on-device follow-up procedure in the review notes
+
+## Review
+
+- Replaced the generic tracing-based allocation instrumentation with direct pre-allocation `eprintln!` probes so the iPhone run can be diagnosed by the last emitted stderr line before the OOM.
+- The low-level SIMD column constructors now use `#[track_caller]` and print the caller file/line for large allocations, so if a shared helper like `BaseColumn::uninitialized` is the allocating primitive the log still points back to the higher-level call site.
+- Kept caller-oriented `eprintln!` probes on the remaining high-value low-memory allocation paths in `component_prover`, `pcs`, `spill`, `mempool`, SIMD FRI folding, SIMD quotient fallback, and the Blake2s lifted-Merkle state/hash builders.
+- Focused verification passed:
+- `cargo check -p stwo --features prover`
+- `cargo test -p stwo --features prover test_build_first_layer_above_leaves_matches_default -- --nocapture`
+- `cargo test -p stwo --features prover test_checkpointed_decommitment_matches_full_tree -- --nocapture`
+- `cargo test -p stwo --features prover test_pcs_prove_and_verify_simd_low_memory_multi_tree_many_columns -- --nocapture`
+- This is still instrumentation only, not a confirmed memory fix. The next step is on-device: rebuild, rerun the failing transaction sequence, and capture the last `ALLOC probe ...` stderr line emitted before `memory allocation of 268435456 bytes failed`.
+- The probes currently only print for allocations at or above `128 MiB`, so the output stays focused on the candidate large allocations that can plausibly match the failing `256 MiB` request.
+
 - [x] Inspect the existing end-to-end proof harness and choose the lowest-churn location for a fast-vs-low-memory byte-identity regression test
 - [x] Add a deterministic byte-identity STARK proof regression test for fast vs low-memory proving
 - [x] Run the targeted proof regression test and record the result

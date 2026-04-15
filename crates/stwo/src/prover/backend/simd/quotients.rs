@@ -146,16 +146,62 @@ impl QuotientOps for SimdBackend {
         };
 
         if memory_mode == ProverMemoryMode::LowMemory {
+            let eval_buffers_bytes = eval_domain
+                .size()
+                .div_ceil(crate::prover::backend::simd::m31::N_LANES)
+                .saturating_mul(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE)
+                .saturating_mul(std::mem::size_of::<PackedBaseField>());
+            if eval_buffers_bytes >= (128 << 20) {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine bytes={} logical_len={} packed_len={} element_type={} backing=mmap_attempt",
+                    file!(),
+                    line!(),
+                    eval_buffers_bytes,
+                    eval_domain.size(),
+                    eval_domain.size().div_ceil(crate::prover::backend::simd::m31::N_LANES)
+                        * crate::core::fields::qm31::SECURE_EXTENSION_DEGREE,
+                    std::any::type_name::<PackedBaseField>(),
+                );
+            }
             if let Ok((mut eval_buffers, mmap_guard)) =
                 mmap_secure_column_by_coords(eval_domain.size())
             {
                 let evals = SecureColumnByCoords {
                     columns: array::from_fn(|coordinate| {
+                        let coordinate_bytes = (1usize << subdomain_log_size)
+                            .div_ceil(crate::prover::backend::simd::m31::N_LANES)
+                            .saturating_mul(std::mem::size_of::<PackedBaseField>());
+                        if coordinate_bytes >= (128 << 20) {
+                            eprintln!(
+                                "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine coordinate={} bytes={} logical_len={} packed_len={} element_type={} backing=mmap_attempt",
+                                file!(),
+                                line!(),
+                                coordinate,
+                                coordinate_bytes,
+                                1usize << subdomain_log_size,
+                                (1usize << subdomain_log_size)
+                                    .div_ceil(crate::prover::backend::simd::m31::N_LANES),
+                                std::any::type_name::<PackedBaseField>(),
+                            );
+                        }
                         let (quotient_coordinate, quotient_guard) = match mmap_base_column(
                             1 << subdomain_log_size,
                         ) {
                             Ok((column, guard)) => (column, Some(guard)),
                             Err(err) => {
+                                if coordinate_bytes >= (128 << 20) {
+                                    eprintln!(
+                                        "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine coordinate={} bytes={} logical_len={} packed_len={} element_type={} backing=heap_fallback",
+                                        file!(),
+                                        line!(),
+                                        coordinate,
+                                        coordinate_bytes,
+                                        1usize << subdomain_log_size,
+                                        (1usize << subdomain_log_size)
+                                            .div_ceil(crate::prover::backend::simd::m31::N_LANES),
+                                        std::any::type_name::<PackedBaseField>(),
+                                    );
+                                }
                                 tracing::warn!(
                                         "Failed to mmap low-memory quotient subdomain column: {err}. Falling back to heap."
                                     );
