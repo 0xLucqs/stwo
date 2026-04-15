@@ -617,10 +617,15 @@ pub fn spill_eval_columns(
         let mmap_result = {
             use std::os::unix::io::AsRawFd;
             let ptr = unsafe {
+                // PROT_READ only: eval columns are read-only after being written to the
+                // file.  On iOS (no swap), PROT_WRITE forces the kernel to reserve
+                // physical pages for potential dirty COW copies, which fails with ENOMEM
+                // when total mapped bytes exceed available RAM.  Read-only MAP_SHARED
+                // pages are served from the page cache and need no reservation.
                 libc::mmap(
                     std::ptr::null_mut(),
                     chunk_bytes,
-                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::PROT_READ,
                     libc::MAP_SHARED,
                     file.as_file().as_raw_fd(),
                     0,
