@@ -16,11 +16,35 @@
 //!    Merkle tree building.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytemuck::Pod;
 use memmap2::Mmap;
 use tempfile::NamedTempFile;
+
+static ACTIVE_MMAPS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_MMAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Log and return the current mmap stats.
+pub fn log_mmap_stats(label: &str) {
+    let count = ACTIVE_MMAPS.load(Ordering::Relaxed);
+    let bytes = ACTIVE_MMAP_BYTES.load(Ordering::Relaxed);
+    eprintln!(
+        "MMAP_STATS [{label}] active_mmaps={count} active_bytes={:.1} MB",
+        bytes as f64 / (1024.0 * 1024.0),
+    );
+}
+
+fn track_mmap(bytes: usize) {
+    ACTIVE_MMAPS.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_MMAP_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn track_munmap(bytes: usize) {
+    ACTIVE_MMAPS.fetch_sub(1, Ordering::Relaxed);
+    ACTIVE_MMAP_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
 
 /// A file that stores spilled polynomial coefficient data with an mmap for read access.
 ///
@@ -47,9 +71,16 @@ struct SpillEntry {
 /// under memory pressure, and re-read from the backing file on next access.
 pub struct FrozenSpillFile {
     mmap: Mmap,
+    mmap_len: usize,
     entries: Vec<SpillEntry>,
     /// Keep the file alive so the mmap remains valid.
     _file: NamedTempFile,
+}
+
+impl Drop for FrozenSpillFile {
+    fn drop(&mut self) {
+        track_munmap(self.mmap_len);
+    }
 }
 
 /// A handle to a frozen spill file that can be shared across polynomial structs.
@@ -101,8 +132,11 @@ impl CoefficientSpillFile {
         // SAFETY: The file is fully written and synced. We hold an exclusive reference.
         // The mmap is read-only, and the file is kept alive by the FrozenSpillFile.
         let mmap = unsafe { Mmap::map(file.as_file())? };
+        let mmap_len = mmap.len();
+        track_mmap(mmap_len);
         Ok(Arc::new(FrozenSpillFile {
             mmap,
+            mmap_len,
             entries: self.entries,
             _file: file,
         }))
@@ -209,6 +243,7 @@ impl<T: Pod> MmapVec<T> {
             return Err(std::io::Error::last_os_error());
         }
 
+        track_mmap(byte_len);
         Ok(Self {
             ptr: ptr as *mut T,
             len,
@@ -273,6 +308,7 @@ impl<T: Pod> MmapVec<T> {
             return Err(std::io::Error::last_os_error());
         }
 
+        track_mmap(byte_len);
         Ok(Self {
             ptr: ptr as *mut T,
             len,
@@ -312,6 +348,7 @@ impl<T: Pod> std::ops::DerefMut for MmapVec<T> {
 impl<T: Pod> Drop for MmapVec<T> {
     fn drop(&mut self) {
         if self.byte_len > 0 {
+            track_munmap(self.byte_len);
             #[cfg(unix)]
             unsafe {
                 libc::munmap(self.ptr as *mut libc::c_void, self.byte_len);
@@ -337,6 +374,7 @@ unsafe impl Sync for MmapRegion {}
 
 impl Drop for MmapRegion {
     fn drop(&mut self) {
+        track_munmap(self.byte_len);
         #[cfg(unix)]
         unsafe {
             libc::munmap(self.ptr, self.byte_len);
@@ -568,7 +606,10 @@ pub fn spill_eval_columns(
         ));
 
         let mmap_ptr = match mmap_result {
-            Ok(ptr) => ptr,
+            Ok(ptr) => {
+                track_mmap(byte_len);
+                ptr
+            }
             Err(e) => {
                 tracing::warn!("Eval mmap failed: {e}");
                 continue;
