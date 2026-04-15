@@ -105,6 +105,13 @@ fn allocate_state_layer(
         }
     }
 
+    eprintln!(
+        "ALLOC probe {}:{} fn={} heap_fallback bytes={}",
+        file!(),
+        line!(),
+        allocation_label,
+        allocation_bytes,
+    );
     (unsafe { uninit_vec(length) }, None)
 }
 
