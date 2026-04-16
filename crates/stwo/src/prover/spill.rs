@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytemuck::Pod;
-use memmap2::Mmap;
 use tempfile::NamedTempFile;
 
 static ACTIVE_MMAPS: AtomicUsize = AtomicUsize::new(0);
@@ -332,6 +331,356 @@ fn track_munmap(bytes: usize) {
     ACTIVE_MMAP_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+mod mmap_arena {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::NamedTempFile;
+
+    const DEFAULT_ARENA_MB: usize = 4096;
+    const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
+
+    #[derive(Clone, Copy, Debug)]
+    struct FreeRange {
+        offset: usize,
+        len: usize,
+    }
+
+    struct ArenaState {
+        base_addr: usize,
+        page_size: usize,
+        free_ranges: Vec<FreeRange>,
+    }
+
+    impl ArenaState {
+        fn reserve(&mut self, requested_len: usize) -> Option<ArenaLease> {
+            let alloc_len = align_up(requested_len, self.page_size);
+            let idx = self
+                .free_ranges
+                .iter()
+                .position(|range| range.len >= alloc_len)?;
+            let offset = self.free_ranges[idx].offset;
+            self.free_ranges[idx].offset += alloc_len;
+            self.free_ranges[idx].len -= alloc_len;
+            if self.free_ranges[idx].len == 0 {
+                self.free_ranges.remove(idx);
+            }
+            Some(ArenaLease { offset, alloc_len })
+        }
+
+        fn release(&mut self, offset: usize, alloc_len: usize) {
+            self.free_ranges.push(FreeRange {
+                offset,
+                len: alloc_len,
+            });
+            self.free_ranges.sort_by_key(|range| range.offset);
+
+            let mut merged: Vec<FreeRange> = Vec::with_capacity(self.free_ranges.len());
+            for range in self.free_ranges.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if last.offset + last.len == range.offset {
+                        last.len += range.len;
+                        continue;
+                    }
+                }
+                merged.push(range);
+            }
+            self.free_ranges = merged;
+        }
+    }
+
+    pub struct ArenaLease {
+        offset: usize,
+        alloc_len: usize,
+    }
+
+    pub fn try_map_file(
+        file: &NamedTempFile,
+        byte_len: usize,
+        prot: i32,
+    ) -> std::io::Result<Option<(*mut libc::c_void, ArenaLease)>> {
+        if byte_len == 0 {
+            return Ok(None);
+        }
+        let Some(arena) = arena_state() else {
+            return Ok(None);
+        };
+
+        let lease = {
+            let mut state = arena.lock().expect("mmap arena mutex poisoned");
+            match state.reserve(byte_len) {
+                Some(lease) => lease,
+                None => return Ok(None),
+            }
+        };
+
+        let addr = arena_addr(lease.offset);
+        let ptr = unsafe {
+            libc::mmap(
+                addr,
+                byte_len,
+                prot,
+                libc::MAP_FIXED | libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            if let Some(arena) = arena_state() {
+                let mut state = arena.lock().expect("mmap arena mutex poisoned");
+                state.release(lease.offset, lease.alloc_len);
+            }
+            return Err(err);
+        }
+
+        Ok(Some((ptr, lease)))
+    }
+
+    impl Drop for ArenaLease {
+        fn drop(&mut self) {
+            let Some(arena) = arena_state() else {
+                return;
+            };
+            let addr = arena_addr(self.offset);
+            let restore = unsafe {
+                libc::mmap(
+                    addr,
+                    self.alloc_len,
+                    libc::PROT_NONE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if restore == libc::MAP_FAILED {
+                eprintln!(
+                    "MMAP_ARENA restore_failed offset={} bytes={} err={}",
+                    self.offset,
+                    self.alloc_len,
+                    std::io::Error::last_os_error()
+                );
+                return;
+            }
+
+            let mut state = arena.lock().expect("mmap arena mutex poisoned");
+            state.release(self.offset, self.alloc_len);
+        }
+    }
+
+    fn arena_state() -> Option<&'static Mutex<ArenaState>> {
+        static ARENA: OnceLock<Option<Mutex<ArenaState>>> = OnceLock::new();
+        ARENA.get_or_init(init_arena).as_ref()
+    }
+
+    fn arena_addr(offset: usize) -> *mut libc::c_void {
+        let arena = arena_state().expect("arena address requested without arena");
+        let state = arena.lock().expect("mmap arena mutex poisoned");
+        (state.base_addr + offset) as *mut libc::c_void
+    }
+
+    fn init_arena() -> Option<Mutex<ArenaState>> {
+        let requested_mb = std::env::var(ARENA_ENV_VAR)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_ARENA_MB);
+        if requested_mb == 0 {
+            eprintln!("MMAP_ARENA disabled via {ARENA_ENV_VAR}=0");
+            return None;
+        }
+
+        let page_size = page_size()?;
+        let total_len = align_up(requested_mb * 1024 * 1024, page_size);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            eprintln!(
+                "MMAP_ARENA init_failed size_mb={} err={}",
+                requested_mb,
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+
+        eprintln!(
+            "MMAP_ARENA reserved base={ptr:p} size_mb={} page_kb={}",
+            total_len / (1024 * 1024),
+            page_size / 1024
+        );
+        Some(Mutex::new(ArenaState {
+            base_addr: ptr as usize,
+            page_size,
+            free_ranges: vec![FreeRange {
+                offset: 0,
+                len: total_len,
+            }],
+        }))
+    }
+
+    fn page_size() -> Option<usize> {
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if raw <= 0 {
+            eprintln!("MMAP_ARENA failed_to_read_page_size");
+            None
+        } else {
+            Some(raw as usize)
+        }
+    }
+
+    fn align_up(value: usize, alignment: usize) -> usize {
+        value.div_ceil(alignment) * alignment
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{align_up, ArenaState, FreeRange};
+
+        #[test]
+        fn release_merges_adjacent_ranges() {
+            let mut state = ArenaState {
+                base_addr: 0,
+                page_size: 4096,
+                free_ranges: vec![FreeRange {
+                    offset: 2048,
+                    len: 2048,
+                }],
+            };
+
+            state.release(0, 1024);
+            state.release(1024, 1024);
+
+            assert_eq!(state.free_ranges.len(), 1);
+            assert_eq!(state.free_ranges[0].offset, 0);
+            assert_eq!(state.free_ranges[0].len, 4096);
+        }
+
+        #[test]
+        fn align_up_rounds_to_page() {
+            assert_eq!(align_up(1, 4096), 4096);
+            assert_eq!(align_up(4096, 4096), 4096);
+            assert_eq!(align_up(4097, 4096), 8192);
+        }
+    }
+}
+
+enum MappingRelease {
+    System,
+    #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+    Arena {
+        _lease: mmap_arena::ArenaLease,
+    },
+}
+
+struct FileBackedMapping {
+    ptr: *mut libc::c_void,
+    byte_len: usize,
+    _file: NamedTempFile,
+    release: MappingRelease,
+}
+
+unsafe impl Send for FileBackedMapping {}
+unsafe impl Sync for FileBackedMapping {}
+
+impl FileBackedMapping {
+    #[cfg(unix)]
+    fn map_named_temp_file(
+        file: NamedTempFile,
+        byte_len: usize,
+        prot: i32,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        match mmap_arena::try_map_file(&file, byte_len, prot) {
+            Ok(Some((ptr, lease))) => {
+                track_mmap(byte_len);
+                return Ok(Self {
+                    ptr,
+                    byte_len,
+                    _file: file,
+                    release: MappingRelease::Arena { _lease: lease },
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "MMAP_ARENA map_failed bytes={} prot={} err={err}",
+                    byte_len, prot
+                );
+            }
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                prot,
+                libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        track_mmap(byte_len);
+        Ok(Self {
+            ptr,
+            byte_len,
+            _file: file,
+            release: MappingRelease::System,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn map_named_temp_file(
+        _file: NamedTempFile,
+        _byte_len: usize,
+        _prot: i32,
+    ) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file-backed mmap is unsupported on this platform",
+        ))
+    }
+
+    fn as_ptr(&self) -> *mut libc::c_void {
+        self.ptr
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` and `byte_len` cover the full live mapping owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.byte_len) }
+    }
+}
+
+impl Drop for FileBackedMapping {
+    fn drop(&mut self) {
+        if self.byte_len == 0 {
+            return;
+        }
+
+        track_munmap(self.byte_len);
+        #[cfg(unix)]
+        if matches!(self.release, MappingRelease::System) {
+            unsafe {
+                libc::munmap(self.ptr, self.byte_len);
+            }
+        }
+    }
+}
+
 /// A file that stores spilled polynomial coefficient data with an mmap for read access.
 ///
 /// Coefficient vectors are written contiguously. After all writes are complete, the file is
@@ -356,17 +705,8 @@ struct SpillEntry {
 /// The OS manages physical memory residency: pages not recently accessed are evicted
 /// under memory pressure, and re-read from the backing file on next access.
 pub struct FrozenSpillFile {
-    mmap: Mmap,
-    mmap_len: usize,
+    mapping: FileBackedMapping,
     entries: Vec<SpillEntry>,
-    /// Keep the file alive so the mmap remains valid.
-    _file: NamedTempFile,
-}
-
-impl Drop for FrozenSpillFile {
-    fn drop(&mut self) {
-        track_munmap(self.mmap_len);
-    }
 }
 
 /// A handle to a frozen spill file that can be shared across polynomial structs.
@@ -415,16 +755,11 @@ impl CoefficientSpillFile {
     pub fn freeze(self) -> std::io::Result<SharedSpillFile> {
         let file = self.file;
         file.as_file().sync_all()?;
-        // SAFETY: The file is fully written and synced. We hold an exclusive reference.
-        // The mmap is read-only, and the file is kept alive by the FrozenSpillFile.
-        let mmap = unsafe { Mmap::map(file.as_file())? };
-        let mmap_len = mmap.len();
-        track_mmap(mmap_len);
+        let mapping =
+            FileBackedMapping::map_named_temp_file(file, self.offset as usize, libc::PROT_READ)?;
         Ok(Arc::new(FrozenSpillFile {
-            mmap,
-            mmap_len,
+            mapping,
             entries: self.entries,
-            _file: file,
         }))
     }
 }
@@ -433,7 +768,8 @@ impl FrozenSpillFile {
     /// Returns the raw bytes for the coefficient vector at the given index.
     pub fn get_bytes(&self, index: SpillIndex) -> &[u8] {
         let entry = &self.entries[index.0];
-        &self.mmap[entry.byte_offset as usize..entry.byte_offset as usize + entry.byte_len]
+        &self.mapping.as_bytes()
+            [entry.byte_offset as usize..entry.byte_offset as usize + entry.byte_len]
     }
 
     /// Returns the coefficient data at the given index as a slice of `T`.
@@ -488,7 +824,7 @@ pub struct MmapVec<T: Pod> {
     ptr: *mut T,
     len: usize,
     byte_len: usize,
-    _file: NamedTempFile,
+    _mapping: Option<FileBackedMapping>,
 }
 
 unsafe impl<T: Pod> Send for MmapVec<T> {}
@@ -498,8 +834,6 @@ impl<T: Pod> MmapVec<T> {
     /// Creates a file-backed mmap of uninitialized storage for `len` elements.
     #[cfg(unix)]
     pub fn uninitialized(len: usize) -> std::io::Result<Self> {
-        use std::os::unix::io::AsRawFd;
-
         let byte_len = len * std::mem::size_of::<T>();
 
         if byte_len == 0 {
@@ -507,34 +841,22 @@ impl<T: Pod> MmapVec<T> {
                 ptr: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,
                 byte_len: 0,
-                _file: NamedTempFile::new()?,
+                _mapping: None,
             });
         }
 
         let file = NamedTempFile::new()?;
         file.as_file().set_len(byte_len as u64)?;
-
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_file().as_raw_fd(),
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        track_mmap(byte_len);
+        let mapping = FileBackedMapping::map_named_temp_file(
+            file,
+            byte_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )?;
         Ok(Self {
-            ptr: ptr as *mut T,
+            ptr: mapping.as_ptr() as *mut T,
             len,
             byte_len,
-            _file: file,
+            _mapping: Some(mapping),
         })
     }
 
@@ -556,8 +878,6 @@ impl<T: Pod> MmapVec<T> {
     /// The original Vec's memory is freed.
     #[cfg(unix)]
     pub fn from_vec(data: Vec<T>) -> std::io::Result<Self> {
-        use std::os::unix::io::AsRawFd;
-
         let len = data.len();
         let byte_len = len * std::mem::size_of::<T>();
 
@@ -566,7 +886,7 @@ impl<T: Pod> MmapVec<T> {
                 ptr: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,
                 byte_len: 0,
-                _file: NamedTempFile::new()?,
+                _mapping: None,
             });
         }
 
@@ -578,28 +898,16 @@ impl<T: Pod> MmapVec<T> {
         // Drop the original Vec to free its anonymous heap pages.
         drop(data);
 
-        // Mmap the file.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_file().as_raw_fd(),
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        track_mmap(byte_len);
+        let mapping = FileBackedMapping::map_named_temp_file(
+            file,
+            byte_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )?;
         Ok(Self {
-            ptr: ptr as *mut T,
+            ptr: mapping.as_ptr() as *mut T,
             len,
             byte_len,
-            _file: file,
+            _mapping: Some(mapping),
         })
     }
 
@@ -613,7 +921,7 @@ impl<T: Pod> MmapVec<T> {
             ptr,
             len,
             byte_len,
-            _file: NamedTempFile::new()?,
+            _mapping: None,
         })
     }
 }
@@ -633,13 +941,11 @@ impl<T: Pod> std::ops::DerefMut for MmapVec<T> {
 
 impl<T: Pod> Drop for MmapVec<T> {
     fn drop(&mut self) {
-        if self.byte_len > 0 {
-            track_munmap(self.byte_len);
-            #[cfg(unix)]
-            unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.byte_len);
-            }
-            #[cfg(not(unix))]
+        if self.byte_len == 0 {
+            return;
+        }
+        #[cfg(not(unix))]
+        if self._mapping.is_none() {
             unsafe {
                 // Reconstruct the Box to free the allocation.
                 let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.ptr, self.len));
@@ -650,23 +956,11 @@ impl<T: Pod> Drop for MmapVec<T> {
 
 /// A raw mmap region that needs to be munmapped on drop.
 struct MmapRegion {
-    ptr: *mut libc::c_void,
-    byte_len: usize,
-    _file: NamedTempFile,
+    _mapping: FileBackedMapping,
 }
 
 unsafe impl Send for MmapRegion {}
 unsafe impl Sync for MmapRegion {}
-
-impl Drop for MmapRegion {
-    fn drop(&mut self) {
-        track_munmap(self.byte_len);
-        #[cfg(unix)]
-        unsafe {
-            libc::munmap(self.ptr, self.byte_len);
-        }
-    }
-}
 
 /// Guard holding file-backed mmap data for evaluation columns.
 ///
@@ -788,7 +1082,8 @@ pub fn mmap_blake2s_hash_layer(
     Vec<crate::core::vcs::blake2_hash::Blake2sHash>,
     HashLayerMmapGuard,
 )> {
-    let allocation_bytes = length * std::mem::size_of::<crate::core::vcs::blake2_hash::Blake2sHash>();
+    let allocation_bytes =
+        length * std::mem::size_of::<crate::core::vcs::blake2_hash::Blake2sHash>();
     if allocation_bytes >= (128 << 20) {
         eprintln!(
             "ALLOC probe {}:{} fn=mmap_blake2s_hash_layer bytes={} logical_len={} element_type={} backing=mmap",
@@ -858,16 +1153,13 @@ pub fn spill_eval_columns(
             }
         };
         let mut chunk_bytes: usize = 0;
-        let chunk_start = pos;
-
         while pos < eval_indices.len() {
             let idx = eval_indices[pos];
             let col = &polynomials[idx].evals.as_ref().unwrap().values;
             let packed_len = col.data.len();
             let byte_len = packed_len * std::mem::size_of::<PackedBaseField>();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(col.data.as_ptr() as *const u8, byte_len)
-            };
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(col.data.as_ptr() as *const u8, byte_len) };
 
             if let Err(e) = file.write_all(bytes) {
                 tracing::warn!("Eval mmap spill failed (write): {e}");
@@ -898,76 +1190,38 @@ pub fn spill_eval_columns(
             continue;
         }
 
-        // Mmap the chunk file.
-        #[cfg(unix)]
-        let mmap_result = {
-            use std::os::unix::io::AsRawFd;
-            let ptr = unsafe {
-                // PROT_READ only: eval columns are read-only after being written to the
-                // file.  On iOS (no swap), PROT_WRITE forces the kernel to reserve
-                // physical pages for potential dirty COW copies, which fails with ENOMEM
-                // when total mapped bytes exceed available RAM.  Read-only MAP_SHARED
-                // pages are served from the page cache and need no reservation.
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    chunk_bytes,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    file.as_file().as_raw_fd(),
-                    0,
-                )
+        // PROT_READ only: eval columns are read-only after being written to the
+        // file. On iOS (no swap), PROT_WRITE forces the kernel to reserve
+        // physical pages for potential dirty COW copies, which fails with ENOMEM
+        // when total mapped bytes exceed available RAM.
+        let mapping =
+            match FileBackedMapping::map_named_temp_file(file, chunk_bytes, libc::PROT_READ) {
+                Ok(mapping) => mapping,
+                Err(e) => {
+                    tracing::warn!(
+                        "Eval mmap failed ({} cols, {:.1} MB): {e}",
+                        entries.len(),
+                        chunk_bytes as f64 / (1024.0 * 1024.0)
+                    );
+                    break;
+                }
             };
-            if ptr == libc::MAP_FAILED {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(ptr)
-            }
-        };
-
-        #[cfg(not(unix))]
-        let mmap_result: Result<*mut libc::c_void, std::io::Error> = Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "not unix",
-        ));
-
-        let mmap_ptr = match mmap_result {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                tracing::warn!("Eval mmap failed ({} cols, {:.1} MB): {e}",
-                    entries.len(), chunk_bytes as f64 / (1024.0 * 1024.0));
-                // Rewind so the caller's batch keeps these columns heap-backed.
-                pos = chunk_start;
-                break;
-            }
-        };
-
-        track_mmap(chunk_bytes);
+        let mmap_ptr = mapping.as_ptr();
 
         // Mmap succeeded — swap each column's Vec to the mmap and drop heap copies.
         for entry in &entries {
-            let col = &mut polynomials[entry.idx]
-                .evals
-                .as_mut()
-                .unwrap()
-                .values;
-            let _old = std::mem::replace(
-                &mut col.data,
-                unsafe {
-                    Vec::from_raw_parts(
-                        (mmap_ptr as *mut u8).add(entry.byte_offset) as *mut PackedBaseField,
-                        entry.packed_len,
-                        entry.packed_len,
-                    )
-                },
-            );
+            let col = &mut polynomials[entry.idx].evals.as_mut().unwrap().values;
+            let _old = std::mem::replace(&mut col.data, unsafe {
+                Vec::from_raw_parts(
+                    (mmap_ptr as *mut u8).add(entry.byte_offset) as *mut PackedBaseField,
+                    entry.packed_len,
+                    entry.packed_len,
+                )
+            });
             all_spilled_indices.push(entry.idx);
         }
 
-        all_regions.push(MmapRegion {
-            ptr: mmap_ptr,
-            byte_len: chunk_bytes,
-            _file: file,
-        });
+        all_regions.push(MmapRegion { _mapping: mapping });
     }
 
     if all_regions.is_empty() {
