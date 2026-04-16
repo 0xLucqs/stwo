@@ -53,7 +53,7 @@ impl<B: ColumnOps<BaseField>> BaseColumnPool<B> {
             .and_then(|mut pool| pool.pop())
             .unwrap_or_else(|| {
                 let allocation_bytes = (1usize << log_size).saturating_mul(std::mem::size_of::<BaseField>());
-                if allocation_bytes >= (128 << 20) {
+                if allocation_bytes >= (4 << 20) {
                     eprintln!(
                         "ALLOC probe {}:{} fn=BaseColumnPool::take_or_alloc bytes={} logical_len={} element_type={} backing=heap",
                         file!(),

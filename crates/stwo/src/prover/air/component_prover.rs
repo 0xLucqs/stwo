@@ -162,7 +162,7 @@ impl<B: Backend> Poly<B> {
             .eval_domain
             .size()
             .saturating_mul(std::mem::size_of::<BaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=Poly::materialize_evaluation bytes={} logical_len={} element_type={} backing=heap_or_pool",
                 file!(),

@@ -61,7 +61,7 @@ fn allocate_state_layer(
     allocation_label: &str,
 ) -> (Vec<Blake2StateWords>, Option<Blake2StateLayerMmapGuard>) {
     let allocation_bytes = length.saturating_mul(std::mem::size_of::<Blake2StateWords>());
-    if allocation_bytes >= (128 << 20) {
+    if allocation_bytes >= (4 << 20) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let avail_mb = {
             extern "C" { fn os_proc_available_memory() -> u64; }
@@ -122,7 +122,7 @@ fn allocate_hash_layer(
     use_mmap: bool,
 ) -> (Vec<Blake2sHash>, Option<HashLayerMmapGuard>) {
     let allocation_bytes = length.saturating_mul(std::mem::size_of::<Blake2sHash>());
-    if allocation_bytes >= (128 << 20) {
+    if allocation_bytes >= (4 << 20) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let avail_mb = {
             extern "C" { fn os_proc_available_memory() -> u64; }
@@ -570,7 +570,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let state_len = 1usize << max_log_size;
         let state_bytes =
             state_len.saturating_mul(std::mem::size_of::<[u32x16; N_FELTS_IN_BLAKE_STATE]>());
-        if state_bytes >= (128 << 20) {
+        if state_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::build_leaves prev_layer_states bytes={} logical_len={} element_type={} backing=heap",
                 file!(),
@@ -590,7 +590,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // having been written to before.
         let mut prev_layer_states: Vec<[u32x16; N_FELTS_IN_BLAKE_STATE]> =
             unsafe { uninit_vec(1 << max_log_size) };
-        if state_bytes >= (128 << 20) {
+        if state_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::build_leaves next_layer_states bytes={} logical_len={} element_type={} backing=heap",
                 file!(),
@@ -701,7 +701,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let leaf_hashes_len = 1usize << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE);
         let leaf_hashes_bytes =
             leaf_hashes_len.saturating_mul(std::mem::size_of::<Blake2sHash>());
-        if leaf_hashes_bytes >= (128 << 20) {
+        if leaf_hashes_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::build_leaves leaf_hashes bytes={} logical_len={} element_type={} backing=heap",
                 file!(),
@@ -721,7 +721,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             let lifted_state_len = 1usize << lifting_log_size_packed;
             let lifted_state_bytes = lifted_state_len
                 .saturating_mul(std::mem::size_of::<[u32x16; N_FELTS_IN_BLAKE_STATE]>());
-            if lifted_state_bytes >= (128 << 20) {
+            if lifted_state_bytes >= (4 << 20) {
                 eprintln!(
                     "ALLOC probe {}:{} fn=SimdBackend::build_leaves lifted_state_buffer bytes={} logical_len={} element_type={} backing=heap",
                     file!(),

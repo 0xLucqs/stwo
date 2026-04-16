@@ -62,7 +62,7 @@ impl FriOps for SimdBackend {
             .div_ceil(N_LANES)
             .saturating_mul(4)
             .saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::fold_line bytes={} logical_len={} packed_len={} element_type={} backing=heap",
                 file!(),
@@ -160,7 +160,7 @@ impl FriOps for SimdBackend {
             .div_ceil(N_LANES)
             .saturating_mul(4)
             .saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::fold_circle_into_line bytes={} logical_len={} packed_len={} element_type={} backing=heap",
                 file!(),
@@ -208,7 +208,7 @@ impl FriOps for SimdBackend {
             .div_ceil(N_LANES)
             .saturating_mul(4)
             .saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::decompose bytes={} logical_len={} packed_len={} element_type={} backing=heap",
                 file!(),

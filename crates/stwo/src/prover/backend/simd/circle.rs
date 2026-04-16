@@ -234,7 +234,7 @@ impl PolyOps for SimdBackend {
             let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
             let packed_len = (1usize << log_eval_size).div_ceil(N_LANES);
             let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
-            if allocation_bytes >= (128 << 20) {
+            if allocation_bytes >= (4 << 20) {
                 eprintln!(
                     "ALLOC probe {}:{} fn=SimdBackend::evaluate_polynomials bytes={} logical_len={} packed_len={} element_type={} backing=heap_or_pool",
                     file!(),
@@ -255,7 +255,7 @@ impl PolyOps for SimdBackend {
             ));
 
             if batch_bytes >= spill_batch_threshold_bytes {
-                if batch_bytes >= (128 << 20) {
+                if batch_bytes >= (4 << 20) {
                     eprintln!(
                         "ALLOC probe {}:{} fn=SimdBackend::evaluate_polynomials spill_batch_bytes={} batch_len={} backing=mmap",
                         file!(),
@@ -533,7 +533,7 @@ impl PolyOps for SimdBackend {
         // SAFETY: evaluate_into writes all values via FFT before they are read.
         let packed_len = domain.size().div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::evaluate bytes={} logical_len={} packed_len={} element_type={} backing=heap",
                 file!(),

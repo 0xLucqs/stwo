@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use hashbrown::HashMap;
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
@@ -831,6 +833,13 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     }
 }
 
+/// Process-wide monotonic counter incremented on every `TreeBuilder::extend_evals`
+/// call. Used purely to stride VM_WALK emissions during base-trace generation,
+/// where extend_evals is invoked dozens of times in a tight loop and we want a
+/// memory-growth trajectory instead of either zero VM_WALKs (current) or one per
+/// call (too noisy).
+static EXTEND_EVALS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 /// Helper struct for aggregating polynomials and evaluations for a commitment tree.
 pub struct TreeBuilder<'a, 'b, B: BackendForChannel<MC>, MC: MerkleChannel> {
     tree_index: usize,
@@ -842,6 +851,22 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         &mut self,
         columns: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     ) -> TreeSubspan {
+        // Periodic VM_WALK during base-trace generation, where the cairo prover
+        // calls extend_evals dozens of times in a row. Capturing the trajectory
+        // lets us correlate `phys_footprint` growth (anonymous heap pressure)
+        // with how many components have been processed so far. Stride is hand-
+        // tuned to keep log volume modest while still catching ramp-up clearly.
+        const VM_WALK_STRIDE: usize = 5;
+        let call_idx = EXTEND_EVALS_CALLS.fetch_add(1, Ordering::Relaxed);
+        if call_idx % VM_WALK_STRIDE == 0 {
+            let n_cols = columns.len();
+            let label = format!(
+                "extend_evals:#{call_idx}:tree={}:cols={n_cols}:polys_so_far={}",
+                self.tree_index,
+                self.polys.len()
+            );
+            crate::prover::spill::log_vm_walk(&label);
+        }
         let span = span!(Level::INFO, "Interpolation for commitment").entered();
         let polys = B::interpolate_columns(columns, self.commitment_scheme.twiddles);
         span.exit();
@@ -1187,7 +1212,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
 
             let logical_len = 1usize << self.polynomials[idx].log_size();
             let bytes = logical_len * std::mem::size_of::<BaseField>();
-            if bytes >= (128 << 20) {
+            if bytes >= (4 << 20) {
                 eprintln!(
                     "ALLOC probe {}:{} fn=CommitmentTreeProver::materialize_evaluations_low_memory poly_idx={} bytes={} logical_len={} element_type={} backing=heap",
                     file!(),
@@ -1240,7 +1265,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .filter_map(|poly| poly.evals.as_ref())
             .map(|evals| evals.values.len() * std::mem::size_of::<BaseField>())
             .sum();
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=CommitmentTreeProver::spill_newly_materialized_range bytes={} poly_range=[{}, {}) element_type={} backing=mmap",
                 file!(),

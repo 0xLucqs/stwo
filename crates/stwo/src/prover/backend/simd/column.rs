@@ -84,7 +84,7 @@ impl Column<BaseField> for BaseColumn {
     fn zeros(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=BaseColumn::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
@@ -105,7 +105,7 @@ impl Column<BaseField> for BaseColumn {
     unsafe fn uninitialized(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=BaseColumn::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",
@@ -194,7 +194,7 @@ impl Column<CM31> for CM31Column {
     fn zeros(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedCM31>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=CM31Column::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
@@ -217,7 +217,7 @@ impl Column<CM31> for CM31Column {
     unsafe fn uninitialized(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedCM31>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=CM31Column::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",
@@ -356,7 +356,7 @@ impl Column<SecureField> for SecureColumn {
     fn zeros(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedSecureField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=SecureColumn::zeros bytes={} logical_len={} packed_len={} element_type={} backing=heap",
@@ -379,7 +379,7 @@ impl Column<SecureField> for SecureColumn {
     unsafe fn uninitialized(length: usize) -> Self {
         let packed_len = length.div_ceil(N_LANES);
         let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedSecureField>());
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=SecureColumn::uninitialized bytes={} logical_len={} packed_len={} element_type={} backing=heap",

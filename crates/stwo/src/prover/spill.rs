@@ -35,6 +35,43 @@ pub fn log_mmap_stats(label: &str) {
     );
 }
 
+/// Re-entrancy guard for the alloc-error hook so that diagnostic emission
+/// inside the hook (which itself may allocate) cannot recurse infinitely.
+static ALLOC_HOOK_REENTRY: AtomicUsize = AtomicUsize::new(0);
+
+/// Custom alloc-error hook that, when the global allocator fails, dumps a
+/// VM_WALK + MMAP_STATS snapshot to stderr before the runtime aborts. This
+/// is critical on iOS where `memory allocation of N bytes failed` is the
+/// only signal we get back from a jetsam/ENOMEM event during proving.
+fn alloc_error_hook(layout: std::alloc::Layout) {
+    let depth = ALLOC_HOOK_REENTRY.fetch_add(1, Ordering::Relaxed);
+    if depth == 0 {
+        eprintln!(
+            "ALLOC_FAILURE size={} align={} active_mmaps={} active_mmap_bytes={}",
+            layout.size(),
+            layout.align(),
+            ACTIVE_MMAPS.load(Ordering::Relaxed),
+            ACTIVE_MMAP_BYTES.load(Ordering::Relaxed),
+        );
+        log_mmap_stats("alloc_error");
+        log_vm_walk("alloc_error");
+    }
+    ALLOC_HOOK_REENTRY.fetch_sub(1, Ordering::Relaxed);
+    // Returning falls through to the runtime's default abort path, which is
+    // what we want — we just wanted to attach diagnostics first.
+}
+
+/// Installs the custom alloc-error hook exactly once per process. Safe to
+/// call from multiple sites; subsequent calls are no-ops.
+pub fn ensure_alloc_error_hook_installed() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        std::alloc::set_alloc_error_hook(alloc_error_hook);
+        eprintln!("ALLOC_HOOK installed");
+    });
+}
+
 /// Snapshot task-level VM accounting and the largest contiguous free VA gap.
 ///
 /// This is meant to distinguish allocator/phys_footprint retention (shows up as elevated
@@ -43,13 +80,21 @@ pub fn log_mmap_stats(label: &str) {
 ///
 /// Emits a single grep-friendly line prefixed with `VM_WALK [label]`.
 /// No-op on non-Darwin.
+///
+/// As a side effect, also ensures the alloc-error hook is installed so that any
+/// allocation failure later in the same process dumps a VM_WALK snapshot before
+/// abort. The very first VM_WALK call from the FFI (`ffi:before_proof`) thus
+/// covers cases where the arena is disabled or the first arena mmap never runs.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn log_vm_walk(label: &str) {
+    ensure_alloc_error_hook_installed();
     vm_walk_impl::log_vm_walk(label);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-pub fn log_vm_walk(_label: &str) {}
+pub fn log_vm_walk(_label: &str) {
+    ensure_alloc_error_hook_installed();
+}
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod vm_walk_impl {
@@ -482,6 +527,12 @@ mod mmap_arena {
     }
 
     fn init_arena() -> Option<Mutex<ArenaState>> {
+        // Install the alloc-error hook now so any later malloc failure during
+        // proving prints a VM_WALK snapshot before the runtime aborts. This is
+        // the only window we have to capture VM state at the failure point on
+        // iOS, where the default abort path emits just the byte count.
+        super::ensure_alloc_error_hook_installed();
+
         let requested_mb = std::env::var(ARENA_ENV_VAR)
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
@@ -788,7 +839,7 @@ impl FrozenSpillFile {
     pub fn load_vec<T: Pod + Clone>(&self, index: SpillIndex) -> Vec<T> {
         let slice = self.get_slice::<T>(index);
         let allocation_bytes = std::mem::size_of_val(slice);
-        if allocation_bytes >= (128 << 20) {
+        if allocation_bytes >= (4 << 20) {
             let caller = std::panic::Location::caller();
             eprintln!(
                 "ALLOC probe caller={}:{} callee=FrozenSpillFile::load_vec bytes={} logical_len={} element_type={} backing=heap",
@@ -1007,7 +1058,7 @@ pub fn mmap_base_column(
     let packed_len = length.div_ceil(crate::prover::backend::simd::m31::N_LANES);
     let allocation_bytes =
         packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
-    if allocation_bytes >= (128 << 20) {
+    if allocation_bytes >= (4 << 20) {
         eprintln!(
             "ALLOC probe {}:{} fn=mmap_base_column bytes={} logical_len={} packed_len={} element_type={} backing=mmap",
             file!(),
@@ -1042,7 +1093,7 @@ pub fn mmap_secure_column_by_coords(
     let coordinate_bytes =
         packed_len * std::mem::size_of::<crate::prover::backend::simd::m31::PackedBaseField>();
     let allocation_bytes = coordinate_bytes * crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
-    if allocation_bytes >= (128 << 20) {
+    if allocation_bytes >= (4 << 20) {
         eprintln!(
             "ALLOC probe {}:{} fn=mmap_secure_column_by_coords bytes={} logical_len={} packed_len={} element_type={} backing=mmap",
             file!(),
@@ -1084,7 +1135,7 @@ pub fn mmap_blake2s_hash_layer(
 )> {
     let allocation_bytes =
         length * std::mem::size_of::<crate::core::vcs::blake2_hash::Blake2sHash>();
-    if allocation_bytes >= (128 << 20) {
+    if allocation_bytes >= (4 << 20) {
         eprintln!(
             "ALLOC probe {}:{} fn=mmap_blake2s_hash_layer bytes={} logical_len={} element_type={} backing=mmap",
             file!(),

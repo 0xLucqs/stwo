@@ -151,7 +151,7 @@ impl QuotientOps for SimdBackend {
                 .div_ceil(crate::prover::backend::simd::m31::N_LANES)
                 .saturating_mul(crate::core::fields::qm31::SECURE_EXTENSION_DEGREE)
                 .saturating_mul(std::mem::size_of::<PackedBaseField>());
-            if eval_buffers_bytes >= (128 << 20) {
+            if eval_buffers_bytes >= (4 << 20) {
                 eprintln!(
                     "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine bytes={} logical_len={} packed_len={} element_type={} backing=mmap_attempt",
                     file!(),
@@ -171,7 +171,7 @@ impl QuotientOps for SimdBackend {
                         let coordinate_bytes = (1usize << subdomain_log_size)
                             .div_ceil(crate::prover::backend::simd::m31::N_LANES)
                             .saturating_mul(std::mem::size_of::<PackedBaseField>());
-                        if coordinate_bytes >= (128 << 20) {
+                        if coordinate_bytes >= (4 << 20) {
                             eprintln!(
                                 "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine coordinate={} bytes={} logical_len={} packed_len={} element_type={} backing=mmap_attempt",
                                 file!(),
@@ -189,7 +189,7 @@ impl QuotientOps for SimdBackend {
                         ) {
                             Ok((column, guard)) => (column, Some(guard)),
                             Err(err) => {
-                                if coordinate_bytes >= (128 << 20) {
+                                if coordinate_bytes >= (4 << 20) {
                                     eprintln!(
                                         "ALLOC probe {}:{} fn=SimdBackend::compute_quotients_and_combine coordinate={} bytes={} logical_len={} packed_len={} element_type={} backing=heap_fallback",
                                         file!(),
