@@ -404,14 +404,15 @@ mod mmap_arena {
     ///   (~13.6 GiB on a 4 GiB iPhone). Proof 1 aborts on a plain 8 MiB heap
     ///   allocation with `largest_user_mb=3.7` and `gaps_ge_16mb=0` while
     ///   jetsam still has 3 GiB of physical headroom.
-    /// * 1024 → current: matches what we actually observe active inside the
-    ///   arena during base trace (155 MiB) with ~6× headroom for growth, and
-    ///   gives 4 GiB of VA back to libsystem_malloc so its magazine churn
-    ///   has room to keep finding contiguous holes for new heap allocations.
-    ///   If late proving then fails on a clean `mmap_failed` inside the arena
-    ///   (i.e. arena genuinely too small for concurrent spill peak), bump
-    ///   size up by the observed shortfall via `STWO_MMAP_ARENA_MB`.
-    const DEFAULT_ARENA_MB: usize = 1024;
+    /// * 1024 → with threshold=32 MiB the arena was 99.4% full all the time
+    ///   and forced 57 RESERVE_FAIL overflows per proof.
+    /// * 2048 → current. Paired with threshold=128 MiB so only the ~19 large
+    ///   allocations per proof (256 MiB state layers, 128+ MiB hash layers,
+    ///   400-500 MiB coefficient spills) need to fit. 2 GiB is a comfortable
+    ///   envelope for that set without eating so much of the iOS user-VA
+    ///   budget that libsystem_malloc runs out of room for its own heap
+    ///   magazines. Override at runtime via `STWO_MMAP_ARENA_MB`.
+    const DEFAULT_ARENA_MB: usize = 2048;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
@@ -738,9 +739,17 @@ unsafe impl Sync for FileBackedMapping {}
 /// guarantee.
 ///
 /// Override at runtime via `STWO_MMAP_ARENA_MIN_MB` (e.g. `0` to route
-/// every spill through the arena, `128` to only catch the very biggest).
+/// every spill through the arena, `32` to match the previous default).
+///
+/// Why 128: the simulator log shows 57 `ARENA_RESERVE_FAIL` events at the
+/// 32 MiB threshold (the arena was constantly full of 32 MiB and 64 MiB
+/// chunks that don't actually need the contiguity guarantee). Raising the
+/// threshold to 128 MiB lets the small chunks go straight to libc where
+/// they have no trouble finding space, and keeps the arena reserved for
+/// the allocations that genuinely need it (lifted-Merkle state/hash layers
+/// and multi-hundred-MiB coefficient spills).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-const DEFAULT_ARENA_FILE_BACKED_MIN_MB: usize = 32;
+const DEFAULT_ARENA_FILE_BACKED_MIN_MB: usize = 128;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const ARENA_FILE_BACKED_MIN_ENV: &str = "STWO_MMAP_ARENA_MIN_MB";
