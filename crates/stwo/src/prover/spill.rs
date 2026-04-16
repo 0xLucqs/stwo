@@ -72,6 +72,39 @@ pub fn ensure_alloc_error_hook_installed() {
     });
 }
 
+/// Asks libsystem_malloc to return any unused magazine / cache VA back to the
+/// kernel. On iOS the per-process VA budget is small enough that long-running
+/// proving runs can fragment the user VA range to the point where a fresh
+/// contiguous N MiB allocation fails even though phys_footprint is nowhere
+/// near the jetsam ceiling — see device log [VM_WALK alloc_error] showing
+/// `largest_user_mb=3.7` while `phys=1518`. Calling pressure_relief between
+/// phases coalesces malloc's free magazines and typically restores tens to
+/// hundreds of MiB of contiguous VA.
+///
+/// Returns the number of bytes the allocator reports as freed (best-effort,
+/// 0 on non-Darwin or when the call is unavailable). Always logs a
+/// `MALLOC_RELIEF [label]` line so a regression is easy to spot in device logs.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn malloc_pressure_relief(label: &str) -> usize {
+    extern "C" {
+        // void * here is malloc_zone_t *; passing NULL means "all zones".
+        // size_t goal=0 means "release everything you can".
+        fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t)
+            -> libc::size_t;
+    }
+    let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    eprintln!(
+        "MALLOC_RELIEF [{label}] freed_bytes={freed} freed_mb={:.1}",
+        freed as f64 / (1024.0 * 1024.0)
+    );
+    freed
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn malloc_pressure_relief(_label: &str) -> usize {
+    0
+}
+
 /// Snapshot task-level VM accounting and the largest contiguous free VA gap.
 ///
 /// This is meant to distinguish allocator/phys_footprint retention (shows up as elevated
