@@ -123,6 +123,11 @@ mod vm_walk_impl {
         // Hard caps so the probe never dominates proving time.
         const MAX_REGIONS: u64 = 50_000;
         const WALK_DEADLINE_MS: u128 = 500;
+        // Gap size thresholds for the histogram (bytes).
+        const MB_256: u64 = 256 << 20;
+        const MB_128: u64 = 128 << 20;
+        const MB_64: u64 = 64 << 20;
+        const MB_16: u64 = 16 << 20;
 
         let task = unsafe { mach_task_self() };
 
@@ -141,13 +146,36 @@ mod vm_walk_impl {
             return;
         }
 
+        let user_min = info.min_address;
+        let user_max = info.max_address;
+
         let started = Instant::now();
         let mut addr: MachVmAddressT = 0;
         let mut prev_end: MachVmAddressT = 0;
         let mut walked: u64 = 0;
-        let mut gaps: u64 = 0;
-        let mut largest_gap: u64 = 0;
-        let mut total_free: u64 = 0;
+
+        // Whole-walk metrics: every gap mach_vm_region_recurse exposes, including the
+        // potentially huge hole between the app's user range and iOS shared cache.
+        let mut gaps_all: u64 = 0;
+        let mut largest_gap_all: u64 = 0;
+        let mut total_free_all: u64 = 0;
+
+        // User-range metrics: clipped to [user_min, user_max].  This is the window the
+        // user-mmap allocator actually competes for, and therefore the right number for
+        // answering "does a contiguous 128/256 MiB hole exist?"
+        let mut gaps_user: u64 = 0;
+        let mut largest_gap_user: u64 = 0;
+        let mut total_free_user: u64 = 0;
+        let mut gaps_ge_256mb: u64 = 0;
+        let mut gaps_ge_128mb: u64 = 0;
+        let mut gaps_ge_64mb: u64 = 0;
+        let mut gaps_ge_16mb: u64 = 0;
+
+        // Region-size distribution within user range (tells us how fragmented the
+        // map is: many small regions in a tight user VA is the failure signature).
+        let mut regions_in_user: u64 = 0;
+        let mut regions_ge_128mb: u64 = 0;
+        let mut regions_ge_16mb: u64 = 0;
 
         loop {
             if walked >= MAX_REGIONS || started.elapsed().as_millis() > WALK_DEADLINE_MS {
@@ -171,24 +199,99 @@ mod vm_walk_impl {
                 // KERN_INVALID_ADDRESS (1) signals end-of-map; anything else is a real error.
                 break;
             }
+
+            // Whole-walk gap bookkeeping.
             if addr > prev_end {
                 let gap = addr - prev_end;
-                gaps += 1;
-                total_free += gap;
-                if gap > largest_gap {
-                    largest_gap = gap;
+                gaps_all += 1;
+                total_free_all += gap;
+                if gap > largest_gap_all {
+                    largest_gap_all = gap;
                 }
             }
+
+            // User-range gap bookkeeping.  Clip the gap [prev_end, addr) to
+            // [user_min, user_max).
+            if user_max > user_min {
+                let gap_start = prev_end.max(user_min);
+                let gap_end = addr.min(user_max);
+                if gap_end > gap_start {
+                    let gap = gap_end - gap_start;
+                    gaps_user += 1;
+                    total_free_user += gap;
+                    if gap > largest_gap_user {
+                        largest_gap_user = gap;
+                    }
+                    if gap >= MB_256 {
+                        gaps_ge_256mb += 1;
+                    }
+                    if gap >= MB_128 {
+                        gaps_ge_128mb += 1;
+                    }
+                    if gap >= MB_64 {
+                        gaps_ge_64mb += 1;
+                    }
+                    if gap >= MB_16 {
+                        gaps_ge_16mb += 1;
+                    }
+                }
+            }
+
+            // Region-size bookkeeping (only for regions whose start lies in user range).
+            if addr >= user_min && addr < user_max {
+                regions_in_user += 1;
+                if size >= MB_128 {
+                    regions_ge_128mb += 1;
+                }
+                if size >= MB_16 {
+                    regions_ge_16mb += 1;
+                }
+            }
+
             walked += 1;
             prev_end = addr.saturating_add(size);
             addr = prev_end;
         }
 
+        // Tail gap: from the last visited region end up to user_max, if it lies within
+        // user range.
+        if user_max > user_min {
+            let gap_start = prev_end.max(user_min);
+            if user_max > gap_start {
+                let gap = user_max - gap_start;
+                gaps_user += 1;
+                total_free_user += gap;
+                if gap > largest_gap_user {
+                    largest_gap_user = gap;
+                }
+                if gap >= MB_256 {
+                    gaps_ge_256mb += 1;
+                }
+                if gap >= MB_128 {
+                    gaps_ge_128mb += 1;
+                }
+                if gap >= MB_64 {
+                    gaps_ge_64mb += 1;
+                }
+                if gap >= MB_16 {
+                    gaps_ge_16mb += 1;
+                }
+            }
+        }
+
+        let user_va_bytes = user_max.saturating_sub(user_min);
+        let user_va_mb = user_va_bytes as f64 / MB;
+        let user_used_mb = user_va_bytes.saturating_sub(total_free_user) as f64 / MB;
+
         eprintln!(
             "VM_WALK [{label}] virt={:.1} MB resident={:.1} MB phys={:.1} MB \
              internal={:.1} MB external={:.1} MB reusable={:.1} MB \
              task_regions={} min=0x{:x} max=0x{:x} \
-             walked={} gaps={} largest_gap={:.1} MB total_free={:.1} MB walk_ms={}",
+             user_va_mb={:.1} user_used_mb={:.1} \
+             walked={} gaps_all={} largest_all_mb={:.1} total_free_all_mb={:.1} \
+             gaps_user={} largest_user_mb={:.1} total_free_user_mb={:.1} \
+             gaps_ge_256mb={} gaps_ge_128mb={} gaps_ge_64mb={} gaps_ge_16mb={} \
+             regions_in_user={} regions_ge_128mb={} regions_ge_16mb={} walk_ms={}",
             info.virtual_size as f64 / MB,
             info.resident_size as f64 / MB,
             info.phys_footprint as f64 / MB,
@@ -198,10 +301,22 @@ mod vm_walk_impl {
             info.region_count,
             info.min_address,
             info.max_address,
+            user_va_mb,
+            user_used_mb,
             walked,
-            gaps,
-            largest_gap as f64 / MB,
-            total_free as f64 / MB,
+            gaps_all,
+            largest_gap_all as f64 / MB,
+            total_free_all as f64 / MB,
+            gaps_user,
+            largest_gap_user as f64 / MB,
+            total_free_user as f64 / MB,
+            gaps_ge_256mb,
+            gaps_ge_128mb,
+            gaps_ge_64mb,
+            gaps_ge_16mb,
+            regions_in_user,
+            regions_ge_128mb,
+            regions_ge_16mb,
             started.elapsed().as_millis(),
         );
     }
