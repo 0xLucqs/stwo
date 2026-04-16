@@ -659,6 +659,42 @@ struct FileBackedMapping {
 unsafe impl Send for FileBackedMapping {}
 unsafe impl Sync for FileBackedMapping {}
 
+/// Minimum file-backed mmap size (in MiB) that will be routed through the
+/// arena. Anything smaller is sent straight to `libc::mmap` at whatever
+/// address the kernel picks.
+///
+/// The arena's whole purpose is to keep **big** spill mappings contiguous
+/// across proof runs — that's what the original proof 2 failure was about
+/// (a 256 MiB lifted-Merkle mapping that couldn't find a contiguous hole in
+/// a warm, fragmented user VA). Small spill mmaps do not need that
+/// protection: the kernel always finds 3-4 MiB of contiguous VA somewhere,
+/// and forcing the thousand-plus small spills that a Cairo proof produces
+/// through the arena just fills it with 3-4 MiB fragments that then
+/// displace the one allocation that actually needed the contiguity
+/// guarantee.
+///
+/// Override at runtime via `STWO_MMAP_ARENA_MIN_MB` (e.g. `0` to route
+/// every spill through the arena, `128` to only catch the very biggest).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const DEFAULT_ARENA_FILE_BACKED_MIN_MB: usize = 32;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ARENA_FILE_BACKED_MIN_ENV: &str = "STWO_MMAP_ARENA_MIN_MB";
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn arena_file_backed_min_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mb = std::env::var(ARENA_FILE_BACKED_MIN_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_ARENA_FILE_BACKED_MIN_MB);
+        eprintln!("MMAP_ARENA file_backed_min_mb={mb}");
+        mb * 1024 * 1024
+    })
+}
+
 impl FileBackedMapping {
     #[cfg(unix)]
     fn map_named_temp_file(
@@ -668,23 +704,30 @@ impl FileBackedMapping {
     ) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
+        // Only route big enough spills through the arena. Small mmaps go
+        // straight to libc — the kernel reliably finds a few MiB of
+        // contiguous VA, and keeping them out of the arena leaves arena
+        // space for the one 256 MiB allocation that actually needs the
+        // guarantee.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        match mmap_arena::try_map_file(&file, byte_len, prot) {
-            Ok(Some((ptr, lease))) => {
-                track_mmap(byte_len);
-                return Ok(Self {
-                    ptr,
-                    byte_len,
-                    _file: file,
-                    release: MappingRelease::Arena { _lease: lease },
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!(
-                    "MMAP_ARENA map_failed bytes={} prot={} err={err}",
-                    byte_len, prot
-                );
+        if byte_len >= arena_file_backed_min_bytes() {
+            match mmap_arena::try_map_file(&file, byte_len, prot) {
+                Ok(Some((ptr, lease))) => {
+                    track_mmap(byte_len);
+                    return Ok(Self {
+                        ptr,
+                        byte_len,
+                        _file: file,
+                        release: MappingRelease::Arena { _lease: lease },
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "MMAP_ARENA map_failed bytes={} prot={} err={err}",
+                        byte_len, prot
+                    );
+                }
             }
         }
 
