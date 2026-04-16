@@ -410,14 +410,19 @@ mod mmap_arena {
     ///   forced 13 RESERVE_FAILs on 128-148 MiB hash-layer / spill chunks
     ///   that arrived while 4 coefficient spills + 2-3 state layers were
     ///   already alive.
-    /// * 4096 → current. Simulator run (threshold=128) showed concurrent
-    ///   peak of 2.85-3.3 GiB across ~51 big allocations per proof
-    ///   (coefficient spills 391-470 MiB, state layers 256 MiB × 8,
-    ///   hash layers / big chunks 128-148 MiB). 4 GiB fits that peak with
-    ///   ~25% headroom for worst-case device timing differences, while
-    ///   still leaving ~8 GiB of iOS user-VA budget for libsystem_malloc
-    ///   and system frameworks. Override at runtime via `STWO_MMAP_ARENA_MB`.
-    const DEFAULT_ARENA_MB: usize = 4096;
+    /// * 4096 → simulator worked, but device aborted during base trace on a
+    ///   4 MiB heap alloc: `user_used_mb=13567`, `largest_user_mb=2.2`,
+    ///   `internal=2068 MiB`. Arena ate too much of the 13.6 GiB iOS user-VA
+    ///   budget, leaving libsystem_malloc no room to grow its magazines
+    ///   during witness generation. Arena was only 15% filled at the abort.
+    /// * 3584 → current. Splits the difference: fits the 2.85-3.3 GiB
+    ///   concurrent peak we measured in simulator, leaves ~10 GiB of
+    ///   user-VA for malloc + frameworks on device (vs ~9 GiB with 4 GiB
+    ///   arena). If device aborts on heap alloc again, drop further
+    ///   (2048 is the next natural stop). If device completes with a late-
+    ///   proving `ARENA_RESERVE_FAIL` overflow, bump back up.
+    ///   Override at runtime via `STWO_MMAP_ARENA_MB`.
+    const DEFAULT_ARENA_MB: usize = 3584;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
