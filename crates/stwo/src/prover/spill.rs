@@ -72,168 +72,6 @@ pub fn ensure_alloc_error_hook_installed() {
     });
 }
 
-/// Asks libsystem_malloc to return any unused magazine / cache VA back to the
-/// kernel. On iOS the per-process VA budget is small enough that long-running
-/// proving runs can fragment the user VA range to the point where a fresh
-/// contiguous N MiB allocation fails even though phys_footprint is nowhere
-/// near the jetsam ceiling — see device log [VM_WALK alloc_error] showing
-/// `largest_user_mb=3.7` while `phys=1518`. Calling pressure_relief between
-/// phases coalesces malloc's free magazines and typically restores tens to
-/// hundreds of MiB of contiguous VA.
-///
-/// Returns the number of bytes the allocator reports as freed (best-effort,
-/// 0 on non-Darwin or when the call is unavailable). Always logs a
-/// `MALLOC_RELIEF [label]` line so a regression is easy to spot in device logs.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub fn malloc_pressure_relief(label: &str) -> usize {
-    extern "C" {
-        // void * here is malloc_zone_t *; passing NULL means "all zones".
-        // size_t goal=0 means "release everything you can".
-        fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t)
-            -> libc::size_t;
-    }
-    let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    eprintln!(
-        "MALLOC_RELIEF [{label}] freed_bytes={freed} freed_mb={:.1}",
-        freed as f64 / (1024.0 * 1024.0)
-    );
-    freed
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
-pub fn malloc_pressure_relief(_label: &str) -> usize {
-    0
-}
-
-/// Threshold above which the global allocator routes allocations through the
-/// arena instead of libsystem_malloc. Picked at 1 MiB so we capture every big
-/// witness/eval/coefficient buffer the prover allocates (the smallest probe-
-/// reported heap allocation in the failing log was 4 MiB), while leaving the
-/// many small/short-lived allocations (HashMap entries, format strings,
-/// tracing buffers) on the system allocator where its tiny-zone fast path is
-/// faster than mmap.
-pub const ARENA_ALLOC_THRESHOLD_BYTES: usize = 1 << 20;
-
-/// Re-entrancy guard for the global allocator. Required because the arena's
-/// own bookkeeping (the `Mutex<ArenaState>` lock + the OnceLock that init
-/// runs `vec![...]` through) inevitably allocates *while* we are inside the
-/// allocator. Without this guard those internal allocations would recurse
-/// straight back into `try_anon_alloc` and either deadlock on the mutex or
-/// loop forever.
-///
-/// The guard uses a `const`-initialised `Cell<bool>` per thread so accessing
-/// it does not allocate.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-mod arena_alloc_reentry {
-    use std::cell::Cell;
-
-    thread_local! {
-        static IN_ALLOCATOR: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub fn enter() -> bool {
-        IN_ALLOCATOR.with(|g| {
-            if g.get() {
-                false
-            } else {
-                g.set(true);
-                true
-            }
-        })
-    }
-
-    pub fn leave() {
-        IN_ALLOCATOR.with(|g| g.set(false));
-    }
-}
-
-/// Global allocator that routes allocations of at least
-/// [`ARENA_ALLOC_THRESHOLD_BYTES`] into the spill arena's anonymous-mapping
-/// path, leaving smaller allocations on the platform's default allocator.
-///
-/// The whole point of the arena is to be the contiguous VA region that holds
-/// the prover's big working set; before this allocator existed, only the
-/// file-backed spill mappings actually used it, while the cairo prover's
-/// per-component witness `BaseColumn::uninitialized` calls (8 MiB chunks)
-/// went through libsystem_malloc and fragmented the per-process iOS user-VA
-/// budget to the point where a fresh 8 MiB malloc would fail with
-/// `largest_user_mb=3.7` and `gaps_ge_16mb=0` even though jetsam had 3 GiB
-/// of headroom left. Routing those allocations through the arena keeps them
-/// contiguous and out of malloc's magazine state.
-///
-/// Activate by adding to the consuming binary's crate root:
-/// ```ignore
-/// #[global_allocator]
-/// static ALLOC: stwo::prover::spill::ArenaSystemAllocator =
-///     stwo::prover::spill::ArenaSystemAllocator;
-/// ```
-pub struct ArenaSystemAllocator;
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-unsafe impl std::alloc::GlobalAlloc for ArenaSystemAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // Fast path: anything smaller than the threshold goes straight to
-        // the system allocator. No re-entry check, no syscall.
-        if layout.size() < ARENA_ALLOC_THRESHOLD_BYTES {
-            return std::alloc::System.alloc(layout);
-        }
-        if !arena_alloc_reentry::enter() {
-            // Re-entry: an arena bookkeeping allocation was triggered from
-            // inside our own alloc/dealloc. Bypass the arena entirely.
-            return std::alloc::System.alloc(layout);
-        }
-        let ptr = mmap_arena::try_anon_alloc(layout.size(), layout.align())
-            .unwrap_or_else(|| std::alloc::System.alloc(layout));
-        arena_alloc_reentry::leave();
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        // Lock-free fast path: ptr is in the arena range iff its address sits
-        // between the snapshot atomics published at arena init.
-        if mmap_arena::is_arena_ptr(ptr) {
-            if !arena_alloc_reentry::enter() {
-                // Re-entry inside our own dealloc; the arena release path
-                // would deadlock. Leak the range -- the alternative is UB.
-                eprintln!(
-                    "ARENA_ALLOC reentrant_dealloc ptr={ptr:p} size={} -- leaking",
-                    layout.size()
-                );
-                return;
-            }
-            mmap_arena::anon_dealloc(ptr, layout.size(), layout.align());
-            arena_alloc_reentry::leave();
-        } else {
-            std::alloc::System.dealloc(ptr, layout);
-        }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // Arena-backed allocations come from a fresh anonymous mmap, which is
-        // already zero-filled by the kernel. So if we successfully route
-        // through the arena we can skip the zero-fill the default impl does.
-        if layout.size() < ARENA_ALLOC_THRESHOLD_BYTES {
-            return std::alloc::System.alloc_zeroed(layout);
-        }
-        let ptr = self.alloc(layout);
-        if !ptr.is_null() && !mmap_arena::is_arena_ptr(ptr) {
-            // System fallback path -- caller expects zero-fill.
-            std::ptr::write_bytes(ptr, 0, layout.size());
-        }
-        ptr
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
-unsafe impl std::alloc::GlobalAlloc for ArenaSystemAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        std::alloc::System.alloc(layout)
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        std::alloc::System.dealloc(ptr, layout);
-    }
-}
-
 /// Snapshot task-level VM accounting and the largest contiguous free VA gap.
 ///
 /// This is meant to distinguish allocator/phys_footprint retention (shows up as elevated
@@ -594,43 +432,23 @@ mod mmap_arena {
         }
 
         fn release(&mut self, offset: usize, alloc_len: usize) {
-            // In-place sorted insert + merge with adjacent ranges. The previous
-            // implementation built a fresh `Vec::with_capacity(...)` to hold the
-            // merged list, which allocates -- and now that the global allocator
-            // can route through this same arena, that allocation would recurse
-            // back into the arena while we already hold its mutex. Doing the
-            // merge in place keeps `release` allocation-free as long as the
-            // arena's `free_ranges` Vec was pre-grown to enough capacity at
-            // init (see `init_arena`).
-            let pos = self
-                .free_ranges
-                .binary_search_by_key(&offset, |range| range.offset)
-                .unwrap_or_else(|p| p);
-            self.free_ranges.insert(
-                pos,
-                FreeRange {
-                    offset,
-                    len: alloc_len,
-                },
-            );
-            // Merge forward with the next range if contiguous.
-            if pos + 1 < self.free_ranges.len() {
-                let next = self.free_ranges[pos + 1];
-                let curr = &mut self.free_ranges[pos];
-                if curr.offset + curr.len == next.offset {
-                    curr.len += next.len;
-                    self.free_ranges.remove(pos + 1);
+            self.free_ranges.push(FreeRange {
+                offset,
+                len: alloc_len,
+            });
+            self.free_ranges.sort_by_key(|range| range.offset);
+
+            let mut merged: Vec<FreeRange> = Vec::with_capacity(self.free_ranges.len());
+            for range in self.free_ranges.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if last.offset + last.len == range.offset {
+                        last.len += range.len;
+                        continue;
+                    }
                 }
+                merged.push(range);
             }
-            // Merge backward with the previous range if contiguous.
-            if pos > 0 {
-                let curr = self.free_ranges[pos];
-                let prev = &mut self.free_ranges[pos - 1];
-                if prev.offset + prev.len == curr.offset {
-                    prev.len += curr.len;
-                    self.free_ranges.remove(pos);
-                }
-            }
+            self.free_ranges = merged;
         }
     }
 
@@ -714,142 +532,9 @@ mod mmap_arena {
         }
     }
 
-    /// Reserves `byte_len` bytes inside the arena and overlays them with an
-    /// anonymous read+write mapping. Used by the global allocator to route
-    /// large heap allocations into the arena instead of letting libsystem_malloc
-    /// fragment the user VA budget.
-    ///
-    /// Returns the user-visible pointer or `None` if the arena is uninitialised
-    /// or has no contiguous range large enough. The caller must eventually call
-    /// [`anon_dealloc`] with the same `byte_len` and `align` to release the
-    /// reservation; passing different values is undefined behavior.
-    ///
-    /// `align` must be `<= page_size` -- enforced because mmap only ever returns
-    /// page-aligned addresses, so over-aligned allocations would need
-    /// over-reservation logic that the global allocator's hot path doesn't need
-    /// today (max alignment in practice is 64-byte for `PackedM31`).
-    pub fn try_anon_alloc(byte_len: usize, align: usize) -> Option<*mut u8> {
-        if byte_len == 0 {
-            return None;
-        }
-        let arena = arena_state()?;
-        // Snapshot page_size without holding the lock across `mmap`.
-        let alloc_len;
-        let offset;
-        let addr;
-        {
-            let mut state = arena.lock().expect("mmap arena mutex poisoned");
-            if align > state.page_size {
-                return None;
-            }
-            let lease = state.reserve(byte_len)?;
-            // We're consuming the offset/len directly; suppress the lease's
-            // Drop so it doesn't release the range we just claimed.
-            offset = lease.offset;
-            alloc_len = lease.alloc_len;
-            std::mem::forget(lease);
-            addr = (state.base_addr + offset) as *mut libc::c_void;
-        }
-        let ptr = unsafe {
-            libc::mmap(
-                addr,
-                alloc_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            // Allocation site failed -- give the range back so the next caller
-            // can retry it.
-            let mut state = arena.lock().expect("mmap arena mutex poisoned");
-            state.release(offset, alloc_len);
-            return None;
-        }
-        Some(ptr as *mut u8)
-    }
-
-    /// Releases an anonymous arena allocation previously returned by
-    /// [`try_anon_alloc`]. Remaps the range back to `PROT_NONE` (returning
-    /// physical pages to the kernel) and returns the VA range to the arena's
-    /// free list.
-    ///
-    /// `byte_len` and `align` MUST match the values originally passed to
-    /// [`try_anon_alloc`] -- the global allocator gets these from the
-    /// `Layout` argument to `dealloc`.
-    pub fn anon_dealloc(ptr: *mut u8, byte_len: usize, _align: usize) {
-        if ptr.is_null() || byte_len == 0 {
-            return;
-        }
-        let Some(arena) = arena_state() else {
-            return;
-        };
-        let (offset, alloc_len, base_addr) = {
-            let state = arena.lock().expect("mmap arena mutex poisoned");
-            let base = state.base_addr;
-            let off = (ptr as usize).wrapping_sub(base);
-            let len = align_up(byte_len, state.page_size);
-            (off, len, base)
-        };
-        let _ = base_addr; // shut up unused-binding lint when assertions are off
-        let restore = unsafe {
-            libc::mmap(
-                ptr as *mut libc::c_void,
-                alloc_len,
-                libc::PROT_NONE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if restore == libc::MAP_FAILED {
-            eprintln!(
-                "MMAP_ARENA anon_dealloc restore_failed offset={offset} bytes={alloc_len} err={}",
-                std::io::Error::last_os_error()
-            );
-            // Even if the restore failed, return the VA to the free list so
-            // the arena bookkeeping stays consistent. Subsequent reservers may
-            // fail to overlay the range, which is the safe failure mode.
-        }
-        let mut state = arena.lock().expect("mmap arena mutex poisoned");
-        state.release(offset, alloc_len);
-    }
-
-    /// Returns true if `ptr` falls inside the arena's reserved VA range.
-    /// Used by the global allocator's `dealloc` to dispatch between the
-    /// arena release path and the system free path.
-    ///
-    /// Reads from a pair of `AtomicUsize` snapshots populated once at arena
-    /// init, so this is a lock-free fast path -- critical because every
-    /// `dealloc` (most of which are for non-arena heap pointers) goes
-    /// through it.
-    pub fn is_arena_ptr(ptr: *mut u8) -> bool {
-        let base = ARENA_BASE.load(std::sync::atomic::Ordering::Acquire);
-        if base == 0 {
-            return false;
-        }
-        let end = ARENA_END.load(std::sync::atomic::Ordering::Acquire);
-        let addr = ptr as usize;
-        addr >= base && addr < end
-    }
-
-    static ARENA_LOCK: OnceLock<Option<Mutex<ArenaState>>> = OnceLock::new();
-
-    /// Snapshot of the arena's base address, set once when `init_arena`
-    /// completes. Zero means uninitialised.
-    static ARENA_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    /// Snapshot of `base + total_len`, set once when `init_arena` completes.
-    /// Used together with `ARENA_BASE` for the lock-free `is_arena_ptr`
-    /// fast path.
-    static ARENA_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
     fn arena_state() -> Option<&'static Mutex<ArenaState>> {
-        // Shared with the lock-free `is_arena_ptr` snapshot atomics so the
-        // allocator's dealloc path can dispatch without triggering init from
-        // a non-arena pointer.
-        ARENA_LOCK.get_or_init(init_arena).as_ref()
+        static ARENA: OnceLock<Option<Mutex<ArenaState>>> = OnceLock::new();
+        ARENA.get_or_init(init_arena).as_ref()
     }
 
     fn arena_addr(offset: usize) -> *mut libc::c_void {
@@ -895,37 +580,18 @@ mod mmap_arena {
             return None;
         }
 
-        // Pre-grow `free_ranges` to enough capacity that subsequent
-        // reserve/release calls never need to reallocate the Vec. With the
-        // global allocator routing through this same arena, growing the Vec
-        // would call back into the allocator while we already hold the arena
-        // mutex (deadlock + recursion). 8192 entries is well above the
-        // worst-case fragmentation we expect (5 GiB arena / ~1 MiB minimum
-        // route-through-arena allocation = ~5120 max simultaneously-alive
-        // ranges).
-        const FREE_RANGES_CAPACITY: usize = 8192;
-        let mut free_ranges = Vec::with_capacity(FREE_RANGES_CAPACITY);
-        free_ranges.push(FreeRange {
-            offset: 0,
-            len: total_len,
-        });
-        // Publish the arena's address range for the lock-free `is_arena_ptr`
-        // fast path used by the global allocator's dealloc dispatch.
-        ARENA_BASE.store(ptr as usize, std::sync::atomic::Ordering::Release);
-        ARENA_END.store(
-            ptr as usize + total_len,
-            std::sync::atomic::Ordering::Release,
-        );
         eprintln!(
-            "MMAP_ARENA reserved base={ptr:p} size_mb={} page_kb={} free_ranges_cap={}",
+            "MMAP_ARENA reserved base={ptr:p} size_mb={} page_kb={}",
             total_len / (1024 * 1024),
-            page_size / 1024,
-            FREE_RANGES_CAPACITY
+            page_size / 1024
         );
         Some(Mutex::new(ArenaState {
             base_addr: ptr as usize,
             page_size,
-            free_ranges,
+            free_ranges: vec![FreeRange {
+                offset: 0,
+                len: total_len,
+            }],
         }))
     }
 
@@ -1703,65 +1369,4 @@ mod tests {
         assert_eq!(frozen.len(), 0);
     }
 
-    /// Smoke-test the arena's anonymous-allocation path that the global
-    /// allocator relies on. Has to live behind cfg(macos|ios) because the
-    /// arena module itself is gated that way; on other platforms the
-    /// allocator just falls through to System and there's nothing to test.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn test_arena_anon_alloc_dealloc() {
-        // 2 MiB so we're above ARENA_ALLOC_THRESHOLD_BYTES and the arena
-        // actually takes ownership; smaller would be a no-op test.
-        let size = 2 << 20;
-        let align = 64;
-        let ptr =
-            super::mmap_arena::try_anon_alloc(size, align).expect("arena anon alloc returned None");
-        assert!(super::mmap_arena::is_arena_ptr(ptr));
-        // Writing into the mapping verifies it's PROT_READ|PROT_WRITE backed.
-        unsafe {
-            std::ptr::write_bytes(ptr, 0xab, size);
-        }
-        let probe = unsafe { *ptr.add(size / 2) };
-        assert_eq!(probe, 0xab);
-        super::mmap_arena::anon_dealloc(ptr, size, align);
-    }
-
-    /// End-to-end test of the GlobalAlloc impl. Calls alloc/dealloc directly
-    /// on an instance (not via the global slot) so we don't have to take over
-    /// the test binary's allocator. Validates: above-threshold allocations
-    /// land in the arena, below-threshold ones land in System, and dealloc
-    /// dispatches correctly via `is_arena_ptr`.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn test_arena_system_allocator_above_and_below_threshold() {
-        use std::alloc::{GlobalAlloc, Layout};
-        let alloc = ArenaSystemAllocator;
-
-        // Above threshold -- expected to be arena-backed.
-        let big = Layout::from_size_align(2 << 20, 64).unwrap();
-        let big_ptr = unsafe { alloc.alloc(big) };
-        assert!(!big_ptr.is_null(), "big alloc returned null");
-        assert!(
-            mmap_arena::is_arena_ptr(big_ptr),
-            "big alloc should be arena-backed"
-        );
-        unsafe {
-            std::ptr::write_bytes(big_ptr, 0x42, big.size());
-            assert_eq!(*big_ptr, 0x42);
-            alloc.dealloc(big_ptr, big);
-        }
-
-        // Below threshold -- expected to go straight to System.
-        let small = Layout::from_size_align(1024, 8).unwrap();
-        let small_ptr = unsafe { alloc.alloc(small) };
-        assert!(!small_ptr.is_null());
-        assert!(
-            !mmap_arena::is_arena_ptr(small_ptr),
-            "small alloc should NOT be arena-backed"
-        );
-        unsafe {
-            std::ptr::write_bytes(small_ptr, 0x37, small.size());
-            alloc.dealloc(small_ptr, small);
-        }
-    }
 }

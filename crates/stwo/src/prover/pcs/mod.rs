@@ -851,15 +851,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         &mut self,
         columns: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     ) -> TreeSubspan {
-        // Periodic VM_WALK + malloc pressure relief during base-trace generation.
-        // The cairo prover calls extend_evals dozens of times in a row, which on
-        // iOS fragments libsystem_malloc's user VA range badly enough that a
-        // fresh 8 MiB allocation can fail with `largest_user_mb=3.7` while
-        // phys_footprint is still ~1.5 GiB (well below the jetsam ceiling).
-        // The pressure_relief call coalesces malloc's empty magazines and
-        // returns their VA back to the kernel; the VM_WALK lets us see whether
-        // it actually opened up new gaps. Stride is hand-tuned to keep log
-        // volume modest while running often enough to defragment in time.
+        // Periodic VM_WALK during base-trace generation so we can see the
+        // phys_footprint / largest_user_mb trajectory as the cairo prover
+        // cycles through components. Stride keeps log volume modest while
+        // still catching the ramp-up clearly.
         const VM_WALK_STRIDE: usize = 5;
         let call_idx = EXTEND_EVALS_CALLS.fetch_add(1, Ordering::Relaxed);
         if call_idx % VM_WALK_STRIDE == 0 {
@@ -869,7 +864,6 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
                 self.tree_index,
                 self.polys.len()
             );
-            crate::prover::spill::malloc_pressure_relief(&label);
             crate::prover::spill::log_vm_walk(&label);
         }
         let span = span!(Level::INFO, "Interpolation for commitment").entered();
@@ -900,10 +894,6 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
     pub fn commit(self, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         phase_memory_checkpoint("pcs:tree_builder:commit");
-        // The base-trace extend_evals loop is over; release any malloc
-        // magazines it left fragmented before the big extension FFT and
-        // Merkle build kick in.
-        crate::prover::spill::malloc_pressure_relief("tree_builder:commit");
         crate::prover::spill::log_vm_walk("tree_builder:commit");
         self.commitment_scheme.commit(self.polys, channel);
     }
