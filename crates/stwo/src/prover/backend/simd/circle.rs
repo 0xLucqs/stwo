@@ -139,15 +139,23 @@ impl SimdBackend {
 /// in-memory evaluation columns to file-backed mmap when running in
 /// [`ProverMemoryMode::LowMemory`].
 ///
-/// Smaller values reduce peak resident memory at the cost of more frequent spill-to-disk
-/// operations. The default is conservative for memory-constrained targets (e.g. mobile phones):
-/// at 1 MiB, the prover effectively spills after every polynomial, so the in-flight heap
-/// footprint stays bounded by the size of the largest single column plus the FFT working set.
+/// Sized to match the arena's file-backed-mmap minimum
+/// ([`crate::prover::spill::DEFAULT_ARENA_FILE_BACKED_MIN_MB`], 128 MiB). Smaller batches
+/// would produce sub-128 MiB spill files that bypass the arena and go straight to
+/// `libc::mmap`, which on iOS fragments the user-VA budget catastrophically -- a single
+/// proof was observed to emit 592 small spill mmaps, create 1654 task_regions, and then
+/// abort with `largest_user_mb=1.7`, `gaps_ge_16mb=0` on a fresh 2 MiB allocation.
 ///
-/// Workstations and CI runners that prefer fewer spill round-trips should override via the
-/// `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` environment variable (e.g. `268435456` for the
-/// historical 256 MiB value).
-const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 1 << 20;
+/// At 128 MiB, each `spill_eval_columns` call produces one file ≥ the arena threshold, so
+/// the spill lands contiguously inside the arena. In-flight heap peak during batching grows
+/// from ~1 MiB to ~128 MiB, but (a) we have headroom for it (iPhone peak was 2 GiB resident
+/// at the abort, with plenty of physical RAM left), and (b) large allocations on iOS bypass
+/// libsystem_malloc's VA-retaining magazine path and are released cleanly to the kernel,
+/// so the larger transient is actually *less* malloc pressure than hundreds of tiny allocs.
+///
+/// Override via `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` (e.g. `1048576` to restore the
+/// historical 1 MiB value for regression comparison).
+const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 128 << 20;
 
 /// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`].
 const LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV: &str = "STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES";
