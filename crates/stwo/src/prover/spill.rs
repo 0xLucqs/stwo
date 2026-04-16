@@ -547,14 +547,22 @@ mod mmap_arena {
 
     /// Reserved VA size for the spill-mapping arena, in MiB.
     ///
-    /// Sized to hold the WHOLE working set the prover runs through — both
-    /// file-backed spill mappings (existing) and large anonymous heap
-    /// allocations routed via [`super::ArenaSystemAllocator`] (new). The
-    /// 4 GiB-arena run hit the spill peak around 4 GiB during late proving;
-    /// 5 GiB leaves headroom for the additional anonymous traffic the global
-    /// allocator now redirects in. Override at runtime via
-    /// `STWO_MMAP_ARENA_MB`.
-    const DEFAULT_ARENA_MB: usize = 5120;
+    /// Sizing history:
+    /// * 4096 → late proving hit spill peak ~4 GiB, the 256 MiB contiguous
+    ///   Merkle mmap had no home, arena exhausted.
+    /// * 5120 → solved that specific failure, but combined with libsystem_malloc's
+    ///   ~6 GiB of retained VA it blows the per-process iOS user-VA budget
+    ///   (~13.6 GiB on a 4 GiB iPhone). Proof 1 aborts on a plain 8 MiB heap
+    ///   allocation with `largest_user_mb=3.7` and `gaps_ge_16mb=0` while
+    ///   jetsam still has 3 GiB of physical headroom.
+    /// * 1024 → current: matches what we actually observe active inside the
+    ///   arena during base trace (155 MiB) with ~6× headroom for growth, and
+    ///   gives 4 GiB of VA back to libsystem_malloc so its magazine churn
+    ///   has room to keep finding contiguous holes for new heap allocations.
+    ///   If late proving then fails on a clean `mmap_failed` inside the arena
+    ///   (i.e. arena genuinely too small for concurrent spill peak), bump
+    ///   size up by the observed shortfall via `STWO_MMAP_ARENA_MB`.
+    const DEFAULT_ARENA_MB: usize = 1024;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
