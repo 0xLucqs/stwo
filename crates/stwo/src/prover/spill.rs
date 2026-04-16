@@ -416,7 +416,23 @@ mod mmap_arena {
 
     use super::NamedTempFile;
 
-    const DEFAULT_ARENA_MB: usize = 5120;
+    /// Reserved VA size for the spill-mapping arena, in MiB.
+    ///
+    /// History:
+    /// * 4096 → too small for late proving on iPhone, mmap_failed at ~4 GiB
+    ///   spill usage with 0 contiguous arena gaps left.
+    /// * 5120 → solved late proving but exhausted the per-process iOS user-VA
+    ///   budget (~13.6 GiB on a 4 GiB iPhone) when combined with libsystem_malloc's
+    ///   ~8 GiB of cached/sparse magazines from the cairo prover. Base trace then
+    ///   aborts on a plain 8 MiB heap allocation with `largest_user_mb=3.8`,
+    ///   `gaps_ge_16mb=0`, `phys_footprint=1494 MB` (3 GiB jetsam headroom unused).
+    /// * 2048 → frees ~3 GiB of VA back to malloc so the cairo prover's small-
+    ///   chunk magazine growth has room to coalesce. The arena was only 3% full
+    ///   (155 MiB active) at the failure point, so this is well above current
+    ///   peak; if a later proving phase actually needs >2 GiB of arena we'll
+    ///   see a clean `mmap_failed` and bump the size back up. Override at
+    ///   runtime via `STWO_MMAP_ARENA_MB`.
+    const DEFAULT_ARENA_MB: usize = 2048;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
