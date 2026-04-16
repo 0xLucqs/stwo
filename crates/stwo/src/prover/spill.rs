@@ -25,6 +25,17 @@ use tempfile::NamedTempFile;
 static ACTIVE_MMAPS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_MMAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes currently reserved in the arena free-list (i.e. not available for
+/// a new `reserve` call). Updated atomically inside `ArenaState::reserve`
+/// and `ArenaState::release` so the per-op ARENA_ALLOC/ARENA_DEALLOC logs
+/// can report utilisation without having to take the arena lock just to
+/// read it.
+static ARENA_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Total bytes the arena reserved at init time. Published once from
+/// `init_arena` and then read-only.
+static ARENA_TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// Log and return the current mmap stats.
 pub fn log_mmap_stats(label: &str) {
     let count = ACTIVE_MMAPS.load(Ordering::Relaxed);
@@ -416,6 +427,19 @@ mod mmap_arena {
     }
 
     impl ArenaState {
+        /// Sum of `len` across the free list. Cheap because `free_ranges` has
+        /// tens of entries at worst.
+        fn total_free_bytes(&self) -> usize {
+            self.free_ranges.iter().map(|r| r.len).sum()
+        }
+
+        /// Largest contiguous free range in the arena. Useful for diagnosing
+        /// "reserve failed because no hole is big enough" vs "arena genuinely
+        /// out of bytes".
+        fn largest_free_bytes(&self) -> usize {
+            self.free_ranges.iter().map(|r| r.len).max().unwrap_or(0)
+        }
+
         fn reserve(&mut self, requested_len: usize) -> Option<ArenaLease> {
             let alloc_len = align_up(requested_len, self.page_size);
             let idx = self
@@ -428,6 +452,7 @@ mod mmap_arena {
             if self.free_ranges[idx].len == 0 {
                 self.free_ranges.remove(idx);
             }
+            super::ARENA_USED_BYTES.fetch_add(alloc_len, super::Ordering::Relaxed);
             Some(ArenaLease { offset, alloc_len })
         }
 
@@ -449,6 +474,7 @@ mod mmap_arena {
                 merged.push(range);
             }
             self.free_ranges = merged;
+            super::ARENA_USED_BYTES.fetch_sub(alloc_len, super::Ordering::Relaxed);
         }
     }
 
@@ -469,11 +495,30 @@ mod mmap_arena {
             return Ok(None);
         };
 
-        let lease = {
+        let (lease, used_after_reserve, largest_free) = {
             let mut state = arena.lock().expect("mmap arena mutex poisoned");
             match state.reserve(byte_len) {
-                Some(lease) => lease,
-                None => return Ok(None),
+                Some(lease) => {
+                    let used = super::ARENA_USED_BYTES.load(super::Ordering::Relaxed);
+                    let largest = state.largest_free_bytes();
+                    (lease, used, largest)
+                }
+                None => {
+                    // Reserve failed -- log what we had to offer so the next
+                    // iteration knows whether to bump arena size or whether
+                    // internal fragmentation (no big-enough single hole) is
+                    // the real cause.
+                    let used = super::ARENA_USED_BYTES.load(super::Ordering::Relaxed);
+                    let total = super::ARENA_TOTAL_BYTES.load(super::Ordering::Relaxed);
+                    let total_free = state.total_free_bytes();
+                    let largest = state.largest_free_bytes();
+                    let n_ranges = state.free_ranges.len();
+                    eprintln!(
+                        "ARENA_RESERVE_FAIL size={byte_len} used={used} total={total} \
+                         total_free={total_free} largest_free={largest} free_ranges={n_ranges}"
+                    );
+                    return Ok(None);
+                }
             }
         };
 
@@ -491,6 +536,10 @@ mod mmap_arena {
 
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
+            eprintln!(
+                "ARENA_MAP_FAIL offset={} alloc_len={} size={} prot={} err={err}",
+                lease.offset, lease.alloc_len, byte_len, prot
+            );
             if let Some(arena) = arena_state() {
                 let mut state = arena.lock().expect("mmap arena mutex poisoned");
                 state.release(lease.offset, lease.alloc_len);
@@ -498,6 +547,11 @@ mod mmap_arena {
             return Err(err);
         }
 
+        let total = super::ARENA_TOTAL_BYTES.load(super::Ordering::Relaxed);
+        eprintln!(
+            "ARENA_ALLOC offset={} alloc_len={} size={} used={}/{} largest_free_after={}",
+            lease.offset, lease.alloc_len, byte_len, used_after_reserve, total, largest_free
+        );
         Ok(Some((ptr, lease)))
     }
 
@@ -529,6 +583,12 @@ mod mmap_arena {
 
             let mut state = arena.lock().expect("mmap arena mutex poisoned");
             state.release(self.offset, self.alloc_len);
+            let used = super::ARENA_USED_BYTES.load(super::Ordering::Relaxed);
+            let total = super::ARENA_TOTAL_BYTES.load(super::Ordering::Relaxed);
+            eprintln!(
+                "ARENA_DEALLOC offset={} alloc_len={} used={}/{}",
+                self.offset, self.alloc_len, used, total
+            );
         }
     }
 
@@ -580,6 +640,10 @@ mod mmap_arena {
             return None;
         }
 
+        // Publish the arena's total capacity so ARENA_ALLOC/DEALLOC logs can
+        // report `used/total` utilisation without having to call `state.lock()`
+        // every time just to read `total_len`.
+        super::ARENA_TOTAL_BYTES.store(total_len, super::Ordering::Release);
         eprintln!(
             "MMAP_ARENA reserved base={ptr:p} size_mb={} page_kb={}",
             total_len / (1024 * 1024),
