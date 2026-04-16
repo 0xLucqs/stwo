@@ -338,7 +338,7 @@ mod mmap_arena {
 
     use super::NamedTempFile;
 
-    const DEFAULT_ARENA_MB: usize = 4096;
+    const DEFAULT_ARENA_MB: usize = 5120;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
