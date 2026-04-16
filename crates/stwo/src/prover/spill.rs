@@ -406,13 +406,18 @@ mod mmap_arena {
     ///   jetsam still has 3 GiB of physical headroom.
     /// * 1024 → with threshold=32 MiB the arena was 99.4% full all the time
     ///   and forced 57 RESERVE_FAIL overflows per proof.
-    /// * 2048 → current. Paired with threshold=128 MiB so only the ~19 large
-    ///   allocations per proof (256 MiB state layers, 128+ MiB hash layers,
-    ///   400-500 MiB coefficient spills) need to fit. 2 GiB is a comfortable
-    ///   envelope for that set without eating so much of the iOS user-VA
-    ///   budget that libsystem_malloc runs out of room for its own heap
-    ///   magazines. Override at runtime via `STWO_MMAP_ARENA_MB`.
-    const DEFAULT_ARENA_MB: usize = 2048;
+    /// * 2048 → paired with threshold=128 MiB, still 98.5% full at peak and
+    ///   forced 13 RESERVE_FAILs on 128-148 MiB hash-layer / spill chunks
+    ///   that arrived while 4 coefficient spills + 2-3 state layers were
+    ///   already alive.
+    /// * 4096 → current. Simulator run (threshold=128) showed concurrent
+    ///   peak of 2.85-3.3 GiB across ~51 big allocations per proof
+    ///   (coefficient spills 391-470 MiB, state layers 256 MiB × 8,
+    ///   hash layers / big chunks 128-148 MiB). 4 GiB fits that peak with
+    ///   ~25% headroom for worst-case device timing differences, while
+    ///   still leaving ~8 GiB of iOS user-VA budget for libsystem_malloc
+    ///   and system frameworks. Override at runtime via `STWO_MMAP_ARENA_MB`.
+    const DEFAULT_ARENA_MB: usize = 4096;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
     #[derive(Clone, Copy, Debug)]
