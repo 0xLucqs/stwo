@@ -36,6 +36,177 @@ pub fn log_mmap_stats(label: &str) {
     );
 }
 
+/// Snapshot task-level VM accounting and the largest contiguous free VA gap.
+///
+/// This is meant to distinguish allocator/phys_footprint retention (shows up as elevated
+/// `internal`/`phys_footprint` across proofs) from VA fragmentation (shows up as
+/// `largest_free_gap_mb` shrinking below the request size while phys_footprint is fine).
+///
+/// Emits a single grep-friendly line prefixed with `VM_WALK [label]`.
+/// No-op on non-Darwin.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn log_vm_walk(label: &str) {
+    vm_walk_impl::log_vm_walk(label);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn log_vm_walk(_label: &str) {}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod vm_walk_impl {
+    use std::ffi::c_int;
+    use std::time::Instant;
+
+    type MachPortT = u32;
+    type KernReturnT = c_int;
+    type IntegerT = i32;
+    type NaturalT = u32;
+    type MachMsgTypeNumberT = NaturalT;
+    type MachVmAddressT = u64;
+    type MachVmSizeT = u64;
+
+    const KERN_SUCCESS: KernReturnT = 0;
+    const TASK_VM_INFO: c_int = 22;
+    // REV1: through `max_address`; stable since iOS 10 / macOS 10.12.
+    // 20 u64 + 2 i32 + 2 u64 = 168 bytes = 42 natural_t.
+    const TASK_VM_INFO_REV1_COUNT: MachMsgTypeNumberT = 42;
+    // sizeof(vm_region_submap_info_data_64_t) / sizeof(natural_t) = 19 on current SDKs.
+    const VM_REGION_SUBMAP_INFO_COUNT_64: MachMsgTypeNumberT = 19;
+
+    #[repr(C)]
+    #[derive(Default, Copy, Clone)]
+    struct TaskVmInfoRev1 {
+        virtual_size: MachVmSizeT,
+        region_count: IntegerT,
+        page_size: IntegerT,
+        resident_size: MachVmSizeT,
+        resident_size_peak: MachVmSizeT,
+        device: MachVmSizeT,
+        device_peak: MachVmSizeT,
+        internal: MachVmSizeT,
+        internal_peak: MachVmSizeT,
+        external: MachVmSizeT,
+        external_peak: MachVmSizeT,
+        reusable: MachVmSizeT,
+        reusable_peak: MachVmSizeT,
+        purgeable_volatile_pmap: MachVmSizeT,
+        purgeable_volatile_resident: MachVmSizeT,
+        purgeable_volatile_virtual: MachVmSizeT,
+        compressed: MachVmSizeT,
+        compressed_peak: MachVmSizeT,
+        compressed_lifetime: MachVmSizeT,
+        phys_footprint: MachVmSizeT,
+        min_address: MachVmAddressT,
+        max_address: MachVmAddressT,
+    }
+
+    extern "C" {
+        fn mach_task_self() -> MachPortT;
+        fn task_info(
+            target_task: MachPortT,
+            flavor: c_int,
+            info: *mut IntegerT,
+            count: *mut MachMsgTypeNumberT,
+        ) -> KernReturnT;
+        fn mach_vm_region_recurse(
+            target_task: MachPortT,
+            address: *mut MachVmAddressT,
+            size: *mut MachVmSizeT,
+            nesting_depth: *mut NaturalT,
+            info: *mut IntegerT,
+            info_count: *mut MachMsgTypeNumberT,
+        ) -> KernReturnT;
+    }
+
+    pub fn log_vm_walk(label: &str) {
+        const MB: f64 = 1024.0 * 1024.0;
+        // Hard caps so the probe never dominates proving time.
+        const MAX_REGIONS: u64 = 50_000;
+        const WALK_DEADLINE_MS: u128 = 500;
+
+        let task = unsafe { mach_task_self() };
+
+        let mut info = TaskVmInfoRev1::default();
+        let mut count = TASK_VM_INFO_REV1_COUNT;
+        let kr = unsafe {
+            task_info(
+                task,
+                TASK_VM_INFO,
+                (&mut info as *mut TaskVmInfoRev1).cast::<IntegerT>(),
+                &mut count,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            eprintln!("VM_WALK [{label}] task_info_failed kr={kr}");
+            return;
+        }
+
+        let started = Instant::now();
+        let mut addr: MachVmAddressT = 0;
+        let mut prev_end: MachVmAddressT = 0;
+        let mut walked: u64 = 0;
+        let mut gaps: u64 = 0;
+        let mut largest_gap: u64 = 0;
+        let mut total_free: u64 = 0;
+
+        loop {
+            if walked >= MAX_REGIONS || started.elapsed().as_millis() > WALK_DEADLINE_MS {
+                break;
+            }
+            let mut size: MachVmSizeT = 0;
+            let mut depth: NaturalT = 1;
+            let mut sub_info = [0 as IntegerT; 32];
+            let mut sub_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+            let kr = unsafe {
+                mach_vm_region_recurse(
+                    task,
+                    &mut addr,
+                    &mut size,
+                    &mut depth,
+                    sub_info.as_mut_ptr(),
+                    &mut sub_count,
+                )
+            };
+            if kr != KERN_SUCCESS {
+                // KERN_INVALID_ADDRESS (1) signals end-of-map; anything else is a real error.
+                break;
+            }
+            if addr > prev_end {
+                let gap = addr - prev_end;
+                gaps += 1;
+                total_free += gap;
+                if gap > largest_gap {
+                    largest_gap = gap;
+                }
+            }
+            walked += 1;
+            prev_end = addr.saturating_add(size);
+            addr = prev_end;
+        }
+
+        eprintln!(
+            "VM_WALK [{label}] virt={:.1} MB resident={:.1} MB phys={:.1} MB \
+             internal={:.1} MB external={:.1} MB reusable={:.1} MB \
+             task_regions={} min=0x{:x} max=0x{:x} \
+             walked={} gaps={} largest_gap={:.1} MB total_free={:.1} MB walk_ms={}",
+            info.virtual_size as f64 / MB,
+            info.resident_size as f64 / MB,
+            info.phys_footprint as f64 / MB,
+            info.internal as f64 / MB,
+            info.external as f64 / MB,
+            info.reusable as f64 / MB,
+            info.region_count,
+            info.min_address,
+            info.max_address,
+            walked,
+            gaps,
+            largest_gap as f64 / MB,
+            total_free as f64 / MB,
+            started.elapsed().as_millis(),
+        );
+    }
+}
+
 fn track_mmap(bytes: usize) {
     ACTIVE_MMAPS.fetch_add(1, Ordering::Relaxed);
     ACTIVE_MMAP_BYTES.fetch_add(bytes, Ordering::Relaxed);

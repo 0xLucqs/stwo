@@ -26,7 +26,7 @@ use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::m31::{reduce_to_m31_simd, PackedBaseField, N_LANES};
 use crate::prover::backend::simd::utils::transpose_packed_leaf;
 use crate::prover::backend::{Col, Column, CpuBackend};
-use crate::prover::spill::{mmap_blake2s_hash_layer, HashLayerMmapGuard, MmapVec};
+use crate::prover::spill::{log_vm_walk, mmap_blake2s_hash_layer, HashLayerMmapGuard, MmapVec};
 use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 
 const N_FELTS_IN_BLAKE_MESSAGE: usize = 16;
@@ -101,6 +101,7 @@ fn allocate_state_layer(
                     line!(),
                     allocation_label,
                 );
+                log_vm_walk("allocate_state_layer:mmap_failed");
             }
         }
     }
@@ -148,6 +149,7 @@ fn allocate_hash_layer(
                     "ALLOC probe {}:{} fn=allocate_hash_layer mmap_failed: {e}",
                     file!(), line!(),
                 );
+                log_vm_walk("allocate_hash_layer:mmap_failed");
             }
         }
     }
