@@ -174,14 +174,44 @@ impl<B: Backend> Poly<B> {
         }
         if let Some(coeffs) = &self.coeffs {
             let buffer = base_column_pool.take_or_alloc(self.log_size());
-            B::evaluate_into(coeffs, self.eval_domain, twiddles, buffer)
+            self.materialize_evaluation_into_buffer(twiddles, buffer, coeffs)
         } else if let Some(spilled) = &self.spilled_coeffs {
             let coeffs = Self::load_spilled_coefficients(spilled);
             let buffer = base_column_pool.take_or_alloc(self.log_size());
-            B::evaluate_into(&coeffs, self.eval_domain, twiddles, buffer)
+            self.materialize_evaluation_into_buffer(twiddles, buffer, &coeffs)
         } else {
             panic!("low-memory polynomial recomputation requires retained coefficients");
         }
+    }
+
+    pub fn materialize_evaluation_with_buffer(
+        &self,
+        twiddles: &TwiddleTree<B>,
+        buffer: Col<B, BaseField>,
+    ) -> CircleEvaluation<B, BaseField, BitReversedOrder>
+    where
+        B: PolyOps + ColumnOps<BaseField>,
+    {
+        if let Some(coeffs) = &self.coeffs {
+            self.materialize_evaluation_into_buffer(twiddles, buffer, coeffs)
+        } else if let Some(spilled) = &self.spilled_coeffs {
+            let coeffs = Self::load_spilled_coefficients(spilled);
+            self.materialize_evaluation_into_buffer(twiddles, buffer, &coeffs)
+        } else {
+            panic!("low-memory polynomial recomputation requires retained coefficients");
+        }
+    }
+
+    fn materialize_evaluation_into_buffer(
+        &self,
+        twiddles: &TwiddleTree<B>,
+        buffer: Col<B, BaseField>,
+        coeffs: &CircleCoefficients<B>,
+    ) -> CircleEvaluation<B, BaseField, BitReversedOrder>
+    where
+        B: PolyOps + ColumnOps<BaseField>,
+    {
+        B::evaluate_into(coeffs, self.eval_domain, twiddles, buffer)
     }
 
     /// Loads coefficient data from the spill file into a fresh in-memory `CircleCoefficients`.

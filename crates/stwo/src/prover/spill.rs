@@ -1360,6 +1360,12 @@ unsafe impl<T: Pod> Sync for MmapVec<T> {}
 
 impl<T: Pod> MmapVec<T> {
     #[cfg(unix)]
+    fn into_mapping(self) -> Option<FileBackedMapping> {
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe { std::ptr::read(&this._mapping) }
+    }
+
+    #[cfg(unix)]
     fn uninitialized_with_reservation(
         len: usize,
         reservation: Option<ContiguousMappingPurpose>,
@@ -1543,6 +1549,10 @@ impl std::fmt::Debug for HashLayerMmapGuard {
     }
 }
 
+// Keep eval spill chunks large enough to consolidate many columns into a handful of vm regions
+// instead of one mapping per column, while staying small enough to succeed on tight devices.
+pub const EVAL_SPILL_CHUNK_BYTES: usize = 128 << 20;
+
 impl EvalMmapGuard {
     pub fn offset_indices(&mut self, offset: usize) {
         self.spilled_indices
@@ -1668,6 +1678,68 @@ pub fn mmap_blake2s_hash_layer(
     Ok((data, HashLayerMmapGuard { _mmap: mmap }))
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct EvalColumnLayout {
+    pub idx: usize,
+    pub logical_len: usize,
+}
+
+#[track_caller]
+pub fn mmap_eval_column_chunk(
+    layouts: &[EvalColumnLayout],
+) -> std::io::Result<(
+    Vec<crate::prover::backend::simd::column::BaseColumn>,
+    EvalMmapGuard,
+)> {
+    use crate::prover::backend::simd::m31::{PackedBaseField, N_LANES};
+
+    let total_packed_len: usize = layouts
+        .iter()
+        .map(|layout| layout.logical_len.div_ceil(N_LANES))
+        .sum();
+    let allocation_bytes = total_packed_len * std::mem::size_of::<PackedBaseField>();
+    if allocation_bytes >= (4 << 20) {
+        eprintln!(
+            "ALLOC probe {}:{} fn=mmap_eval_column_chunk bytes={} columns={} element_type={} backing=mmap",
+            file!(),
+            line!(),
+            allocation_bytes,
+            layouts.len(),
+            std::any::type_name::<PackedBaseField>(),
+        );
+    }
+
+    let mmap = MmapVec::<PackedBaseField>::uninitialized(total_packed_len)?;
+    let packed_ptr = mmap.as_ptr() as *mut PackedBaseField;
+    let mut packed_offset = 0usize;
+    let mut columns = Vec::with_capacity(layouts.len());
+    let mut spilled_indices = Vec::with_capacity(layouts.len());
+
+    for layout in layouts {
+        let packed_len = layout.logical_len.div_ceil(N_LANES);
+        let data =
+            unsafe { Vec::from_raw_parts(packed_ptr.add(packed_offset), packed_len, packed_len) };
+        columns.push(crate::prover::backend::simd::column::BaseColumn {
+            data,
+            length: layout.logical_len,
+        });
+        spilled_indices.push(layout.idx);
+        packed_offset += packed_len;
+    }
+
+    let mapping = mmap
+        .into_mapping()
+        .expect("non-empty eval chunk mmap must carry mapping");
+
+    Ok((
+        columns,
+        EvalMmapGuard {
+            _regions: vec![MmapRegion { _mapping: mapping }],
+            spilled_indices,
+        },
+    ))
+}
+
 /// Replaces evaluation column Vecs with file-backed mmap Vecs for the given polynomials.
 ///
 /// Columns are grouped into consolidated chunks (up to `CHUNK_BYTES` each). Each chunk is
@@ -1683,10 +1755,6 @@ pub fn spill_eval_columns(
     >],
 ) -> Option<EvalMmapGuard> {
     use crate::prover::backend::simd::m31::PackedBaseField;
-
-    // Target ~128 MB per consolidated file. Small enough to succeed on tight devices,
-    // large enough to consolidate hundreds of columns into a handful of mmaps.
-    const CHUNK_BYTES: usize = 128 << 20;
 
     struct ColEntry {
         idx: usize,
@@ -1738,7 +1806,7 @@ pub fn spill_eval_columns(
             chunk_bytes += byte_len;
             pos += 1;
 
-            if chunk_bytes >= CHUNK_BYTES {
+            if chunk_bytes >= EVAL_SPILL_CHUNK_BYTES {
                 break;
             }
         }
@@ -1862,5 +1930,37 @@ mod tests {
         let frozen = spill.freeze().unwrap();
         assert!(frozen.is_empty());
         assert_eq!(frozen.len(), 0);
+    }
+
+    #[test]
+    fn test_mmap_eval_column_chunk_groups_multiple_columns_under_one_guard() {
+        let layouts = [
+            EvalColumnLayout {
+                idx: 3,
+                logical_len: 1 << 20,
+            },
+            EvalColumnLayout {
+                idx: 7,
+                logical_len: 1 << 19,
+            },
+            EvalColumnLayout {
+                idx: 11,
+                logical_len: 1 << 18,
+            },
+        ];
+
+        let (columns, guard) = mmap_eval_column_chunk(&layouts).unwrap();
+
+        assert_eq!(columns.len(), layouts.len());
+        assert_eq!(guard._regions.len(), 1);
+        assert_eq!(guard.spilled_indices, vec![3, 7, 11]);
+        assert_eq!(columns[0].length, layouts[0].logical_len);
+        assert_eq!(columns[1].length, layouts[1].logical_len);
+        assert_eq!(columns[2].length, layouts[2].logical_len);
+
+        for column in columns {
+            std::mem::forget(column);
+        }
+        drop(guard);
     }
 }

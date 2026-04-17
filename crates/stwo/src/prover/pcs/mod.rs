@@ -1193,6 +1193,23 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         twiddles: &TwiddleTree<B>,
         base_column_pool: &BaseColumnPool<B>,
     ) {
+        #[cfg(target_os = "ios")]
+        if std::any::type_name::<B>()
+            == std::any::type_name::<crate::prover::backend::simd::SimdBackend>()
+        {
+            let self_ptr = self as *mut Self
+                as *mut CommitmentTreeProver<crate::prover::backend::simd::SimdBackend>;
+            let twiddles_ptr = twiddles as *const TwiddleTree<B>
+                as *const TwiddleTree<crate::prover::backend::simd::SimdBackend>;
+            let pool_ptr = base_column_pool as *const BaseColumnPool<B>
+                as *const BaseColumnPool<crate::prover::backend::simd::SimdBackend>;
+            unsafe {
+                (*self_ptr)
+                    .materialize_evaluations_low_memory_direct_mmap(&*twiddles_ptr, &*pool_ptr);
+            }
+            return;
+        }
+
         let budget_bytes = low_memory_materialize_budget_bytes();
         let total = self.polynomials.len();
         // Accumulated bytes of newly-materialized (heap-backed) polys in the current batch,
@@ -1477,6 +1494,107 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     fn mapped_position(query_position: usize, log_size: usize, max_log_size: usize) -> usize {
         let shift = max_log_size - log_size;
         (query_position >> (shift + 1) << 1) + (query_position & 1)
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl<MC: MerkleChannel> CommitmentTreeProver<crate::prover::backend::simd::SimdBackend, MC> {
+    fn materialize_evaluations_low_memory_direct_mmap(
+        &mut self,
+        twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
+        base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
+    ) {
+        let mut batch_layouts = Vec::new();
+        let mut batch_bytes = 0usize;
+
+        for idx in 0..self.polynomials.len() {
+            if self.polynomials[idx].evals.is_some() {
+                self.flush_direct_mmap_materialization_batch(
+                    &mut batch_layouts,
+                    &mut batch_bytes,
+                    twiddles,
+                    base_column_pool,
+                );
+                continue;
+            }
+
+            let logical_len = 1usize << self.polynomials[idx].log_size();
+            let bytes = logical_len * std::mem::size_of::<BaseField>();
+            if bytes >= (4 << 20) {
+                eprintln!(
+                    "ALLOC probe {}:{} fn=CommitmentTreeProver::materialize_evaluations_low_memory_direct_mmap poly_idx={} bytes={} logical_len={} element_type={} backing=mmap_chunk",
+                    file!(),
+                    line!(),
+                    idx,
+                    bytes,
+                    logical_len,
+                    std::any::type_name::<BaseField>(),
+                );
+            }
+
+            if !batch_layouts.is_empty()
+                && batch_bytes + bytes > crate::prover::spill::EVAL_SPILL_CHUNK_BYTES
+            {
+                self.flush_direct_mmap_materialization_batch(
+                    &mut batch_layouts,
+                    &mut batch_bytes,
+                    twiddles,
+                    base_column_pool,
+                );
+            }
+
+            batch_layouts.push(crate::prover::spill::EvalColumnLayout { idx, logical_len });
+            batch_bytes += bytes;
+        }
+
+        self.flush_direct_mmap_materialization_batch(
+            &mut batch_layouts,
+            &mut batch_bytes,
+            twiddles,
+            base_column_pool,
+        );
+    }
+
+    fn flush_direct_mmap_materialization_batch(
+        &mut self,
+        batch_layouts: &mut Vec<crate::prover::spill::EvalColumnLayout>,
+        batch_bytes: &mut usize,
+        twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
+        base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
+    ) {
+        if batch_layouts.is_empty() {
+            return;
+        }
+
+        let layouts = std::mem::take(batch_layouts);
+        *batch_bytes = 0;
+
+        match crate::prover::spill::mmap_eval_column_chunk(&layouts) {
+            Ok((columns, guard)) => {
+                for (layout, column) in layouts.iter().zip(columns.into_iter()) {
+                    let evals = self.polynomials[layout.idx]
+                        .materialize_evaluation_with_buffer(twiddles, column);
+                    self.polynomials[layout.idx].evals = Some(evals);
+                }
+                self.eval_mmap_guards.push(guard);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Direct eval mmap materialization failed for {} columns ({:.1} MB): {e}. Falling back to heap-backed recomputation.",
+                    layouts.len(),
+                    layouts
+                        .iter()
+                        .map(|layout| layout.logical_len * std::mem::size_of::<BaseField>())
+                        .sum::<usize>() as f64
+                        / (1024.0 * 1024.0),
+                );
+                for layout in layouts {
+                    let evals = self.polynomials[layout.idx]
+                        .materialize_evaluation(twiddles, base_column_pool);
+                    self.polynomials[layout.idx].evals = Some(evals);
+                }
+            }
+        }
     }
 }
 
