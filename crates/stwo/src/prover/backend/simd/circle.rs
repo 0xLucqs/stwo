@@ -139,19 +139,17 @@ impl SimdBackend {
 /// in-memory evaluation columns to file-backed mmap when running in
 /// [`ProverMemoryMode::LowMemory`].
 ///
-/// Sized to match the arena's file-backed-mmap minimum
-/// ([`crate::prover::spill::DEFAULT_ARENA_FILE_BACKED_MIN_MB`], 128 MiB). Smaller batches
-/// would produce sub-128 MiB spill files that bypass the arena and go straight to
-/// `libc::mmap`, which on iOS fragments the user-VA budget catastrophically -- a single
-/// proof was observed to emit 592 small spill mmaps, create 1654 task_regions, and then
-/// abort with `largest_user_mb=1.7`, `gaps_ge_16mb=0` on a fresh 2 MiB allocation.
+/// Kept at 128 MiB because smaller batches create many more file-backed spill mappings,
+/// which previously fragmented iOS user VA badly -- a single proof was observed to emit
+/// 592 small spill mmaps, create 1654 task regions, and then abort with
+/// `largest_user_mb=1.7`, `gaps_ge_16mb=0` on a fresh 2 MiB allocation.
 ///
-/// At 128 MiB, each `spill_eval_columns` call produces one file ≥ the arena threshold, so
-/// the spill lands contiguously inside the arena. In-flight heap peak during batching grows
-/// from ~1 MiB to ~128 MiB, but (a) we have headroom for it (iPhone peak was 2 GiB resident
-/// at the abort, with plenty of physical RAM left), and (b) large allocations on iOS bypass
-/// libsystem_malloc's VA-retaining magazine path and are released cleanly to the kernel,
-/// so the larger transient is actually *less* malloc pressure than hundreds of tiny allocs.
+/// At 128 MiB, each `spill_eval_columns` call produces far fewer, larger mappings. In-flight
+/// heap peak during batching grows from ~1 MiB to ~128 MiB, but (a) we have headroom for it
+/// (iPhone peak was 2 GiB resident at the abort, with plenty of physical RAM left), and
+/// (b) large allocations on iOS bypass libsystem_malloc's VA-retaining magazine path and are
+/// released cleanly to the kernel, so the larger transient is actually *less* malloc pressure
+/// than hundreds of tiny allocs.
 ///
 /// Override via `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` (e.g. `1048576` to restore the
 /// historical 1 MiB value for regression comparison).
@@ -241,7 +239,8 @@ impl PolyOps for SimdBackend {
         for poly_coeffs in polynomials {
             let log_eval_size = poly_coeffs.log_size() + log_blowup_factor;
             let packed_len = (1usize << log_eval_size).div_ceil(N_LANES);
-            let allocation_bytes = packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
+            let allocation_bytes =
+                packed_len.saturating_mul(std::mem::size_of::<PackedBaseField>());
             if allocation_bytes >= (4 << 20) {
                 eprintln!(
                     "ALLOC probe {}:{} fn=SimdBackend::evaluate_polynomials bytes={} logical_len={} packed_len={} element_type={} backing=heap_or_pool",
@@ -533,7 +532,7 @@ impl PolyOps for SimdBackend {
             .interpolate()
     }
 
-        fn evaluate(
+    fn evaluate(
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
         twiddles: &TwiddleTree<Self>,

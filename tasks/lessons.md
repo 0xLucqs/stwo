@@ -14,3 +14,7 @@
 - On Cairo proofs, inspect the retained base-to-interaction bridge directly. A large share of the early peak can live in `InteractionClaimGenerator` payloads that duplicate lookup tuples across phases, even when PCS/FRI low-memory work is already in place.
 - When compacting a retained Cairo generator, prefer removing duplicated preprocessed columns first. That is a better ROI than chasing unrelated prover internals, but it still must be validated with the same `Activity Monitor` peak metric because on-demand replay from preprocessed columns can sometimes worsen `Memory` even when it shrinks explicit buffers.
 - When the user asks for simple probe logging to identify the last allocation site hit before a crash, do not build generic tracing infrastructure. Use direct pre-allocation `eprintln!` probes at the suspected call sites instead.
+
+## 2026-04-17
+
+- When investigating iOS proving failures, separate virtual-address fragmentation from RSS/phys_footprint immediately. A warm-run failure to find a contiguous `256 MiB` hole is a different problem from retained bytes, and the fixes target allocator/VA layout rather than drop timing alone.

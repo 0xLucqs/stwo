@@ -26,7 +26,9 @@ use crate::prover::backend::simd::column::BaseColumn;
 use crate::prover::backend::simd::m31::{reduce_to_m31_simd, PackedBaseField, N_LANES};
 use crate::prover::backend::simd::utils::transpose_packed_leaf;
 use crate::prover::backend::{Col, Column, CpuBackend};
-use crate::prover::spill::{log_vm_walk, mmap_blake2s_hash_layer, HashLayerMmapGuard, MmapVec};
+use crate::prover::spill::{
+    log_vm_walk, mmap_blake2s_hash_layer, ContiguousMappingPurpose, HashLayerMmapGuard, MmapVec,
+};
 use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 
 const N_FELTS_IN_BLAKE_MESSAGE: usize = 16;
@@ -64,7 +66,9 @@ fn allocate_state_layer(
     if allocation_bytes >= (4 << 20) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let avail_mb = {
-            extern "C" { fn os_proc_available_memory() -> u64; }
+            extern "C" {
+                fn os_proc_available_memory() -> u64;
+            }
             (unsafe { os_proc_available_memory() }) / (1024 * 1024)
         };
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -83,14 +87,13 @@ fn allocate_state_layer(
     }
 
     if use_mmap {
-        match MmapVec::uninitialized(length) {
+        match MmapVec::uninitialized_for_contiguous_mapping(
+            length,
+            ContiguousMappingPurpose::LiftedMerkleState,
+        ) {
             Ok(mmap) => {
                 let data = unsafe {
-                    Vec::from_raw_parts(
-                        mmap.as_ptr() as *mut Blake2StateWords,
-                        length,
-                        length,
-                    )
+                    Vec::from_raw_parts(mmap.as_ptr() as *mut Blake2StateWords, length, length)
                 };
                 return (data, Some(Blake2StateLayerMmapGuard { _mmap: mmap }));
             }
@@ -125,7 +128,9 @@ fn allocate_hash_layer(
     if allocation_bytes >= (4 << 20) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let avail_mb = {
-            extern "C" { fn os_proc_available_memory() -> u64; }
+            extern "C" {
+                fn os_proc_available_memory() -> u64;
+            }
             (unsafe { os_proc_available_memory() }) / (1024 * 1024)
         };
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -147,7 +152,8 @@ fn allocate_hash_layer(
             Err(e) => {
                 eprintln!(
                     "ALLOC probe {}:{} fn=allocate_hash_layer mmap_failed: {e}",
-                    file!(), line!(),
+                    file!(),
+                    line!(),
                 );
                 log_vm_walk("allocate_hash_layer:mmap_failed");
             }
@@ -155,7 +161,9 @@ fn allocate_hash_layer(
     }
     eprintln!(
         "ALLOC probe {}:{} fn=allocate_hash_layer heap_fallback bytes={}",
-        file!(), line!(), allocation_bytes,
+        file!(),
+        line!(),
+        allocation_bytes,
     );
     (unsafe { uninit_vec(length) }, None)
 }
@@ -303,7 +311,8 @@ fn build_first_layer_above_leaves_inner<const IS_M31_OUTPUT: bool>(
                 let log_ratio = chunk_max_log_size - log_size;
                 msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
             }
-            states[i] = Blake2StateWords::from_simd(compress_finalize(prev_state, msgs, byte_count));
+            states[i] =
+                Blake2StateWords::from_simd(compress_finalize(prev_state, msgs, byte_count));
         }
 
         let lifting_log_size_packed = lifting_log_size - LOG_N_LANES;
@@ -699,8 +708,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // this copy.
         // Safety: we never read from `res`, only write to it.
         let leaf_hashes_len = 1usize << (lifting_log_size_packed + LOG_N_HASHES_PER_SIMD_STATE);
-        let leaf_hashes_bytes =
-            leaf_hashes_len.saturating_mul(std::mem::size_of::<Blake2sHash>());
+        let leaf_hashes_bytes = leaf_hashes_len.saturating_mul(std::mem::size_of::<Blake2sHash>());
         if leaf_hashes_bytes >= (4 << 20) {
             eprintln!(
                 "ALLOC probe {}:{} fn=SimdBackend::build_leaves leaf_hashes bytes={} logical_len={} element_type={} backing=heap",

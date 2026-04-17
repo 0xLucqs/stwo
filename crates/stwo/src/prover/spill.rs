@@ -387,6 +387,7 @@ fn track_munmap(bytes: usize) {
     ACTIVE_MMAP_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
 mod mmap_arena {
     use std::os::unix::io::AsRawFd;
@@ -397,37 +398,31 @@ mod mmap_arena {
     /// Reserved VA size for the spill-mapping arena, in MiB.
     ///
     /// Sizing history:
-    /// * 4096 → late proving hit spill peak ~4 GiB, the 256 MiB contiguous
-    ///   Merkle mmap had no home, arena exhausted.
-    /// * 5120 → solved that specific failure, but combined with libsystem_malloc's
-    ///   ~6 GiB of retained VA it blows the per-process iOS user-VA budget
-    ///   (~13.6 GiB on a 4 GiB iPhone). Proof 1 aborts on a plain 8 MiB heap
-    ///   allocation with `largest_user_mb=3.7` and `gaps_ge_16mb=0` while
-    ///   jetsam still has 3 GiB of physical headroom.
-    /// * 1024 → with threshold=32 MiB the arena was 99.4% full all the time
-    ///   and forced 57 RESERVE_FAIL overflows per proof.
-    /// * 2048 → paired with threshold=128 MiB, still 98.5% full at peak and
-    ///   forced 13 RESERVE_FAILs on 128-148 MiB hash-layer / spill chunks
-    ///   that arrived while 4 coefficient spills + 2-3 state layers were
-    ///   already alive.
-    /// * 4096 → simulator worked, but device aborted during base trace on
-    ///   a 4 MiB heap alloc (internal=2068 MiB, largest_user_mb=2.2). This
-    ///   was with the 1 MiB spill batch which retained heavy malloc magazine
-    ///   state; since superseded by the 128 MiB spill batch change which
-    ///   drops internal to ~1900 MiB.
-    /// * 3584 → device ran further (composition phase) but still aborted on
-    ///   a 16 MiB heap alloc. Peak arena content 3669 MiB, 4 RESERVE_FAIL
-    ///   overflows (256+134+436+448=1274 MiB) went to libc and fragmented
-    ///   the non-arena VA into 15.5 MiB pieces.
-    /// * 4608 → current. Sized to absorb the 4943 MiB of actually-useful
-    ///   big-alloc peak (3669 arena-successful + 1274 overflow we now keep
-    ///   inside arena). With no overflow, libc stays clean. The extra
-    ///   arena VA mostly *replaces* the would-have-been libc mappings, not
-    ///   adds to them -- net VA cost vs 3584 is only the ~60-100 MiB of
-    ///   genuinely unused reservation headroom. Combined with the 128 MiB
-    ///   spill batch (which saved ~164 MiB of malloc internal), we should
-    ///   fit the 13.6 GiB budget with ~500 MiB headroom.
-    ///   Override at runtime via `STWO_MMAP_ARENA_MB`.
+    /// * 4096 → late proving hit spill peak ~4 GiB, the 256 MiB contiguous Merkle mmap had no home,
+    ///   arena exhausted.
+    /// * 5120 → solved that specific failure, but combined with libsystem_malloc's ~6 GiB of
+    ///   retained VA it blows the per-process iOS user-VA budget (~13.6 GiB on a 4 GiB iPhone).
+    ///   Proof 1 aborts on a plain 8 MiB heap allocation with `largest_user_mb=3.7` and
+    ///   `gaps_ge_16mb=0` while jetsam still has 3 GiB of physical headroom.
+    /// * 1024 → with threshold=32 MiB the arena was 99.4% full all the time and forced 57
+    ///   RESERVE_FAIL overflows per proof.
+    /// * 2048 → paired with threshold=128 MiB, still 98.5% full at peak and forced 13 RESERVE_FAILs
+    ///   on 128-148 MiB hash-layer / spill chunks that arrived while 4 coefficient spills + 2-3
+    ///   state layers were already alive.
+    /// * 4096 → simulator worked, but device aborted during base trace on a 4 MiB heap alloc
+    ///   (internal=2068 MiB, largest_user_mb=2.2). This was with the 1 MiB spill batch which
+    ///   retained heavy malloc magazine state; since superseded by the 128 MiB spill batch change
+    ///   which drops internal to ~1900 MiB.
+    /// * 3584 → device ran further (composition phase) but still aborted on a 16 MiB heap alloc.
+    ///   Peak arena content 3669 MiB, 4 RESERVE_FAIL overflows (256+134+436+448=1274 MiB) went to
+    ///   libc and fragmented the non-arena VA into 15.5 MiB pieces.
+    /// * 4608 → current. Sized to absorb the 4943 MiB of actually-useful big-alloc peak (3669
+    ///   arena-successful + 1274 overflow we now keep inside arena). With no overflow, libc stays
+    ///   clean. The extra arena VA mostly *replaces* the would-have-been libc mappings, not adds to
+    ///   them -- net VA cost vs 3584 is only the ~60-100 MiB of genuinely unused reservation
+    ///   headroom. Combined with the 128 MiB spill batch (which saved ~164 MiB of malloc internal),
+    ///   we should fit the 13.6 GiB budget with ~500 MiB headroom. Override at runtime via
+    ///   `STWO_MMAP_ARENA_MB`.
     const DEFAULT_ARENA_MB: usize = 4608;
     const ARENA_ENV_VAR: &str = "STWO_MMAP_ARENA_MB";
 
@@ -766,8 +761,8 @@ mod mmap_arena {
 enum MappingRelease {
     System,
     #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
-    Arena {
-        _lease: mmap_arena::ArenaLease,
+    MerkleSlot {
+        _lease: merkle_slot_pool::SlotLease,
     },
 }
 
@@ -781,85 +776,359 @@ struct FileBackedMapping {
 unsafe impl Send for FileBackedMapping {}
 unsafe impl Sync for FileBackedMapping {}
 
-/// Minimum file-backed mmap size (in MiB) that will be routed through the
-/// arena. Anything smaller is sent straight to `libc::mmap` at whatever
-/// address the kernel picks.
-///
-/// The arena's whole purpose is to keep **big** spill mappings contiguous
-/// across proof runs — that's what the original proof 2 failure was about
-/// (a 256 MiB lifted-Merkle mapping that couldn't find a contiguous hole in
-/// a warm, fragmented user VA). Small spill mmaps do not need that
-/// protection: the kernel always finds 3-4 MiB of contiguous VA somewhere,
-/// and forcing the thousand-plus small spills that a Cairo proof produces
-/// through the arena just fills it with 3-4 MiB fragments that then
-/// displace the one allocation that actually needed the contiguity
-/// guarantee.
-///
-/// Override at runtime via `STWO_MMAP_ARENA_MIN_MB` (e.g. `0` to route
-/// every spill through the arena, `32` to match the previous default).
-///
-/// Why 128: the simulator log shows 57 `ARENA_RESERVE_FAIL` events at the
-/// 32 MiB threshold (the arena was constantly full of 32 MiB and 64 MiB
-/// chunks that don't actually need the contiguity guarantee). Raising the
-/// threshold to 128 MiB lets the small chunks go straight to libc where
-/// they have no trouble finding space, and keeps the arena reserved for
-/// the allocations that genuinely need it (lifted-Merkle state/hash layers
-/// and multi-hundred-MiB coefficient spills).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const DEFAULT_ARENA_FILE_BACKED_MIN_MB: usize = 128;
+#[derive(Clone, Copy, Debug)]
+pub enum ContiguousMappingPurpose {
+    LiftedMerkleState,
+    LiftedMerkleHash,
+}
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const ARENA_FILE_BACKED_MIN_ENV: &str = "STWO_MMAP_ARENA_MIN_MB";
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+mod merkle_slot_pool {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Mutex, OnceLock};
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn arena_file_backed_min_bytes() -> usize {
-    use std::sync::OnceLock;
-    static BYTES: OnceLock<usize> = OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let mb = std::env::var(ARENA_FILE_BACKED_MIN_ENV)
+    use super::{ContiguousMappingPurpose, NamedTempFile};
+
+    const STATE_SLOT_BYTES: usize = 256 << 20;
+    const HASH_SLOT_BYTES: usize = 128 << 20;
+    const DEFAULT_STATE_SLOT_COUNT: usize = 2;
+    const DEFAULT_HASH_SLOT_COUNT: usize = 2;
+    const STATE_SLOT_COUNT_ENV: &str = "STWO_MERKLE_STATE_SLOT_COUNT";
+    const HASH_SLOT_COUNT_ENV: &str = "STWO_MERKLE_HASH_SLOT_COUNT";
+
+    #[derive(Debug)]
+    struct SlotPoolState {
+        base_addr: usize,
+        slot_size: usize,
+        free_slots: Vec<bool>,
+        label: &'static str,
+    }
+
+    impl SlotPoolState {
+        fn reserve_slot(&mut self, requested_len: usize) -> Option<SlotLease> {
+            if requested_len > self.slot_size {
+                return None;
+            }
+            let slot_idx = self.free_slots.iter().position(|is_free| *is_free)?;
+            self.free_slots[slot_idx] = false;
+            Some(SlotLease {
+                kind: None,
+                slot_idx,
+                slot_size: self.slot_size,
+            })
+        }
+
+        fn release_slot(&mut self, slot_idx: usize) {
+            self.free_slots[slot_idx] = true;
+        }
+
+        fn used_slots(&self) -> usize {
+            self.free_slots.iter().filter(|&&free| !free).count()
+        }
+    }
+
+    pub struct SlotLease {
+        kind: Option<ContiguousMappingPurpose>,
+        slot_idx: usize,
+        slot_size: usize,
+    }
+
+    pub fn try_map_file(
+        kind: ContiguousMappingPurpose,
+        file: &NamedTempFile,
+        byte_len: usize,
+        prot: i32,
+    ) -> std::io::Result<Option<(*mut libc::c_void, SlotLease)>> {
+        if byte_len == 0 {
+            return Ok(None);
+        }
+        let Some(pool) = pool_state(kind) else {
+            return Ok(None);
+        };
+
+        let mut lease = {
+            let mut state = pool.lock().expect("merkle slot pool mutex poisoned");
+            match state.reserve_slot(byte_len) {
+                Some(lease) => lease,
+                None => {
+                    eprintln!(
+                        "MERKLE_SLOT_RESERVE_FAIL kind={} size={} slot_size={} used_slots={}/{}",
+                        state.label,
+                        byte_len,
+                        state.slot_size,
+                        state.used_slots(),
+                        state.free_slots.len(),
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+        lease.kind = Some(kind);
+
+        let addr = slot_addr(kind, lease.slot_idx);
+        let ptr = unsafe {
+            libc::mmap(
+                addr,
+                byte_len,
+                prot,
+                libc::MAP_FIXED | libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "MERKLE_SLOT_MAP_FAIL kind={} slot_idx={} size={} prot={} err={err}",
+                pool_label(kind),
+                lease.slot_idx,
+                byte_len,
+                prot,
+            );
+            if let Some(pool) = pool_state(kind) {
+                let mut state = pool.lock().expect("merkle slot pool mutex poisoned");
+                state.release_slot(lease.slot_idx);
+            }
+            return Err(err);
+        }
+
+        if let Some(pool) = pool_state(kind) {
+            let state = pool.lock().expect("merkle slot pool mutex poisoned");
+            eprintln!(
+                "MERKLE_SLOT_ALLOC kind={} slot_idx={} size={} used_slots={}/{}",
+                state.label,
+                lease.slot_idx,
+                byte_len,
+                state.used_slots(),
+                state.free_slots.len(),
+            );
+        }
+
+        Ok(Some((ptr, lease)))
+    }
+
+    impl Drop for SlotLease {
+        fn drop(&mut self) {
+            let Some(kind) = self.kind else {
+                return;
+            };
+            let Some(pool) = pool_state(kind) else {
+                return;
+            };
+            let addr = slot_addr(kind, self.slot_idx);
+            let restore = unsafe {
+                libc::mmap(
+                    addr,
+                    self.slot_size,
+                    libc::PROT_NONE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if restore == libc::MAP_FAILED {
+                eprintln!(
+                    "MERKLE_SLOT_RESTORE_FAIL kind={} slot_idx={} bytes={} err={}",
+                    pool_label(kind),
+                    self.slot_idx,
+                    self.slot_size,
+                    std::io::Error::last_os_error(),
+                );
+                return;
+            }
+
+            let mut state = pool.lock().expect("merkle slot pool mutex poisoned");
+            state.release_slot(self.slot_idx);
+            eprintln!(
+                "MERKLE_SLOT_DEALLOC kind={} slot_idx={} used_slots={}/{}",
+                state.label,
+                self.slot_idx,
+                state.used_slots(),
+                state.free_slots.len(),
+            );
+        }
+    }
+
+    fn pool_state(kind: ContiguousMappingPurpose) -> Option<&'static Mutex<SlotPoolState>> {
+        match kind {
+            ContiguousMappingPurpose::LiftedMerkleState => {
+                static STATE_POOL: OnceLock<Option<Mutex<SlotPoolState>>> = OnceLock::new();
+                STATE_POOL
+                    .get_or_init(|| {
+                        init_pool(
+                            "state",
+                            STATE_SLOT_BYTES,
+                            DEFAULT_STATE_SLOT_COUNT,
+                            STATE_SLOT_COUNT_ENV,
+                        )
+                    })
+                    .as_ref()
+            }
+            ContiguousMappingPurpose::LiftedMerkleHash => {
+                static HASH_POOL: OnceLock<Option<Mutex<SlotPoolState>>> = OnceLock::new();
+                HASH_POOL
+                    .get_or_init(|| {
+                        init_pool(
+                            "hash",
+                            HASH_SLOT_BYTES,
+                            DEFAULT_HASH_SLOT_COUNT,
+                            HASH_SLOT_COUNT_ENV,
+                        )
+                    })
+                    .as_ref()
+            }
+        }
+    }
+
+    fn slot_addr(kind: ContiguousMappingPurpose, slot_idx: usize) -> *mut libc::c_void {
+        let pool = pool_state(kind).expect("merkle slot address requested without pool");
+        let state = pool.lock().expect("merkle slot pool mutex poisoned");
+        (state.base_addr + slot_idx * state.slot_size) as *mut libc::c_void
+    }
+
+    fn init_pool(
+        label: &'static str,
+        slot_size: usize,
+        default_slot_count: usize,
+        env_var: &str,
+    ) -> Option<Mutex<SlotPoolState>> {
+        let page_size = page_size()?;
+        let slot_count = std::env::var(env_var)
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_ARENA_FILE_BACKED_MIN_MB);
-        eprintln!("MMAP_ARENA file_backed_min_mb={mb}");
-        mb * 1024 * 1024
-    })
+            .unwrap_or(default_slot_count);
+        if slot_count == 0 {
+            eprintln!("MERKLE_SLOT_POOL disabled label={label} via {env_var}=0");
+            return None;
+        }
+
+        let slot_size = align_up(slot_size, page_size);
+        let total_len = slot_size.checked_mul(slot_count)?;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            eprintln!(
+                "MERKLE_SLOT_POOL init_failed label={label} slot_count={} slot_mb={} err={}",
+                slot_count,
+                slot_size / (1024 * 1024),
+                std::io::Error::last_os_error(),
+            );
+            return None;
+        }
+
+        eprintln!(
+            "MERKLE_SLOT_POOL reserved label={label} slot_count={} slot_mb={} base={ptr:p}",
+            slot_count,
+            slot_size / (1024 * 1024),
+        );
+        Some(Mutex::new(SlotPoolState {
+            base_addr: ptr as usize,
+            slot_size,
+            free_slots: vec![true; slot_count],
+            label,
+        }))
+    }
+
+    fn page_size() -> Option<usize> {
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if raw <= 0 {
+            eprintln!("MERKLE_SLOT_POOL failed_to_read_page_size");
+            None
+        } else {
+            Some(raw as usize)
+        }
+    }
+
+    fn align_up(value: usize, alignment: usize) -> usize {
+        value.div_ceil(alignment) * alignment
+    }
+
+    const fn pool_label(kind: ContiguousMappingPurpose) -> &'static str {
+        match kind {
+            ContiguousMappingPurpose::LiftedMerkleState => "state",
+            ContiguousMappingPurpose::LiftedMerkleHash => "hash",
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::SlotPoolState;
+
+        #[test]
+        fn reserve_release_reuses_slot() {
+            let mut state = SlotPoolState {
+                base_addr: 0,
+                slot_size: 256 << 20,
+                free_slots: vec![true, true],
+                label: "state",
+            };
+
+            let first = state.reserve_slot(256 << 20).unwrap();
+            let second = state.reserve_slot(128 << 20).unwrap();
+            assert_eq!(first.slot_idx, 0);
+            assert_eq!(second.slot_idx, 1);
+            assert!(state.reserve_slot(1).is_none());
+
+            state.release_slot(first.slot_idx);
+            let third = state.reserve_slot(64 << 20).unwrap();
+            assert_eq!(third.slot_idx, 0);
+        }
+
+        #[test]
+        fn reserve_rejects_oversized_request() {
+            let mut state = SlotPoolState {
+                base_addr: 0,
+                slot_size: 128 << 20,
+                free_slots: vec![true],
+                label: "hash",
+            };
+
+            assert!(state.reserve_slot(129 << 20).is_none());
+        }
+    }
 }
 
 impl FileBackedMapping {
-    // `#[track_caller]` so the Location captured inside `try_map_file` skips
-    // this frame and identifies the actual stwo consumer (MmapVec::uninitialized
-    // caller, spill_eval_columns, mmap_blake2s_hash_layer, etc.).
     #[track_caller]
     #[cfg(unix)]
-    fn map_named_temp_file(
+    fn map_named_temp_file_with_reservation(
         file: NamedTempFile,
         byte_len: usize,
         prot: i32,
+        reservation: Option<ContiguousMappingPurpose>,
     ) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
-        // Only route big enough spills through the arena. Small mmaps go
-        // straight to libc — the kernel reliably finds a few MiB of
-        // contiguous VA, and keeping them out of the arena leaves arena
-        // space for the one 256 MiB allocation that actually needs the
-        // guarantee.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if byte_len >= arena_file_backed_min_bytes() {
-            match mmap_arena::try_map_file(&file, byte_len, prot) {
+        #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+        if let Some(reservation) = reservation {
+            match merkle_slot_pool::try_map_file(reservation, &file, byte_len, prot) {
                 Ok(Some((ptr, lease))) => {
                     track_mmap(byte_len);
                     return Ok(Self {
                         ptr,
                         byte_len,
                         _file: file,
-                        release: MappingRelease::Arena { _lease: lease },
+                        release: MappingRelease::MerkleSlot { _lease: lease },
                     });
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    eprintln!(
+                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={} -> system_mmap",
+                        byte_len
+                    );
+                }
                 Err(err) => {
                     eprintln!(
-                        "MMAP_ARENA map_failed bytes={} prot={} err={err}",
-                        byte_len, prot
+                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={} err={err} -> system_mmap",
+                        byte_len
                     );
                 }
             }
@@ -886,6 +1155,19 @@ impl FileBackedMapping {
             _file: file,
             release: MappingRelease::System,
         })
+    }
+
+    // `#[track_caller]` so the Location captured inside `try_map_file` skips
+    // this frame and identifies the actual stwo consumer (MmapVec::uninitialized
+    // caller, spill_eval_columns, mmap_blake2s_hash_layer, etc.).
+    #[track_caller]
+    #[cfg(unix)]
+    fn map_named_temp_file(
+        file: NamedTempFile,
+        byte_len: usize,
+        prot: i32,
+    ) -> std::io::Result<Self> {
+        Self::map_named_temp_file_with_reservation(file, byte_len, prot, None)
     }
 
     #[track_caller]
@@ -1077,13 +1359,11 @@ unsafe impl<T: Pod> Send for MmapVec<T> {}
 unsafe impl<T: Pod> Sync for MmapVec<T> {}
 
 impl<T: Pod> MmapVec<T> {
-    /// Creates a file-backed mmap of uninitialized storage for `len` elements.
-    // `#[track_caller]` so the caller captured inside `try_map_file` points to
-    // the actual stwo site (e.g. `allocate_state_layer` in blake2s_lifted.rs),
-    // not to this helper.
-    #[track_caller]
     #[cfg(unix)]
-    pub fn uninitialized(len: usize) -> std::io::Result<Self> {
+    fn uninitialized_with_reservation(
+        len: usize,
+        reservation: Option<ContiguousMappingPurpose>,
+    ) -> std::io::Result<Self> {
         let byte_len = len * std::mem::size_of::<T>();
 
         if byte_len == 0 {
@@ -1097,10 +1377,11 @@ impl<T: Pod> MmapVec<T> {
 
         let file = NamedTempFile::new()?;
         file.as_file().set_len(byte_len as u64)?;
-        let mapping = FileBackedMapping::map_named_temp_file(
+        let mapping = FileBackedMapping::map_named_temp_file_with_reservation(
             file,
             byte_len,
             libc::PROT_READ | libc::PROT_WRITE,
+            reservation,
         )?;
         Ok(Self {
             ptr: mapping.as_ptr() as *mut T,
@@ -1108,6 +1389,25 @@ impl<T: Pod> MmapVec<T> {
             byte_len,
             _mapping: Some(mapping),
         })
+    }
+
+    /// Creates a file-backed mmap of uninitialized storage for `len` elements.
+    // `#[track_caller]` so the caller captured inside `try_map_file` points to
+    // the actual stwo site (e.g. `allocate_state_layer` in blake2s_lifted.rs),
+    // not to this helper.
+    #[track_caller]
+    #[cfg(unix)]
+    pub fn uninitialized(len: usize) -> std::io::Result<Self> {
+        Self::uninitialized_with_reservation(len, None)
+    }
+
+    #[track_caller]
+    #[cfg(unix)]
+    pub fn uninitialized_for_contiguous_mapping(
+        len: usize,
+        reservation: ContiguousMappingPurpose,
+    ) -> std::io::Result<Self> {
+        Self::uninitialized_with_reservation(len, Some(reservation))
     }
 
     /// Allocates uninitialized backing storage on non-Unix platforms.
@@ -1350,7 +1650,14 @@ pub fn mmap_blake2s_hash_layer(
             std::any::type_name::<crate::core::vcs::blake2_hash::Blake2sHash>(),
         );
     }
-    let mmap = MmapVec::uninitialized(length)?;
+    let mmap = if allocation_bytes >= (128 << 20) {
+        MmapVec::uninitialized_for_contiguous_mapping(
+            length,
+            ContiguousMappingPurpose::LiftedMerkleHash,
+        )?
+    } else {
+        MmapVec::uninitialized(length)?
+    };
     let data = unsafe {
         Vec::from_raw_parts(
             mmap.as_ptr() as *mut crate::core::vcs::blake2_hash::Blake2sHash,
@@ -1556,5 +1863,4 @@ mod tests {
         assert!(frozen.is_empty());
         assert_eq!(frozen.len(), 0);
     }
-
 }

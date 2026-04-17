@@ -182,3 +182,55 @@
 - Existing Allocations exports from the closely related full Cairo proof still show the dominant memory class is large VM-backed malloc regions, not small-object churn. In the saved `cairo_alloc_*_stats.xml` traces, `VM: MALLOC_LARGE` and `Malloc 32/64/128/256/512 MiB` buckets dominate both persistent bytes and total traffic, which matches the observed wide-trace and Merkle materialization architecture.
 - Existing Allocations list exports from that Cairo proof also show many live `Malloc 32,00 MiB` regions owned by Rayon worker `call_once` frames during the early proof window, reinforcing that parallel witness/trace generation is a real contributor to peak memory.
 - Conclusion: if the goal is "mobile-feasible" memory, keep the current low-memory `stwo` path enabled and spend the next optimization round on Cairo-specific interaction generation and fixed-table replay/streaming, not on deeper FRI or verifier-path surgery.
+
+- [x] Trace every `BaseColumn::uninitialized` path that plausibly produces ~4-5 MiB per-component allocations
+- [x] Confirm the owning scope for those buffers in component generation, commitment, and low-memory rematerialization paths
+- [x] Record whether each path drops the allocation at the earliest safe point or retains it across broader prover phases
+
+## Review
+
+- In core `stwo`, the low-memory composition loop in `crates/stwo/src/prover/mod.rs` materializes each component's requested trace evals immediately before `evaluate_constraint_quotients_on_domain` and calls `drop_access_pattern_evaluations(...)` immediately after that component finishes. That is the earliest safe point in the generic prover loop.
+- For components that expose a narrow `TraceEvalAccessPattern`, `crates/stwo/src/prover/pcs/mod.rs` materializes only the requested column ranges / indices and then drops exactly those ranges / indices right after the component. Those eval buffers are not retained across later components.
+- The important nuance is that `drop_evaluation_range` / `drop_evaluation_indices` currently just `take_evals()` and let the `BaseColumn` drop, instead of returning the buffer to `BaseColumnPool`. So the ownership lifetime is short, but repeated 4-5 MiB allocations can still churn through the allocator and remain in process RSS until malloc decides to hand pages back.
+- The broader tree-wide low-memory paths already release promptly as well: after low-memory tree commit, `CommitmentTreeProver::new_with_memory_mode` drops evals right after Merkle construction; during decommit, `prove_values` re-materializes per tree and drops those evals immediately after each tree decommit.
+- I did not find evidence in this repo that the 4-5 MiB `BaseColumn::uninitialized` allocations are being intentionally retained across many components inside core `stwo`. The more credible issue is allocator churn from repeated allocate/drop cycles on the narrow access-pattern path, plus any higher-level witness generators outside this repo that keep component payloads alive before they ever reach PCS.
+
+- [x] Replace the generic file-backed mmap arena routing with an explicit lifted-Merkle contiguous-slot pool
+- [x] Route only `allocate_state_layer` / `allocate_hash_layer` through the dedicated slot pool and leave generic spill files on normal mmap
+- [x] Add focused tests for slot allocation/reuse semantics and run targeted prover verification
+
+## Review
+
+- Implemented an explicit lifted-Merkle contiguous-slot path in `crates/stwo/src/prover/spill.rs` via `ContiguousMappingPurpose` plus a Darwin-only `merkle_slot_pool` with separate state/hash pools. Generic `FileBackedMapping::map_named_temp_file(...)` no longer routes large file-backed mappings into the threshold-based arena.
+- `allocate_state_layer` now requests a reserved contiguous mapping explicitly through `MmapVec::uninitialized_for_contiguous_mapping(..., LiftedMerkleState)`, and `mmap_blake2s_hash_layer` does the same only for `>= 128 MiB` top hash layers via `LiftedMerkleHash`.
+- This keeps the short-lived `256 MiB` state / `128 MiB` top-hash mappings on stable reusable addresses across proofs while leaving coefficient spills and `spill_eval_columns` on normal `MAP_SHARED` mmaps, which is the split suggested by the simulator lifetime analysis.
+- Updated the eval-spill batch documentation in `crates/stwo/src/prover/backend/simd/circle.rs` so it no longer claims the 128 MiB default exists to feed the generic arena path.
+- Focused verification passed:
+- `cargo test -p stwo --features prover reserve_release_reuses_slot -- --nocapture`
+- `cargo test -p stwo --features prover reserve_rejects_oversized_request -- --nocapture`
+- `cargo test -p stwo --features prover test_build_first_layer_above_leaves_matches_default -- --nocapture`
+- `cargo test -p stwo --features prover test_checkpointed_decommitment_matches_full_tree -- --nocapture`
+- `cargo check -p stwo --features prover`
+- Risk/limitation: the old threshold arena implementation is still present but inactive and marked `#[allow(dead_code)]`. The new slot pools default to `2 x 256 MiB` state slots and `2 x 128 MiB` hash slots; if device logs later show true concurrent demand above that, the slot counts should be raised via env vars rather than resurrecting the generic arena routing.
+
+- [x] Inspect the updated simulator run after the Merkle-slot split and confirm the new mappings stay isolated from generic spill traffic
+- [x] Record what the simulator behavior implies for physical-device risk
+
+## Review
+
+- The updated simulator log at `/Users/lucas/mobile-stwo/rust/log.txt` shows the new structure working as intended: `MERKLE_SLOT_POOL reserved` appears once for `state` (`2 x 256 MiB`) and once for `hash` (`2 x 128 MiB`), and every large lifted-Merkle allocation now logs as `MERKLE_SLOT_ALLOC` / `MERKLE_SLOT_DEALLOC`.
+- I did not find any `MERKLE_SLOT_RESERVE_FAIL`, `MERKLE_SLOT_MAP_FAIL`, or `MERKLE_SLOT_FALLBACK` lines in that run, and I also did not find any `ARENA_ALLOC` / `ARENA_RESERVE_FAIL` events. That means the old threshold-based arena path is effectively out of the hot path in this workload.
+- The slot usage pattern is narrow and stable: every observed `256 MiB` state and `128 MiB` hash allocation reused `slot_idx=0` and deallocated almost immediately, with no evidence of overlapping demand that would require more than one live state slot or one live hash slot in this simulator run.
+- Generic spill traffic stayed on normal file-backed mmaps as intended. `MMAP_STATS [after spill_eval_columns]` peaked at `45` active mmaps / about `3.28 GiB`, while the proof still cleaned up to `MMAP_STATS [ffi:after_block_on] active_mmaps=0 active_bytes=0.0 MB` at the end.
+- This makes the structure much more plausible on device: the reserved contiguous VA is now protecting only the short-lived lifted-Merkle working set instead of all large spill files. The remaining unproven risk is that physical iOS may still be sensitive to the many ordinary spill mmaps or to unrelated heap VA churn, which the simulator cannot falsify because its user VA is effectively unconstrained.
+
+- [x] Inspect the first physical-device run and verify whether it is exercising the new slot-pool build or an older arena build
+- [x] Record the concrete device-side failure mode from that log
+
+## Review
+
+- The physical-device log at `/Users/lucas/mobile-stwo/log_physical.txt` is not a validation run for the new Merkle-slot design. It contains `ARENA_ALLOC` / `ARENA_DEALLOC` events and no `MERKLE_SLOT_*` events at all, so the binary on device is still using the old threshold-based arena path.
+- The caller paths in that log point at Cargo's git checkout (`/Users/lucaslevy/.cargo/git/checkouts/stwo-742401397d942f54/166ed41/...`) rather than the local edited workspace, which strongly suggests the app was built against the pinned git dependency instead of this patched checkout.
+- The device still fails for the same broad reason as before: virtual address space is essentially exhausted during the base-trace commitment window. By `VM_WALK [tree_builder:commit]`, `gaps_ge_256mb=0`, `gaps_ge_128mb=0`, `gaps_ge_64mb=0`, and the largest remaining user gap is only `56.0 MiB`; by `VM_WALK [alloc_error]`, the largest user gap has collapsed to `3.5 MiB` with only `88.6 MiB` free in aggregate.
+- The actual aborting request in this run is `ALLOC_FAILURE size=2097152 align=64`, so this specific crash is no longer "cannot find one 256 MiB hole"; it is "the old arena plus heap/mmap fragmentation filled user VA so aggressively that even a 2 MiB aligned allocation fails late in the phase."
+- Conclusion: this physical log does not invalidate the slot-pool design. It shows the device never ran that design. The next required step is to rebuild the mobile app against the patched `stwo` source and rerun the same warm-process scenario; only then can the physical-device log answer whether the structural fix is sufficient.
