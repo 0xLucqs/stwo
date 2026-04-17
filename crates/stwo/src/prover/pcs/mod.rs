@@ -36,6 +36,41 @@ use crate::prover::vcs_lifted::prover::{CheckpointedMerkleProverLifted, MerklePr
 
 pub mod quotient_ops;
 
+#[cfg(any(test, target_os = "ios"))]
+fn direct_mmap_layout_bytes(layout: &crate::prover::spill::EvalColumnLayout) -> usize {
+    layout.logical_len * std::mem::size_of::<BaseField>()
+}
+
+#[cfg(any(test, target_os = "ios"))]
+fn direct_mmap_total_layout_bytes(layouts: &[crate::prover::spill::EvalColumnLayout]) -> usize {
+    layouts.iter().map(direct_mmap_layout_bytes).sum()
+}
+
+#[cfg(test)]
+static DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(test, target_os = "ios"))]
+fn try_mmap_eval_column_chunk(
+    layouts: &[crate::prover::spill::EvalColumnLayout],
+) -> std::io::Result<(
+    Vec<crate::prover::backend::simd::column::BaseColumn>,
+    crate::prover::spill::EvalMmapGuard,
+)> {
+    #[cfg(test)]
+    {
+        let fail_min_columns =
+            DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if fail_min_columns != 0 && layouts.len() >= fail_min_columns {
+            return Err(std::io::Error::other(format!(
+                "test hook: forced direct mmap failure for {} columns",
+                layouts.len()
+            )));
+        }
+    }
+
+    crate::prover::spill::mmap_eval_column_chunk(layouts)
+}
+
 /// Spills in-memory polynomial coefficients to a memory-mapped temporary file.
 ///
 /// This moves coefficient data from anonymous heap pages (which count toward `phys_footprint`)
@@ -518,8 +553,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     pub fn materialize_access_pattern_evaluations(
         &mut self,
         access_pattern: Option<&TraceEvalAccessPattern>,
-    )
-    where
+    ) where
         // Needed because `materialize_evaluations_low_memory` (called below
         // in the LowMemory branch) has an iOS-specialised SimdBackend path
         // that names `CommitmentTreeProver<SimdBackend, MC>`. See its own
@@ -1207,8 +1241,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         &mut self,
         twiddles: &TwiddleTree<B>,
         base_column_pool: &BaseColumnPool<B>,
-    )
-    where
+    ) where
         // Required so the iOS-only SimdBackend-specialised branch below can
         // cast to `CommitmentTreeProver<SimdBackend, MC>` (which itself
         // requires `SimdBackend: BackendForChannel<MC>` to be a valid type).
@@ -1521,7 +1554,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(test, target_os = "ios"))]
 impl<MC: MerkleChannel> CommitmentTreeProver<crate::prover::backend::simd::SimdBackend, MC>
 where
     crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
@@ -1596,7 +1629,20 @@ where
         let layouts = std::mem::take(batch_layouts);
         *batch_bytes = 0;
 
-        match crate::prover::spill::mmap_eval_column_chunk(&layouts) {
+        self.materialize_direct_mmap_layouts(&layouts, twiddles, base_column_pool);
+    }
+
+    fn materialize_direct_mmap_layouts(
+        &mut self,
+        layouts: &[crate::prover::spill::EvalColumnLayout],
+        twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
+        base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
+    ) {
+        if layouts.is_empty() {
+            return;
+        }
+
+        match try_mmap_eval_column_chunk(layouts) {
             Ok((columns, guard)) => {
                 for (layout, column) in layouts.iter().zip(columns.into_iter()) {
                     let evals = self.polynomials[layout.idx]
@@ -1606,22 +1652,54 @@ where
                 self.eval_mmap_guards.push(guard);
             }
             Err(e) => {
-                tracing::warn!(
-                    "Direct eval mmap materialization failed for {} columns ({:.1} MB): {e}. Falling back to heap-backed recomputation.",
-                    layouts.len(),
-                    layouts
-                        .iter()
-                        .map(|layout| layout.logical_len * std::mem::size_of::<BaseField>())
-                        .sum::<usize>() as f64
-                        / (1024.0 * 1024.0),
-                );
-                for layout in layouts {
-                    let evals = self.polynomials[layout.idx]
-                        .materialize_evaluation(twiddles, base_column_pool);
-                    self.polynomials[layout.idx].evals = Some(evals);
+                if layouts.len() > 1 {
+                    let split_idx = Self::split_direct_mmap_layouts(layouts);
+                    let left = &layouts[..split_idx];
+                    let right = &layouts[split_idx..];
+                    tracing::warn!(
+                        "Direct eval mmap materialization failed for {} columns ({:.1} MB): {e}. Retrying as smaller mmap batches of {} ({:.1} MB) and {} ({:.1} MB).",
+                        layouts.len(),
+                        direct_mmap_total_layout_bytes(layouts) as f64 / (1024.0 * 1024.0),
+                        left.len(),
+                        direct_mmap_total_layout_bytes(left) as f64 / (1024.0 * 1024.0),
+                        right.len(),
+                        direct_mmap_total_layout_bytes(right) as f64 / (1024.0 * 1024.0),
+                    );
+                    self.materialize_direct_mmap_layouts(left, twiddles, base_column_pool);
+                    self.materialize_direct_mmap_layouts(right, twiddles, base_column_pool);
+                    return;
                 }
+
+                let layout = layouts[0];
+                tracing::warn!(
+                    "Direct eval mmap materialization failed for poly {} ({:.1} MB): {e}. Falling back to heap-backed recomputation.",
+                    layout.idx,
+                    direct_mmap_layout_bytes(&layout) as f64 / (1024.0 * 1024.0),
+                );
+                let evals =
+                    self.polynomials[layout.idx].materialize_evaluation(twiddles, base_column_pool);
+                self.polynomials[layout.idx].evals = Some(evals);
             }
         }
+    }
+
+    fn split_direct_mmap_layouts(layouts: &[crate::prover::spill::EvalColumnLayout]) -> usize {
+        debug_assert!(
+            layouts.len() > 1,
+            "split_direct_mmap_layouts requires at least two layouts"
+        );
+
+        let target_bytes = direct_mmap_total_layout_bytes(layouts).div_ceil(2);
+        let mut accumulated_bytes = 0usize;
+
+        for split_idx in 1..layouts.len() {
+            accumulated_bytes += direct_mmap_layout_bytes(&layouts[split_idx - 1]);
+            if accumulated_bytes >= target_bytes {
+                return split_idx;
+            }
+        }
+
+        layouts.len() / 2
     }
 }
 
@@ -1657,6 +1735,8 @@ fn print_polynomial_size_histogram<B: BackendForChannel<MC>, MC: MerkleChannel>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use itertools::Itertools;
 
     use super::{
@@ -1665,8 +1745,9 @@ mod tests {
         set_low_memory_materialize_budget_bytes, CommitmentTreeMerkleProver, CommitmentTreeProver,
         ProverMemoryMode, DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
         DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP, DEFAULT_PROVER_MEMORY_MODE_OVERRIDE,
-        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE, PROVER_MEMORY_MODE_OVERRIDE_FAST,
-        PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY, PROVER_MEMORY_MODE_OVERRIDE_UNSET,
+        DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE, LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE,
+        PROVER_MEMORY_MODE_OVERRIDE_FAST, PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
+        PROVER_MEMORY_MODE_OVERRIDE_UNSET,
     };
     use crate::core::channel::MerkleChannel;
     use crate::core::fields::m31::M31;
@@ -2200,5 +2281,57 @@ mod tests {
             checkpointed_decommitment.aux.all_node_values,
             fast_decommitment.aux.all_node_values
         );
+    }
+
+    #[test]
+    fn test_direct_mmap_materialization_retries_smaller_batches_before_heap_fallback() {
+        struct DirectMmapFailOverrideGuard(usize);
+
+        impl Drop for DirectMmapFailOverrideGuard {
+            fn drop(&mut self) {
+                DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE.store(self.0, Ordering::Release);
+            }
+        }
+
+        let override_guard = DirectMmapFailOverrideGuard(
+            DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE.swap(4, Ordering::AcqRel),
+        );
+
+        let pool = BaseColumnPool::<SimdBackend>::new();
+        let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
+        let mut retried_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+        let mut eager_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
+
+        eager_tree.materialize_evaluations(&twiddles, &pool);
+        retried_tree.materialize_evaluations_low_memory_direct_mmap(&twiddles, &pool);
+        drop(override_guard);
+
+        assert!(
+            retried_tree
+                .polynomials
+                .iter()
+                .all(|poly| poly.evals.is_some()),
+            "retry path must still materialize every polynomial"
+        );
+        assert!(
+            retried_tree.eval_mmap_guards.len() > 1,
+            "forced initial mmap failure should split the batch into multiple mmap guards"
+        );
+
+        for (idx, (retried, eager)) in retried_tree
+            .polynomials
+            .iter()
+            .zip(eager_tree.polynomials.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                retried.evals.as_ref().unwrap().values.to_cpu(),
+                eager.evals.as_ref().unwrap().values.to_cpu(),
+                "split retry path must preserve eval bytes at poly index {idx}"
+            );
+        }
+
+        retried_tree.drop_evaluations();
+        eager_tree.drop_evaluations();
     }
 }
