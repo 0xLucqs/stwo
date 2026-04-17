@@ -457,7 +457,10 @@ mod mmap_arena {
             self.free_ranges.iter().map(|r| r.len).max().unwrap_or(0)
         }
 
-        fn reserve(&mut self, requested_len: usize) -> Option<ArenaLease> {
+        /// Reserves a range inside the arena. Returns `(offset, alloc_len)`
+        /// for the caller to wrap into an `ArenaLease` (which also captures
+        /// the originating call site for diagnostics).
+        fn reserve(&mut self, requested_len: usize) -> Option<(usize, usize)> {
             let alloc_len = align_up(requested_len, self.page_size);
             let idx = self
                 .free_ranges
@@ -470,7 +473,7 @@ mod mmap_arena {
                 self.free_ranges.remove(idx);
             }
             super::ARENA_USED_BYTES.fetch_add(alloc_len, super::Ordering::Relaxed);
-            Some(ArenaLease { offset, alloc_len })
+            Some((offset, alloc_len))
         }
 
         fn release(&mut self, offset: usize, alloc_len: usize) {
@@ -498,13 +501,26 @@ mod mmap_arena {
     pub struct ArenaLease {
         offset: usize,
         alloc_len: usize,
+        /// File:line of the caller that created this lease. Preserved so the
+        /// ARENA_DEALLOC log at drop time reports where the mapping originally
+        /// came from, not the location of the drop itself.
+        caller: &'static std::panic::Location<'static>,
     }
 
+    #[track_caller]
     pub fn try_map_file(
         file: &NamedTempFile,
         byte_len: usize,
         prot: i32,
     ) -> std::io::Result<Option<(*mut libc::c_void, ArenaLease)>> {
+        // `#[track_caller]` walks up the call stack past any track_caller frame
+        // so the caller we capture is the first non-track_caller function --
+        // i.e. the actual stwo call site (FileBackedMapping::map_named_temp_file
+        // transitively resolves to its caller, MmapVec::uninitialized similarly,
+        // etc.). Lets a post-analysis pass classify every ARENA_* event by
+        // which stwo code path produced it without threading a class name
+        // through every signature.
+        let caller = std::panic::Location::caller();
         if byte_len == 0 {
             return Ok(None);
         }
@@ -512,13 +528,13 @@ mod mmap_arena {
             return Ok(None);
         };
 
-        let (lease, used_after_reserve, largest_free) = {
+        let (offset, alloc_len, used_after_reserve, largest_free) = {
             let mut state = arena.lock().expect("mmap arena mutex poisoned");
             match state.reserve(byte_len) {
-                Some(lease) => {
+                Some((offset, alloc_len)) => {
                     let used = super::ARENA_USED_BYTES.load(super::Ordering::Relaxed);
                     let largest = state.largest_free_bytes();
-                    (lease, used, largest)
+                    (offset, alloc_len, used, largest)
                 }
                 None => {
                     // Reserve failed -- log what we had to offer so the next
@@ -531,12 +547,20 @@ mod mmap_arena {
                     let largest = state.largest_free_bytes();
                     let n_ranges = state.free_ranges.len();
                     eprintln!(
-                        "ARENA_RESERVE_FAIL size={byte_len} used={used} total={total} \
-                         total_free={total_free} largest_free={largest} free_ranges={n_ranges}"
+                        "ARENA_RESERVE_FAIL size={byte_len} caller={}:{} used={used} total={total} \
+                         total_free={total_free} largest_free={largest} free_ranges={n_ranges}",
+                        caller.file(),
+                        caller.line()
                     );
                     return Ok(None);
                 }
             }
+        };
+
+        let lease = ArenaLease {
+            offset,
+            alloc_len,
+            caller,
         };
 
         let addr = arena_addr(lease.offset);
@@ -554,8 +578,13 @@ mod mmap_arena {
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
             eprintln!(
-                "ARENA_MAP_FAIL offset={} alloc_len={} size={} prot={} err={err}",
-                lease.offset, lease.alloc_len, byte_len, prot
+                "ARENA_MAP_FAIL offset={} alloc_len={} size={} prot={} caller={}:{} err={err}",
+                lease.offset,
+                lease.alloc_len,
+                byte_len,
+                prot,
+                caller.file(),
+                caller.line()
             );
             if let Some(arena) = arena_state() {
                 let mut state = arena.lock().expect("mmap arena mutex poisoned");
@@ -566,8 +595,15 @@ mod mmap_arena {
 
         let total = super::ARENA_TOTAL_BYTES.load(super::Ordering::Relaxed);
         eprintln!(
-            "ARENA_ALLOC offset={} alloc_len={} size={} used={}/{} largest_free_after={}",
-            lease.offset, lease.alloc_len, byte_len, used_after_reserve, total, largest_free
+            "ARENA_ALLOC offset={} alloc_len={} size={} caller={}:{} used={}/{} largest_free_after={}",
+            lease.offset,
+            lease.alloc_len,
+            byte_len,
+            caller.file(),
+            caller.line(),
+            used_after_reserve,
+            total,
+            largest_free
         );
         Ok(Some((ptr, lease)))
     }
@@ -603,8 +639,13 @@ mod mmap_arena {
             let used = super::ARENA_USED_BYTES.load(super::Ordering::Relaxed);
             let total = super::ARENA_TOTAL_BYTES.load(super::Ordering::Relaxed);
             eprintln!(
-                "ARENA_DEALLOC offset={} alloc_len={} used={}/{}",
-                self.offset, self.alloc_len, used, total
+                "ARENA_DEALLOC offset={} alloc_len={} caller={}:{} used={}/{}",
+                self.offset,
+                self.alloc_len,
+                self.caller.file(),
+                self.caller.line(),
+                used,
+                total
             );
         }
     }
@@ -785,6 +826,10 @@ fn arena_file_backed_min_bytes() -> usize {
 }
 
 impl FileBackedMapping {
+    // `#[track_caller]` so the Location captured inside `try_map_file` skips
+    // this frame and identifies the actual stwo consumer (MmapVec::uninitialized
+    // caller, spill_eval_columns, mmap_blake2s_hash_layer, etc.).
+    #[track_caller]
     #[cfg(unix)]
     fn map_named_temp_file(
         file: NamedTempFile,
@@ -843,6 +888,7 @@ impl FileBackedMapping {
         })
     }
 
+    #[track_caller]
     #[cfg(not(unix))]
     fn map_named_temp_file(
         _file: NamedTempFile,
@@ -1032,6 +1078,10 @@ unsafe impl<T: Pod> Sync for MmapVec<T> {}
 
 impl<T: Pod> MmapVec<T> {
     /// Creates a file-backed mmap of uninitialized storage for `len` elements.
+    // `#[track_caller]` so the caller captured inside `try_map_file` points to
+    // the actual stwo site (e.g. `allocate_state_layer` in blake2s_lifted.rs),
+    // not to this helper.
+    #[track_caller]
     #[cfg(unix)]
     pub fn uninitialized(len: usize) -> std::io::Result<Self> {
         let byte_len = len * std::mem::size_of::<T>();
@@ -1061,6 +1111,7 @@ impl<T: Pod> MmapVec<T> {
     }
 
     /// Allocates uninitialized backing storage on non-Unix platforms.
+    #[track_caller]
     #[cfg(not(unix))]
     pub fn uninitialized(len: usize) -> std::io::Result<Self> {
         #[allow(clippy::uninit_vec)]
@@ -1076,6 +1127,7 @@ impl<T: Pod> MmapVec<T> {
     ///
     /// Writes the Vec's data to a temp file, mmaps it, and returns the mmap-backed view.
     /// The original Vec's memory is freed.
+    #[track_caller]
     #[cfg(unix)]
     pub fn from_vec(data: Vec<T>) -> std::io::Result<Self> {
         let len = data.len();
@@ -1112,6 +1164,7 @@ impl<T: Pod> MmapVec<T> {
     }
 
     /// No-op on non-Unix: just wraps the Vec data.
+    #[track_caller]
     #[cfg(not(unix))]
     pub fn from_vec(data: Vec<T>) -> std::io::Result<Self> {
         let len = data.len();
@@ -1198,6 +1251,7 @@ impl EvalMmapGuard {
     }
 }
 
+#[track_caller]
 pub fn mmap_base_column(
     length: usize,
 ) -> std::io::Result<(
@@ -1232,6 +1286,7 @@ pub fn mmap_base_column(
     ))
 }
 
+#[track_caller]
 pub fn mmap_secure_column_by_coords(
     length: usize,
 ) -> std::io::Result<(
@@ -1276,6 +1331,7 @@ pub fn mmap_secure_column_by_coords(
     ))
 }
 
+#[track_caller]
 pub fn mmap_blake2s_hash_layer(
     length: usize,
 ) -> std::io::Result<(
