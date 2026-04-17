@@ -138,6 +138,7 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// `32 MiB` eval columns heap-backed long enough to run out of user VA even after the lifted
 /// Merkle `256/128 MiB` contiguous-hole issue was fixed. So iOS defaults to immediate spill
 /// (`1` byte budget) unless the embedding app overrides it explicitly.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP: usize = 2 << 30;
 #[cfg(target_os = "ios")]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 1;
@@ -517,7 +518,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     pub fn materialize_access_pattern_evaluations(
         &mut self,
         access_pattern: Option<&TraceEvalAccessPattern>,
-    ) {
+    )
+    where
+        // Needed because `materialize_evaluations_low_memory` (called below
+        // in the LowMemory branch) has an iOS-specialised SimdBackend path
+        // that names `CommitmentTreeProver<SimdBackend, MC>`. See its own
+        // where clause for the full rationale. In practice all MCs used
+        // with the prover satisfy this bound.
+        crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+    {
         let low_memory = self.memory_mode == ProverMemoryMode::LowMemory;
         match access_pattern {
             Some(access_pattern) => {
@@ -637,7 +646,13 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         mut self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
         channel: &mut MC::C,
-    ) -> ExtendedCommitmentSchemeProof<MC::H> {
+    ) -> ExtendedCommitmentSchemeProof<MC::H>
+    where
+        // Same reasoning as `materialize_access_pattern_evaluations`: the
+        // decommit path calls `materialize_evaluations_low_memory` which
+        // requires this bound for its iOS SimdBackend specialisation.
+        crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+    {
         phase_memory_checkpoint("pcs:prove_values:start");
         // Evaluate polynomials on open points.
         let span = span!(
@@ -1192,13 +1207,22 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         &mut self,
         twiddles: &TwiddleTree<B>,
         base_column_pool: &BaseColumnPool<B>,
-    ) {
+    )
+    where
+        // Required so the iOS-only SimdBackend-specialised branch below can
+        // cast to `CommitmentTreeProver<SimdBackend, MC>` (which itself
+        // requires `SimdBackend: BackendForChannel<MC>` to be a valid type).
+        // In practice the prover is always used with SimdBackend + a channel
+        // that implements BackendForChannel, so this bound is never
+        // restrictive in real call sites.
+        crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+    {
         #[cfg(target_os = "ios")]
         if std::any::type_name::<B>()
             == std::any::type_name::<crate::prover::backend::simd::SimdBackend>()
         {
             let self_ptr = self as *mut Self
-                as *mut CommitmentTreeProver<crate::prover::backend::simd::SimdBackend>;
+                as *mut CommitmentTreeProver<crate::prover::backend::simd::SimdBackend, MC>;
             let twiddles_ptr = twiddles as *const TwiddleTree<B>
                 as *const TwiddleTree<crate::prover::backend::simd::SimdBackend>;
             let pool_ptr = base_column_pool as *const BaseColumnPool<B>
@@ -1498,7 +1522,10 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
 }
 
 #[cfg(target_os = "ios")]
-impl<MC: MerkleChannel> CommitmentTreeProver<crate::prover::backend::simd::SimdBackend, MC> {
+impl<MC: MerkleChannel> CommitmentTreeProver<crate::prover::backend::simd::SimdBackend, MC>
+where
+    crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+{
     fn materialize_evaluations_low_memory_direct_mmap(
         &mut self,
         twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,

@@ -63,7 +63,11 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
     commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
-) -> Result<StarkProof<MC::H>, ProvingError> {
+) -> Result<StarkProof<MC::H>, ProvingError>
+where
+    // Propagated from `prove_ex`. All MCs used with the prover satisfy this.
+    crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+{
     Ok(prove_ex(components, channel, commitment_scheme, false)?.proof)
 }
 
@@ -73,7 +77,14 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     channel: &mut MC::C,
     mut commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
     include_all_preprocessed_columns: bool,
-) -> Result<ExtendedStarkProof<MC::H>, ProvingError> {
+) -> Result<ExtendedStarkProof<MC::H>, ProvingError>
+where
+    // Propagated from `materialize_access_pattern_evaluations` and
+    // `prove_values`, which call into the iOS-specialised SimdBackend
+    // materialize path. In practice all MCs used with the prover satisfy
+    // this bound.
+    crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+{
     let _memory_session = PhaseMemorySession::start("prove_ex");
     phase_memory_checkpoint("prove_ex:start");
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
