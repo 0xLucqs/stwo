@@ -153,7 +153,7 @@ impl SimdBackend {
 ///
 /// Override via `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` (e.g. `1048576` to restore the
 /// historical 1 MiB value for regression comparison).
-const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 128 << 20;
+const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 1 << 20;
 
 /// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`].
 const LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV: &str = "STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES";
