@@ -574,10 +574,18 @@ impl PolyOps for SimdBackend {
             let cpu_poly: CircleCoefficients<CpuBackend> =
                 CircleCoefficients::new(poly.coeffs.to_cpu());
             let cpu_eval = cpu_poly.evaluate(domain);
-            return CircleEvaluation::new(
-                cpu_eval.domain,
-                Col::<SimdBackend, BaseField>::from_iter(cpu_eval.values),
-            );
+            // Write the CPU-computed evals into the caller-provided `buffer`
+            // instead of allocating a fresh `Col` from iter. The caller owns
+            // the storage and, in the iOS low-memory path, that storage may
+            // be mmap-backed (arena). Dropping the old `buffer` and returning
+            // a new heap `Col` would invoke `Vec::drop` on mmap memory and
+            // abort with
+            //     malloc: *** error for object 0x...: pointer being freed was
+            //     not allocated
+            // when the eval is eventually released.
+            assert_eq!(cpu_eval.values.len(), buffer.len());
+            buffer.as_mut_slice().copy_from_slice(&cpu_eval.values);
+            return CircleEvaluation::new(cpu_eval.domain, buffer);
         }
 
         let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
