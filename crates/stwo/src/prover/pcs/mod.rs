@@ -131,13 +131,19 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// effectively equivalent to the eager `materialize_evaluations` path.
 ///
 /// Raising this budget trades RAM for wall-clock: each mmap flush costs a file write, a
-/// sync, and a mmap call (tens of ms per column on mobile flash). A 2 GiB default lets a
-/// privacy-demo-size phone workload complete with effectively zero spills during the tail
-/// phase, when the initial commit spike has already been released and the jetsam budget has
-/// opened back up. Devices with less than ~3 GiB of app budget should override via
-/// [`set_low_memory_materialize_budget_bytes`] or
-/// `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`.
-const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 2 << 30;
+/// sync, and a mmap call (tens of ms per column on mobile flash). Desktop-class targets keep
+/// a 2 GiB default so the tail phase can often avoid re-spill I/O entirely once the early
+/// commitment peak is gone. Physical iOS runs, however, proved much more sensitive to late
+/// anonymous rematerialization churn: the 2 GiB budget let low-memory PCS keep re-materialized
+/// `32 MiB` eval columns heap-backed long enough to run out of user VA even after the lifted
+/// Merkle `256/128 MiB` contiguous-hole issue was fixed. So iOS defaults to immediate spill
+/// (`1` byte budget) unless the embedding app overrides it explicitly.
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP: usize = 2 << 30;
+#[cfg(target_os = "ios")]
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 1;
+#[cfg(not(target_os = "ios"))]
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize =
+    DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP;
 
 /// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
 const LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV: &str = "STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES";
@@ -1512,7 +1518,8 @@ mod tests {
         default_prover_memory_mode, parse_low_memory_materialize_budget_bytes,
         parse_prover_memory_mode, set_default_prover_memory_mode,
         set_low_memory_materialize_budget_bytes, CommitmentTreeMerkleProver, CommitmentTreeProver,
-        ProverMemoryMode, DEFAULT_PROVER_MEMORY_MODE_OVERRIDE,
+        ProverMemoryMode, DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+        DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP, DEFAULT_PROVER_MEMORY_MODE_OVERRIDE,
         LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE, PROVER_MEMORY_MODE_OVERRIDE_FAST,
         PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY, PROVER_MEMORY_MODE_OVERRIDE_UNSET,
     };
@@ -1928,6 +1935,18 @@ mod tests {
         assert_eq!(parse_low_memory_materialize_budget_bytes("abc"), None);
         assert_eq!(parse_low_memory_materialize_budget_bytes("1.5"), None);
         assert_eq!(parse_low_memory_materialize_budget_bytes("1MB"), None);
+    }
+
+    #[test]
+    fn test_platform_default_low_memory_materialize_budget_bytes() {
+        #[cfg(target_os = "ios")]
+        assert_eq!(DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES, 1);
+
+        #[cfg(not(target_os = "ios"))]
+        assert_eq!(
+            DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+            DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP
+        );
     }
 
     #[test]
