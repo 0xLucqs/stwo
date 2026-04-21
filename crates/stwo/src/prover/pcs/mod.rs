@@ -173,15 +173,21 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// size for that direct-mmap path and the fallback heap budget for any non-SIMD callers. The old
 /// `1`-byte iOS default was a diagnostic setting used before direct-mmap rematerialization
 /// existed; with extended VA enabled it is now too aggressive and creates unnecessary extra spill
-/// work. So iOS defaults to a modest 256 MiB rematerialization budget unless the embedding app
+/// work. So iOS defaults to a modest 64 MiB rematerialization budget unless the embedding app
 /// overrides it explicitly.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP: usize = 2 << 30;
 #[cfg(target_os = "ios")]
-const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 256 << 20;
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 64 << 20;
 #[cfg(not(target_os = "ios"))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize =
     DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP;
+
+#[cfg(target_os = "ios")]
+const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = 64 << 20;
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+#[cfg(not(target_os = "ios"))]
+const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = crate::prover::spill::EVAL_SPILL_CHUNK_BYTES;
 
 /// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
 const LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV: &str = "STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES";
@@ -1567,7 +1573,7 @@ where
         base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
     ) {
         let target_batch_bytes =
-            low_memory_materialize_budget_bytes().max(crate::prover::spill::EVAL_SPILL_CHUNK_BYTES);
+            low_memory_materialize_budget_bytes().max(DIRECT_MMAP_BATCH_FLOOR_BYTES);
         let mut batch_layouts = Vec::new();
         let mut batch_bytes = 0usize;
 
