@@ -16,7 +16,7 @@ use crate::core::pcs::quotients::{
 use crate::core::pcs::utils::prepare_preprocessed_query_positions;
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
 use crate::core::poly::circle::CanonicCoset;
-use crate::core::utils::{bit_reverse_index, MaybeOwned};
+use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
 use crate::core::verifier::PREPROCESSED_TRACE_IDX;
@@ -716,15 +716,17 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
         // of point samples.
         let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
+            let values = poly.eval_at_points(
+                points
+                    .iter()
+                    .map(|&point| point.repeated_double(lifting_log_size - poly.log_size())),
+                weights_hash_map.as_ref(),
+            );
             points
                 .iter()
-                .map(|&point| PointSample {
-                    point,
-                    value: poly.eval_at_point(
-                        point.repeated_double(lifting_log_size - poly.log_size()),
-                        weights_hash_map.as_ref(),
-                    ),
-                })
+                .copied()
+                .zip(values)
+                .map(|(point, value)| PointSample { point, value })
                 .collect_vec()
         };
 
@@ -1496,12 +1498,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         let max_log_size = self.commitment.height() as usize;
         self.polynomials
             .iter()
-            .map(|poly| {
-                queries
-                    .iter()
-                    .map(|&pos| self.sample_committed_position(poly, pos, max_log_size))
-                    .collect()
-            })
+            .map(|poly| poly.sample_committed_positions(queries, max_log_size))
             .collect()
     }
 
@@ -1515,50 +1512,25 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .sorted_by_key(|poly| poly.log_size())
             .collect_vec();
+        let sampled_values_by_poly = sorted_polynomials
+            .iter()
+            .map(|poly| poly.sample_committed_positions(positions, max_log_size))
+            .collect_vec();
 
         positions
             .iter()
-            .copied()
-            .map(|position| {
+            .enumerate()
+            .map(|(position_idx, &position)| {
                 let mut hasher = MC::H::default();
-                for chunk in &sorted_polynomials.iter().chunks(16) {
-                    let values = chunk
-                        .into_iter()
-                        .map(|poly| self.sample_committed_position(poly, position, max_log_size))
-                        .collect_vec();
-                    hasher.update_leaf(&values);
+                let mut scratch = Vec::with_capacity(16);
+                for chunk in sampled_values_by_poly.chunks(16) {
+                    scratch.clear();
+                    scratch.extend(chunk.iter().map(|values| values[position_idx]));
+                    hasher.update_leaf(&scratch);
                 }
                 (position, hasher.finalize())
             })
             .collect()
-    }
-
-    fn sample_committed_position(
-        &self,
-        poly: &Poly<B>,
-        query_position: usize,
-        max_log_size: usize,
-    ) -> BaseField {
-        let mapped_index =
-            Self::mapped_position(query_position, poly.log_size() as usize, max_log_size);
-        if let Some(evals) = &poly.evals {
-            evals.values.at(mapped_index)
-        } else {
-            assert!(
-                poly.has_coefficients(),
-                "low-memory PCS decommit requires retained coefficients (in memory or spilled)"
-            );
-            let point = poly
-                .eval_domain
-                .at(bit_reverse_index(mapped_index, poly.log_size()))
-                .into_ef::<SecureField>();
-            poly.eval_at_point(point, None).to_m31_array()[0]
-        }
-    }
-
-    fn mapped_position(query_position: usize, log_size: usize, max_log_size: usize) -> usize {
-        let shift = max_log_size - log_size;
-        (query_position >> (shift + 1) << 1) + (query_position & 1)
     }
 }
 
@@ -1761,6 +1733,9 @@ mod tests {
     use crate::core::fields::m31::M31;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use crate::prover::air::component_prover::{
+        reset_spilled_coefficient_load_count, spilled_coefficient_load_count,
+    };
     use crate::prover::backend::simd::SimdBackend;
     use crate::prover::backend::{BackendForChannel, Column, CpuBackend};
     use crate::prover::mempool::BaseColumnPool;
@@ -2288,6 +2263,27 @@ mod tests {
         assert_eq!(
             checkpointed_decommitment.aux.all_node_values,
             fast_decommitment.aux.all_node_values
+        );
+    }
+
+    #[test]
+    fn test_checkpointed_decommit_loads_each_spilled_poly_once_per_bulk_phase() {
+        let pool = BaseColumnPool::new();
+        let queries = [1, 7, 18, 33];
+
+        let checkpointed_tree = prepare_tree_with_memory_mode::<Blake2sMerkleChannel>(
+            &pool,
+            ProverMemoryMode::LowMemory,
+        );
+        let expected_loads = checkpointed_tree.polynomials.len() * 2;
+
+        reset_spilled_coefficient_load_count();
+        let _ = checkpointed_tree.decommit(&queries);
+
+        assert_eq!(
+            spilled_coefficient_load_count(),
+            expected_loads,
+            "checkpointed decommit should load each spilled polynomial once for queried values and once for leaf hashing"
         );
     }
 

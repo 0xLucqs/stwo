@@ -8,9 +8,10 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::{TreeSubspan, TreeVec};
 use crate::core::poly::circle::CircleDomain;
+use crate::core::utils::bit_reverse_index;
 use crate::core::ColumnVec;
 use crate::prover::air::accumulation::{DomainEvaluationAccumulator, EvaluationMode};
-use crate::prover::backend::{Backend, Col, ColumnOps};
+use crate::prover::backend::{Backend, Col, Column, ColumnOps};
 use crate::prover::memory::phase_memory_checkpoint;
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::circle::{
@@ -81,6 +82,20 @@ pub struct SpilledPolyCoeffs {
     pub log_size: u32,
 }
 
+#[cfg(test)]
+static SPILLED_COEFFICIENT_LOAD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_spilled_coefficient_load_count() {
+    SPILLED_COEFFICIENT_LOAD_COUNT.store(0, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn spilled_coefficient_load_count() -> usize {
+    SPILLED_COEFFICIENT_LOAD_COUNT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl<B: Backend> Poly<B> {
     pub fn new(
         coeffs: Option<CircleCoefficients<B>>,
@@ -132,6 +147,40 @@ impl<B: Backend> Poly<B> {
                     .get(&(self.log_size(), point))
                     .expect("weights should exist for all sampled points"),
             )
+        }
+    }
+
+    pub fn eval_at_points(
+        &self,
+        points: impl IntoIterator<Item = CirclePoint<SecureField>>,
+        weights_hash_map: Option<&WeightsHashMap<B>>,
+    ) -> Vec<SecureField>
+    where
+        B: ColumnOps<BaseField>,
+    {
+        if let Some(coeffs) = &self.coeffs {
+            points
+                .into_iter()
+                .map(|point| coeffs.eval_at_point(point))
+                .collect()
+        } else if let Some(spilled) = &self.spilled_coeffs {
+            let coeffs = Self::load_spilled_coefficients(spilled);
+            points
+                .into_iter()
+                .map(|point| coeffs.eval_at_point(point))
+                .collect()
+        } else {
+            points
+                .into_iter()
+                .map(|point| {
+                    self.evals().barycentric_eval_at_point(
+                        &weights_hash_map
+                            .unwrap()
+                            .get(&(self.log_size(), point))
+                            .expect("weights should exist for all sampled points"),
+                    )
+                })
+                .collect()
         }
     }
 
@@ -202,6 +251,36 @@ impl<B: Backend> Poly<B> {
         }
     }
 
+    pub fn sample_committed_positions(
+        &self,
+        query_positions: &[usize],
+        max_log_size: usize,
+    ) -> Vec<BaseField>
+    where
+        B: ColumnOps<BaseField>,
+    {
+        if let Some(evals) = &self.evals {
+            query_positions
+                .iter()
+                .map(|&query_position| {
+                    let mapped_index = Self::mapped_position(
+                        query_position,
+                        self.log_size() as usize,
+                        max_log_size,
+                    );
+                    evals.values.at(mapped_index)
+                })
+                .collect()
+        } else if let Some(coeffs) = &self.coeffs {
+            self.sample_committed_positions_from_coeffs(coeffs, query_positions, max_log_size)
+        } else if let Some(spilled) = &self.spilled_coeffs {
+            let coeffs = Self::load_spilled_coefficients(spilled);
+            self.sample_committed_positions_from_coeffs(&coeffs, query_positions, max_log_size)
+        } else {
+            panic!("low-memory PCS decommit requires retained coefficients (in memory or spilled)");
+        }
+    }
+
     fn materialize_evaluation_into_buffer(
         &self,
         twiddles: &TwiddleTree<B>,
@@ -222,6 +301,9 @@ impl<B: Backend> Poly<B> {
     where
         B: ColumnOps<BaseField>,
     {
+        #[cfg(test)]
+        SPILLED_COEFFICIENT_LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
         let coeff_len = 1usize << spilled.log_size;
         if std::any::type_name::<B>()
             == std::any::type_name::<crate::prover::backend::simd::SimdBackend>()
@@ -249,6 +331,31 @@ impl<B: Backend> Poly<B> {
             let col = Col::<B, BaseField>::from_iter(base_fields.iter().copied());
             CircleCoefficients::new(col)
         }
+    }
+
+    fn sample_committed_positions_from_coeffs(
+        &self,
+        coeffs: &CircleCoefficients<B>,
+        query_positions: &[usize],
+        max_log_size: usize,
+    ) -> Vec<BaseField> {
+        query_positions
+            .iter()
+            .map(|&query_position| {
+                let mapped_index =
+                    Self::mapped_position(query_position, self.log_size() as usize, max_log_size);
+                let point = self
+                    .eval_domain
+                    .at(bit_reverse_index(mapped_index, self.log_size()))
+                    .into_ef::<SecureField>();
+                coeffs.eval_at_point(point).to_m31_array()[0]
+            })
+            .collect()
+    }
+
+    const fn mapped_position(query_position: usize, log_size: usize, max_log_size: usize) -> usize {
+        let shift = max_log_size - log_size;
+        (query_position >> (shift + 1) << 1) + (query_position & 1)
     }
 }
 
@@ -293,5 +400,63 @@ impl<B: Backend> ComponentProvers<'_, B> {
         }
         phase_memory_checkpoint("composition:after_constraint_accumulation");
         accumulator.finalize(twiddles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::fields::m31::M31;
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::prover::backend::CpuBackend;
+    use crate::prover::poly::circle::CircleCoefficients;
+    use crate::prover::spill::CoefficientSpillFile;
+
+    use super::{reset_spilled_coefficient_load_count, spilled_coefficient_load_count, Poly};
+
+    fn make_spilled_cpu_poly(log_size: u32) -> Poly<CpuBackend> {
+        let coeffs = CircleCoefficients::<CpuBackend>::new(
+            (0..1u32 << log_size).map(M31::from).collect(),
+        );
+        let evals = coeffs.clone().evaluate(CanonicCoset::new(log_size).circle_domain());
+
+        let mut spill = CoefficientSpillFile::new().unwrap();
+        let spill_index = spill.write_coefficients(&coeffs.coeffs).unwrap();
+        let spill_file = spill.freeze().unwrap();
+
+        let mut poly = Poly::new(Some(coeffs), evals);
+        poly.coeffs = None;
+        poly.evals = None;
+        poly.spilled_coeffs = Some(super::SpilledPolyCoeffs {
+            spill_file,
+            spill_index,
+            log_size,
+        });
+        poly
+    }
+
+    #[test]
+    fn spilled_poly_eval_at_points_loads_coefficients_once() {
+        let poly = make_spilled_cpu_poly(4);
+        let domain = CanonicCoset::new(4).circle_domain();
+        let points = (0..4)
+            .map(|i| domain.at(i).into_ef())
+            .collect::<Vec<_>>();
+
+        reset_spilled_coefficient_load_count();
+        let values = poly.eval_at_points(points.iter().copied(), None);
+
+        assert_eq!(values.len(), points.len());
+        assert_eq!(spilled_coefficient_load_count(), 1);
+    }
+
+    #[test]
+    fn spilled_poly_sample_committed_positions_loads_coefficients_once() {
+        let poly = make_spilled_cpu_poly(4);
+
+        reset_spilled_coefficient_load_count();
+        let values = poly.sample_committed_positions(&[1, 3, 7, 9], 4);
+
+        assert_eq!(values.len(), 4);
+        assert_eq!(spilled_coefficient_load_count(), 1);
     }
 }
