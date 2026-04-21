@@ -168,15 +168,17 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// Raising this budget trades RAM for wall-clock: each mmap flush costs a file write, a
 /// sync, and a mmap call (tens of ms per column on mobile flash). Desktop-class targets keep
 /// a 2 GiB default so the tail phase can often avoid re-spill I/O entirely once the early
-/// commitment peak is gone. Physical iOS runs, however, proved much more sensitive to late
-/// anonymous rematerialization churn: the 2 GiB budget let low-memory PCS keep re-materialized
-/// `32 MiB` eval columns heap-backed long enough to run out of user VA even after the lifted
-/// Merkle `256/128 MiB` contiguous-hole issue was fixed. So iOS defaults to immediate spill
-/// (`1` byte budget) unless the embedding app overrides it explicitly.
+/// commitment peak is gone. On iOS, the active low-memory path now rematerializes directly into
+/// mmap-backed batches instead of heap-then-spill, but the same knob still sets the target batch
+/// size for that direct-mmap path and the fallback heap budget for any non-SIMD callers. The old
+/// `1`-byte iOS default was a diagnostic setting used before direct-mmap rematerialization
+/// existed; with extended VA enabled it is now too aggressive and creates unnecessary extra spill
+/// work. So iOS defaults to a modest 256 MiB rematerialization budget unless the embedding app
+/// overrides it explicitly.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP: usize = 2 << 30;
 #[cfg(target_os = "ios")]
-const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 1;
+const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 256 << 20;
 #[cfg(not(target_os = "ios"))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize =
     DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP;
@@ -1564,6 +1566,8 @@ where
         twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
         base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
     ) {
+        let target_batch_bytes =
+            low_memory_materialize_budget_bytes().max(crate::prover::spill::EVAL_SPILL_CHUNK_BYTES);
         let mut batch_layouts = Vec::new();
         let mut batch_bytes = 0usize;
 
@@ -1592,9 +1596,7 @@ where
                 );
             }
 
-            if !batch_layouts.is_empty()
-                && batch_bytes + bytes > crate::prover::spill::EVAL_SPILL_CHUNK_BYTES
-            {
+            if !batch_layouts.is_empty() && batch_bytes + bytes > target_batch_bytes {
                 self.flush_direct_mmap_materialization_batch(
                     &mut batch_layouts,
                     &mut batch_bytes,
