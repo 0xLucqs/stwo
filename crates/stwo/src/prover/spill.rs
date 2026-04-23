@@ -25,14 +25,56 @@ use tempfile::NamedTempFile;
 static ACTIVE_MMAPS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_MMAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Emit a probe line to the platform's log sink.
+///
+/// Stderr is the primary sink (captured by Xcode/oslog on Apple platforms and
+/// by most desktop shells on Linux). Android zero-out stderr for app processes
+/// by default, so we additionally route to logcat there.
+fn emit_probe(line: &str) {
+    eprintln!("{line}");
+    #[cfg(target_os = "android")]
+    android_log::write_info(line);
+}
+
+#[cfg(target_os = "android")]
+mod android_log {
+    use std::ffi::CString;
+
+    use libc::{c_char, c_int};
+
+    const ANDROID_LOG_INFO: c_int = 4;
+    const TAG: &str = "stwo_probe";
+
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(
+            priority: c_int,
+            tag: *const c_char,
+            text: *const c_char,
+        ) -> c_int;
+    }
+
+    pub fn write_info(line: &str) {
+        let Ok(tag) = CString::new(TAG) else {
+            return;
+        };
+        let Ok(text) = CString::new(line) else {
+            return;
+        };
+        unsafe {
+            __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), text.as_ptr());
+        }
+    }
+}
+
 /// Log and return the current mmap stats.
 pub fn log_mmap_stats(label: &str) {
     let count = ACTIVE_MMAPS.load(Ordering::Relaxed);
     let bytes = ACTIVE_MMAP_BYTES.load(Ordering::Relaxed);
-    eprintln!(
+    emit_probe(&format!(
         "MMAP_STATS [{label}] active_mmaps={count} active_bytes={:.1} MB",
         bytes as f64 / (1024.0 * 1024.0),
-    );
+    ));
 }
 
 /// Re-entrancy guard for the alloc-error hook so that diagnostic emission
@@ -40,19 +82,20 @@ pub fn log_mmap_stats(label: &str) {
 static ALLOC_HOOK_REENTRY: AtomicUsize = AtomicUsize::new(0);
 
 /// Custom alloc-error hook that, when the global allocator fails, dumps a
-/// VM_WALK + MMAP_STATS snapshot to stderr before the runtime aborts. This
-/// is critical on iOS where `memory allocation of N bytes failed` is the
-/// only signal we get back from a jetsam/ENOMEM event during proving.
+/// VM_WALK + MMAP_STATS snapshot before the runtime aborts. This is critical
+/// on mobile where `memory allocation of N bytes failed` (iOS) or a silent
+/// SIGKILL from LMKd (Android) is often the only signal we get from an
+/// ENOMEM event during proving.
 fn alloc_error_hook(layout: std::alloc::Layout) {
     let depth = ALLOC_HOOK_REENTRY.fetch_add(1, Ordering::Relaxed);
     if depth == 0 {
-        eprintln!(
+        emit_probe(&format!(
             "ALLOC_FAILURE size={} align={} active_mmaps={} active_mmap_bytes={}",
             layout.size(),
             layout.align(),
             ACTIVE_MMAPS.load(Ordering::Relaxed),
             ACTIVE_MMAP_BYTES.load(Ordering::Relaxed),
-        );
+        ));
         log_mmap_stats("alloc_error");
         log_vm_walk("alloc_error");
     }
@@ -68,7 +111,7 @@ pub fn ensure_alloc_error_hook_installed() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         std::alloc::set_alloc_error_hook(alloc_error_hook);
-        eprintln!("ALLOC_HOOK installed");
+        emit_probe("ALLOC_HOOK installed");
     });
 }
 
@@ -91,7 +134,18 @@ pub fn log_vm_walk(label: &str) {
     vm_walk_impl::log_vm_walk(label);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn log_vm_walk(label: &str) {
+    ensure_alloc_error_hook_installed();
+    vm_walk_impl_linux::log_vm_walk(label);
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
 pub fn log_vm_walk(_label: &str) {
     ensure_alloc_error_hook_installed();
 }
@@ -363,6 +417,206 @@ mod vm_walk_impl {
             regions_ge_16mb,
             started.elapsed().as_millis(),
         );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod vm_walk_impl_linux {
+    use std::fs;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    use super::{emit_probe, ACTIVE_MMAPS, ACTIVE_MMAP_BYTES};
+
+    pub fn log_vm_walk(label: &str) {
+        const MB: f64 = 1024.0 * 1024.0;
+        let started = Instant::now();
+
+        let status = read_proc_status();
+        let rollup = read_smaps_rollup();
+        let maps = walk_maps();
+        let sys = read_meminfo();
+
+        let active_mmaps = ACTIVE_MMAPS.load(Ordering::Relaxed);
+        let active_mmap_bytes = ACTIVE_MMAP_BYTES.load(Ordering::Relaxed);
+
+        emit_probe(&format!(
+            "VM_WALK [{label}] virt_mb={:.1} rss_mb={:.1} vm_peak_mb={:.1} \
+             vm_hwm_mb={:.1} swap_mb={:.1} rss_anon_mb={:.1} rss_file_mb={:.1} \
+             rss_shmem_mb={:.1} pss_mb={:.1} pss_anon_mb={:.1} pss_file_mb={:.1} \
+             swap_pss_mb={:.1} task_regions={} anon_regions={} file_regions={} \
+             shared_regions={} maps_anon_mb={:.1} maps_file_mb={:.1} \
+             stwo_mmaps={} stwo_mmap_mb={:.1} sys_mem_avail_mb={:.1} \
+             sys_swap_free_mb={:.1} walk_ms={}",
+            status.vm_size_kb as f64 / 1024.0,
+            status.vm_rss_kb as f64 / 1024.0,
+            status.vm_peak_kb as f64 / 1024.0,
+            status.vm_hwm_kb as f64 / 1024.0,
+            status.vm_swap_kb as f64 / 1024.0,
+            status.rss_anon_kb as f64 / 1024.0,
+            status.rss_file_kb as f64 / 1024.0,
+            status.rss_shmem_kb as f64 / 1024.0,
+            rollup.pss_kb as f64 / 1024.0,
+            rollup.pss_anon_kb as f64 / 1024.0,
+            rollup.pss_file_kb as f64 / 1024.0,
+            rollup.swap_pss_kb as f64 / 1024.0,
+            maps.total_regions,
+            maps.anon_regions,
+            maps.file_regions,
+            maps.shared_regions,
+            maps.anon_bytes as f64 / MB,
+            maps.file_bytes as f64 / MB,
+            active_mmaps,
+            active_mmap_bytes as f64 / MB,
+            sys.mem_available_kb as f64 / 1024.0,
+            sys.swap_free_kb as f64 / 1024.0,
+            started.elapsed().as_millis(),
+        ));
+    }
+
+    #[derive(Default)]
+    struct ProcStatus {
+        vm_size_kb: u64,
+        vm_rss_kb: u64,
+        vm_peak_kb: u64,
+        vm_hwm_kb: u64,
+        vm_swap_kb: u64,
+        rss_anon_kb: u64,
+        rss_file_kb: u64,
+        rss_shmem_kb: u64,
+    }
+
+    fn read_proc_status() -> ProcStatus {
+        let mut out = ProcStatus::default();
+        let Ok(text) = fs::read_to_string("/proc/self/status") else {
+            return out;
+        };
+        parse_kb_table(&text, |key, val| match key {
+            "VmSize" => out.vm_size_kb = val,
+            "VmRSS" => out.vm_rss_kb = val,
+            "VmPeak" => out.vm_peak_kb = val,
+            "VmHWM" => out.vm_hwm_kb = val,
+            "VmSwap" => out.vm_swap_kb = val,
+            "RssAnon" => out.rss_anon_kb = val,
+            "RssFile" => out.rss_file_kb = val,
+            "RssShmem" => out.rss_shmem_kb = val,
+            _ => {}
+        });
+        out
+    }
+
+    #[derive(Default)]
+    struct SmapsRollup {
+        pss_kb: u64,
+        pss_anon_kb: u64,
+        pss_file_kb: u64,
+        swap_pss_kb: u64,
+    }
+
+    fn read_smaps_rollup() -> SmapsRollup {
+        let mut out = SmapsRollup::default();
+        let Ok(text) = fs::read_to_string("/proc/self/smaps_rollup") else {
+            return out;
+        };
+        parse_kb_table(&text, |key, val| match key {
+            "Pss" => out.pss_kb = val,
+            "Pss_Anon" => out.pss_anon_kb = val,
+            "Pss_File" => out.pss_file_kb = val,
+            "SwapPss" => out.swap_pss_kb = val,
+            _ => {}
+        });
+        out
+    }
+
+    #[derive(Default)]
+    struct MemInfo {
+        mem_available_kb: u64,
+        swap_free_kb: u64,
+    }
+
+    fn read_meminfo() -> MemInfo {
+        let mut out = MemInfo::default();
+        let Ok(text) = fs::read_to_string("/proc/meminfo") else {
+            return out;
+        };
+        parse_kb_table(&text, |key, val| match key {
+            "MemAvailable" => out.mem_available_kb = val,
+            "SwapFree" => out.swap_free_kb = val,
+            _ => {}
+        });
+        out
+    }
+
+    fn parse_kb_table<F: FnMut(&str, u64)>(text: &str, mut f: F) {
+        for line in text.lines() {
+            let Some((key, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let Some(num) = rest.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(val) = num.parse::<u64>() else {
+                continue;
+            };
+            f(key.trim(), val);
+        }
+    }
+
+    #[derive(Default)]
+    struct MapsSummary {
+        total_regions: u64,
+        anon_regions: u64,
+        file_regions: u64,
+        shared_regions: u64,
+        anon_bytes: u64,
+        file_bytes: u64,
+    }
+
+    fn walk_maps() -> MapsSummary {
+        let mut out = MapsSummary::default();
+        let Ok(text) = fs::read_to_string("/proc/self/maps") else {
+            return out;
+        };
+        for line in text.lines() {
+            // Format: START-END PERMS OFFSET DEV INODE [PATHNAME]
+            let mut parts = line.split_whitespace();
+            let Some(range) = parts.next() else { continue };
+            let Some(perms) = parts.next() else { continue };
+            let _offset = parts.next();
+            let _dev = parts.next();
+            let Some(inode) = parts.next() else { continue };
+            let pathname = parts.next();
+
+            let Some((start_s, end_s)) = range.split_once('-') else {
+                continue;
+            };
+            let Ok(start) = u64::from_str_radix(start_s, 16) else {
+                continue;
+            };
+            let Ok(end) = u64::from_str_radix(end_s, 16) else {
+                continue;
+            };
+            let size = end.saturating_sub(start);
+
+            out.total_regions += 1;
+
+            // Anonymous: inode=0 and either no path or a kernel pseudo-name
+            // ([heap], [stack], [anon:...], [vvar], ...). Shared file-backed
+            // mappings (e.g. stwo's MAP_SHARED tempfiles) carry 's' in perms.
+            let is_anon = inode == "0"
+                && pathname.map_or(true, |p| p.is_empty() || p.starts_with('['));
+            if is_anon {
+                out.anon_regions += 1;
+                out.anon_bytes += size;
+            } else if perms.contains('s') {
+                out.shared_regions += 1;
+                out.file_bytes += size;
+            } else {
+                out.file_regions += 1;
+                out.file_bytes += size;
+            }
+        }
+        out
     }
 }
 
@@ -665,7 +919,7 @@ mod merkle_slot_pool {
         }
     }
 
-    fn align_up(value: usize, alignment: usize) -> usize {
+    const fn align_up(value: usize, alignment: usize) -> usize {
         value.div_ceil(alignment) * alignment
     }
 
@@ -715,6 +969,19 @@ mod merkle_slot_pool {
 }
 
 impl FileBackedMapping {
+    /// Zero-byte placeholder that still owns the temp file so it survives as long as the
+    /// mapping does. Callers must not dereference `ptr` (guaranteed by the `byte_len == 0`
+    /// early-returns in `as_bytes` and `Drop`).
+    const fn empty(file: NamedTempFile) -> Self {
+        Self {
+            // Non-null, well-aligned sentinel so `slice::from_raw_parts(ptr, 0)` is defined.
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            byte_len: 0,
+            _file: file,
+            release: MappingRelease::System,
+        }
+    }
+
     #[track_caller]
     #[cfg(unix)]
     fn map_named_temp_file_with_reservation(
@@ -724,6 +991,9 @@ impl FileBackedMapping {
         reservation: Option<ContiguousMappingPurpose>,
     ) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
+
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let _ = reservation;
 
         #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
         if let Some(reservation) = reservation {
@@ -739,14 +1009,12 @@ impl FileBackedMapping {
                 }
                 Ok(None) => {
                     eprintln!(
-                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={} -> system_mmap",
-                        byte_len
+                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={byte_len} -> system_mmap",
                     );
                 }
                 Err(err) => {
                     eprintln!(
-                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={} err={err} -> system_mmap",
-                        byte_len
+                        "MERKLE_SLOT_FALLBACK kind={reservation:?} size={byte_len} err={err} -> system_mmap",
                     );
                 }
             }
@@ -801,11 +1069,11 @@ impl FileBackedMapping {
         ))
     }
 
-    fn as_ptr(&self) -> *mut libc::c_void {
+    const fn as_ptr(&self) -> *mut libc::c_void {
         self.ptr
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    const fn as_bytes(&self) -> &[u8] {
         // SAFETY: `ptr` and `byte_len` cover the full live mapping owned by `self`.
         unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.byte_len) }
     }
@@ -901,8 +1169,14 @@ impl CoefficientSpillFile {
     pub fn freeze(self) -> std::io::Result<SharedSpillFile> {
         let file = self.file;
         file.as_file().sync_all()?;
-        let mapping =
-            FileBackedMapping::map_named_temp_file(file, self.offset as usize, libc::PROT_READ)?;
+        // POSIX `mmap` rejects zero-length mappings with `EINVAL`, so short-circuit when no
+        // coefficients were spilled. The resulting `FrozenSpillFile` exposes `len() == 0`
+        // and no reads can be issued because `entries` is empty.
+        let mapping = if self.offset == 0 {
+            FileBackedMapping::empty(file)
+        } else {
+            FileBackedMapping::map_named_temp_file(file, self.offset as usize, libc::PROT_READ)?
+        };
         Ok(Arc::new(FrozenSpillFile {
             mapping,
             entries: self.entries,
@@ -1118,14 +1392,17 @@ impl<T: Pod> std::ops::DerefMut for MmapVec<T> {
 
 impl<T: Pod> Drop for MmapVec<T> {
     fn drop(&mut self) {
-        if self.byte_len == 0 {
-            return;
-        }
-        #[cfg(not(unix))]
-        if self._mapping.is_none() {
-            unsafe {
-                // Reconstruct the Box to free the allocation.
-                let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.ptr, self.len));
+        // Zero-length placeholders never allocated or mmapped anything, so nothing to release.
+        // On unix builds the backing `_mapping` (when present) does its own `munmap` on drop.
+        if self.byte_len != 0 {
+            #[cfg(not(unix))]
+            if self._mapping.is_none() {
+                // SAFETY: on non-Unix builds `from_vec` wrapped the original allocation with
+                // `Box::into_raw(data.into_boxed_slice())`, so reconstructing the Box with the
+                // same ptr/len releases it via the global allocator.
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.ptr, self.len));
+                }
             }
         }
     }
