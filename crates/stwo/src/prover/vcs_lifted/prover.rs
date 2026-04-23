@@ -40,7 +40,11 @@ pub struct CheckpointedMerkleProverLifted<B: MerkleOpsLifted<H>, H: MerkleHasher
 }
 
 impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> StoredMerkleCheckpoint<B, H> {
-    fn new(log_size: u32, hashes: Col<B, H::Hash>, mmap_guard: Option<HashLayerMmapGuard>) -> Self {
+    const fn new(
+        log_size: u32,
+        hashes: Col<B, H::Hash>,
+        mmap_guard: Option<HashLayerMmapGuard>,
+    ) -> Self {
         Self {
             log_size,
             hashes: ManuallyDrop::new(hashes),
@@ -49,9 +53,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> StoredMerkleCheckpoint<B, H> 
     }
 
     fn hashes(&self) -> &Col<B, H::Hash> {
-        unsafe {
-            &*((&self.hashes) as *const ManuallyDrop<Col<B, H::Hash>> as *const Col<B, H::Hash>)
-        }
+        &self.hashes
     }
 }
 
@@ -327,7 +329,7 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> CheckpointedMerkleProverLifte
         }
     }
 
-    pub fn root(&self) -> H::Hash {
+    pub const fn root(&self) -> H::Hash {
         self.root
     }
 

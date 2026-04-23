@@ -169,7 +169,7 @@ fn allocate_hash_layer(
 }
 
 fn build_next_layer_inner<const IS_M31_OUTPUT: bool>(
-    prev_layer: &Vec<Blake2sHash>,
+    prev_layer: &[Blake2sHash],
     use_mmap: bool,
 ) -> (Vec<Blake2sHash>, Option<HashLayerMmapGuard>) {
     // The log size of the current layer that needs to be built.

@@ -97,7 +97,7 @@ pub(crate) fn spilled_coefficient_load_count() -> usize {
 }
 
 impl<B: Backend> Poly<B> {
-    pub fn new(
+    pub const fn new(
         coeffs: Option<CircleCoefficients<B>>,
         evals: CircleEvaluation<B, BaseField, BitReversedOrder>,
     ) -> Self {
@@ -109,7 +109,7 @@ impl<B: Backend> Poly<B> {
         }
     }
 
-    pub fn evals(&self) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
+    pub const fn evals(&self) -> &CircleEvaluation<B, BaseField, BitReversedOrder> {
         self.evals
             .as_ref()
             .expect("evaluation buffer is not retained for this polynomial")
@@ -119,7 +119,7 @@ impl<B: Backend> Poly<B> {
         self.eval_domain.log_size()
     }
 
-    pub fn take_evals(&mut self) -> CircleEvaluation<B, BaseField, BitReversedOrder> {
+    pub const fn take_evals(&mut self) -> CircleEvaluation<B, BaseField, BitReversedOrder> {
         self.evals
             .take()
             .expect("evaluation buffer is not retained for this polynomial")

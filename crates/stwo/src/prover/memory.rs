@@ -225,7 +225,7 @@ fn capture_process_memory() -> Option<ProcessMemorySnapshot> {
     Some(ProcessMemorySnapshot {
         footprint_bytes: usage.ri_phys_footprint,
         resident_bytes: usage.ri_resident_size,
-        virtual_bytes: basic_info.virtual_size as u64,
+        virtual_bytes: basic_info.virtual_size,
         wired_bytes: usage.ri_wired_size,
         disk_read_bytes: usage.ri_diskio_bytesread,
         disk_written_bytes: usage.ri_diskio_byteswritten,

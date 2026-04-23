@@ -16,7 +16,7 @@ use stwo::prover::pcs::quotient_ops::AccumulatedNumerators;
 use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
-use stwo::prover::QuotientOps;
+use stwo::prover::{ProverMemoryMode, QuotientOps};
 
 #[allow(clippy::type_complexity)]
 fn setup(
@@ -147,6 +147,7 @@ fn bench_compute_quotients_and_combine(c: &mut Criterion) {
                         eval_log_size,
                         log_blowup_factor,
                         &twiddles,
+                        ProverMemoryMode::Fast,
                     )
                 },
                 BatchSize::LargeInput,

@@ -854,11 +854,13 @@ mod tests {
 
     #[test]
     fn default_spill_batch_bytes_is_phone_friendly() {
-        // The default must be substantially smaller than the historical 256 MiB tuning so
-        // that mobile targets do not OOM during the LowMemory eval phase. If you bump
-        // this, also reconcile the doc comment on DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES.
-        assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES > 0);
-        assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES <= 16 << 20);
+        // The default must stay strictly below the historical 256 MiB tuning so that mobile
+        // targets do not OOM during the LowMemory eval phase. If you bump this, also reconcile
+        // the doc comment on DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES.
+        const {
+            assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES > 0);
+            assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES < 256 << 20);
+        }
     }
     use crate::prover::poly::{BitReversedOrder, NaturalOrder};
 

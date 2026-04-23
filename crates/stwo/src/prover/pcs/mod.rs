@@ -37,7 +37,7 @@ use crate::prover::vcs_lifted::prover::{CheckpointedMerkleProverLifted, MerklePr
 pub mod quotient_ops;
 
 #[cfg(any(test, target_os = "ios"))]
-fn direct_mmap_layout_bytes(layout: &crate::prover::spill::EvalColumnLayout) -> usize {
+const fn direct_mmap_layout_bytes(layout: &crate::prover::spill::EvalColumnLayout) -> usize {
     layout.logical_len * std::mem::size_of::<BaseField>()
 }
 
@@ -80,7 +80,7 @@ fn try_mmap_eval_column_chunk(
 /// Called in `CommitmentTreeProver::new_with_memory_mode` just before building the Merkle leaf
 /// layer — the most memory-intensive phase of commitment — to prevent simultaneous residency of
 /// coefficients, extended evaluations, and Merkle leaf/next layers in anonymous memory.
-fn spill_polys_coefficients<B>(polys: &mut Vec<Poly<B>>) -> std::io::Result<()>
+fn spill_polys_coefficients<B>(polys: &mut [Poly<B>]) -> std::io::Result<()>
 where
     B: crate::prover::backend::Backend,
 {
@@ -298,7 +298,7 @@ pub fn set_default_prover_memory_mode(mode: ProverMemoryMode) {
     tracing::info!(?mode, "stwo prover memory mode override set");
 }
 
-fn parse_prover_memory_mode(value: &str) -> Option<ProverMemoryMode> {
+const fn parse_prover_memory_mode(value: &str) -> Option<ProverMemoryMode> {
     if value.eq_ignore_ascii_case("fast") {
         Some(ProverMemoryMode::Fast)
     } else if value.eq_ignore_ascii_case("low_memory")
@@ -361,7 +361,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeMerkleProver<B, 
         }
     }
 
-    pub fn height(&self) -> u32 {
+    pub const fn height(&self) -> u32 {
         match self {
             CommitmentTreeMerkleProver::Full(tree) => tree.layers.len() as u32 - 1,
             CommitmentTreeMerkleProver::Checkpointed(tree) => tree.height(),
@@ -922,7 +922,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         // still catching the ramp-up clearly.
         const VM_WALK_STRIDE: usize = 5;
         let call_idx = EXTEND_EVALS_CALLS.fetch_add(1, Ordering::Relaxed);
-        if call_idx % VM_WALK_STRIDE == 0 {
+        if call_idx.is_multiple_of(VM_WALK_STRIDE) {
             let n_cols = columns.len();
             let label = format!(
                 "extend_evals:#{call_idx}:tree={}:cols={n_cols}:polys_so_far={}",

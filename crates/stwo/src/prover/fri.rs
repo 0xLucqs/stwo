@@ -85,7 +85,7 @@ enum FriFirstLayer<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> {
 }
 
 impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriFirstLayer<'a, B, H> {
-    fn column(&self) -> &'a SecureEvaluation<B, BitReversedOrder> {
+    const fn column(&self) -> &'a SecureEvaluation<B, BitReversedOrder> {
         match self {
             FriFirstLayer::InMemory(layer) => layer.column,
             FriFirstLayer::LowMemory(layer) => layer.column,
@@ -545,7 +545,7 @@ impl<'a, B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted>
 // TODO(andrew): Support different step sizes and update docs.
 // TODO(andrew): The docs are wrong. Each leaf of the merkle tree commits to a single
 // QM31 value. This is inefficient and should be changed.
-fn should_pack_leaves(values_len: usize, fold_step: u32) -> bool {
+const fn should_pack_leaves(values_len: usize, fold_step: u32) -> bool {
     values_len.ilog2() >= LOG_PACKED_LEAF_SIZE && fold_step > 1
 }
 

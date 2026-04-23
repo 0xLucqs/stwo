@@ -29,14 +29,14 @@ pub struct ComputedFriQuotients<B: ColumnOps<BaseField>, EvalOrder> {
 }
 
 impl<B: ColumnOps<BaseField>, EvalOrder> ComputedFriQuotients<B, EvalOrder> {
-    pub fn new(evaluation: SecureEvaluation<B, EvalOrder>) -> Self {
+    pub const fn new(evaluation: SecureEvaluation<B, EvalOrder>) -> Self {
         Self {
             evaluation: ManuallyDrop::new(evaluation),
             mmap_guard: None,
         }
     }
 
-    pub fn with_mmap_guard(
+    pub const fn with_mmap_guard(
         evaluation: SecureEvaluation<B, EvalOrder>,
         mmap_guard: SecureEvaluationMmapGuard,
     ) -> Self {
@@ -234,6 +234,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
 /// `all_columns_at_log_size * eval_size`.
 const LOW_MEMORY_QUOTIENT_BATCH_SIZE: usize = 8;
 
+#[allow(clippy::too_many_arguments)]
 pub fn compute_fri_quotients_from_polys<B: QuotientOps + AccumulationOps + Backend>(
     polynomials: &TreeVec<Vec<&Poly<B>>>,
     samples: &TreeVec<Vec<Vec<PointSample>>>,
@@ -636,9 +637,7 @@ mod tests {
         assert!(result.is_ok());
 
         println!(
-            "manual_pcs_memory_measurement mode={memory_mode:?} n_cols={} lifting_log_size={} elapsed_ms={elapsed_ms}",
-            N_COLS,
-            LIFTING_LOG_SIZE,
+            "manual_pcs_memory_measurement mode={memory_mode:?} n_cols={N_COLS} lifting_log_size={LIFTING_LOG_SIZE} elapsed_ms={elapsed_ms}",
         );
     }
 

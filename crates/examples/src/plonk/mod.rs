@@ -395,8 +395,7 @@ mod tests {
         verify_plonk_proof(&component, proof, config);
 
         println!(
-            "manual_plonk_memory_measurement mode={memory_mode:?} log_n_rows={} elapsed_ms={elapsed_ms}",
-            LOG_N_ROWS,
+            "manual_plonk_memory_measurement mode={memory_mode:?} log_n_rows={LOG_N_ROWS} elapsed_ms={elapsed_ms}",
         );
     }
 
