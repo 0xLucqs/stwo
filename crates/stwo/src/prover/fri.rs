@@ -182,17 +182,14 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
     ) -> FriFirstLayer<'a, B, MC::H> {
         // The circle-to-line fold is always equal to the config.fold_step.
         // TODO(Leo): consider support for smaller steps.
-        match memory_mode {
-            ProverMemoryMode::Fast => {
-                let layer = FriFirstLayerProver::new(column, config.fold_step);
-                MC::mix_root(channel, layer.merkle_tree.root());
-                FriFirstLayer::InMemory(layer)
-            }
-            ProverMemoryMode::LowMemory => {
-                let layer = LowMemoryFriFirstLayerProver::new(column, config.fold_step);
-                MC::mix_root(channel, layer.merkle_tree.root());
-                FriFirstLayer::LowMemory(layer)
-            }
+        if memory_mode.uses_checkpointed_merkle() {
+            let layer = LowMemoryFriFirstLayerProver::new(column, config.fold_step);
+            MC::mix_root(channel, layer.merkle_tree.root());
+            FriFirstLayer::LowMemory(layer)
+        } else {
+            let layer = FriFirstLayerProver::new(column, config.fold_step);
+            MC::mix_root(channel, layer.merkle_tree.root());
+            FriFirstLayer::InMemory(layer)
         }
     }
 
@@ -222,85 +219,81 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         );
         // If we're already at the last layer, there are no inner layers to compute.
         if line_log_size == last_layer_log_domain_size {
-            let layers = match memory_mode {
-                ProverMemoryMode::Fast => FriInnerLayers::InMemory(Vec::new()),
-                ProverMemoryMode::LowMemory => FriInnerLayers::LowMemory(LowMemoryFriInnerLayers {
+            let layers = if memory_mode.uses_checkpointed_merkle() {
+                FriInnerLayers::LowMemory(LowMemoryFriInnerLayers {
                     initial_folding_alpha,
                     twiddles,
                     layers: Vec::new(),
-                }),
+                })
+            } else {
+                FriInnerLayers::InMemory(Vec::new())
             };
             return (layers, layer_evaluation);
         }
 
-        match memory_mode {
-            ProverMemoryMode::Fast => {
-                let mut layers = Vec::new();
-                // While we can, skip `config.fold_step` layers.
-                while line_log_size > last_layer_log_domain_size + config.fold_step {
-                    let layer = FriInnerLayerProver::new(layer_evaluation, config.fold_step);
-                    MC::mix_root(channel, layer.merkle_tree.root());
-                    let folding_alpha = channel.draw_secure_felt();
-                    layer_evaluation =
-                        B::fold_line(&layer.evaluation, folding_alpha, twiddles, config.fold_step);
-                    layers.push(layer);
-                    line_log_size -= config.fold_step;
-                }
-
-                // Do one last fold (of size 0 < k <= config.fold_step) to reach the correct size.
-                let last_fold_step = line_log_size - last_layer_log_domain_size;
-                let layer = FriInnerLayerProver::new(layer_evaluation, last_fold_step);
-                MC::mix_root(channel, layer.merkle_tree.root());
-                let folding_alpha = channel.draw_secure_felt();
-                layer_evaluation =
-                    B::fold_line(&layer.evaluation, folding_alpha, twiddles, last_fold_step);
-                layers.push(layer);
-
-                (FriInnerLayers::InMemory(layers), layer_evaluation)
-            }
-            ProverMemoryMode::LowMemory => {
-                let mut layers = Vec::new();
-                while line_log_size > last_layer_log_domain_size + config.fold_step {
-                    let (merkle_tree, pack_leaves) = commit_checkpointed_line_layer::<B, MC::H>(
-                        &layer_evaluation,
-                        config.fold_step,
-                    );
-                    MC::mix_root(channel, merkle_tree.root());
-                    let folding_alpha = channel.draw_secure_felt();
-                    layer_evaluation =
-                        B::fold_line(&layer_evaluation, folding_alpha, twiddles, config.fold_step);
-                    layers.push(LowMemoryFriInnerLayerProver {
-                        merkle_tree,
-                        fold_step: config.fold_step,
-                        pack_leaves,
-                        folding_alpha,
-                    });
-                    line_log_size -= config.fold_step;
-                }
-
-                let last_fold_step = line_log_size - last_layer_log_domain_size;
+        if memory_mode.uses_checkpointed_merkle() {
+            let mut layers = Vec::new();
+            while line_log_size > last_layer_log_domain_size + config.fold_step {
                 let (merkle_tree, pack_leaves) =
-                    commit_checkpointed_line_layer::<B, MC::H>(&layer_evaluation, last_fold_step);
+                    commit_checkpointed_line_layer::<B, MC::H>(&layer_evaluation, config.fold_step);
                 MC::mix_root(channel, merkle_tree.root());
                 let folding_alpha = channel.draw_secure_felt();
                 layer_evaluation =
-                    B::fold_line(&layer_evaluation, folding_alpha, twiddles, last_fold_step);
+                    B::fold_line(&layer_evaluation, folding_alpha, twiddles, config.fold_step);
                 layers.push(LowMemoryFriInnerLayerProver {
                     merkle_tree,
-                    fold_step: last_fold_step,
+                    fold_step: config.fold_step,
                     pack_leaves,
                     folding_alpha,
                 });
-
-                (
-                    FriInnerLayers::LowMemory(LowMemoryFriInnerLayers {
-                        initial_folding_alpha,
-                        twiddles,
-                        layers,
-                    }),
-                    layer_evaluation,
-                )
+                line_log_size -= config.fold_step;
             }
+
+            let last_fold_step = line_log_size - last_layer_log_domain_size;
+            let (merkle_tree, pack_leaves) =
+                commit_checkpointed_line_layer::<B, MC::H>(&layer_evaluation, last_fold_step);
+            MC::mix_root(channel, merkle_tree.root());
+            let folding_alpha = channel.draw_secure_felt();
+            layer_evaluation =
+                B::fold_line(&layer_evaluation, folding_alpha, twiddles, last_fold_step);
+            layers.push(LowMemoryFriInnerLayerProver {
+                merkle_tree,
+                fold_step: last_fold_step,
+                pack_leaves,
+                folding_alpha,
+            });
+
+            (
+                FriInnerLayers::LowMemory(LowMemoryFriInnerLayers {
+                    initial_folding_alpha,
+                    twiddles,
+                    layers,
+                }),
+                layer_evaluation,
+            )
+        } else {
+            let mut layers = Vec::new();
+            // While we can, skip `config.fold_step` layers.
+            while line_log_size > last_layer_log_domain_size + config.fold_step {
+                let layer = FriInnerLayerProver::new(layer_evaluation, config.fold_step);
+                MC::mix_root(channel, layer.merkle_tree.root());
+                let folding_alpha = channel.draw_secure_felt();
+                layer_evaluation =
+                    B::fold_line(&layer.evaluation, folding_alpha, twiddles, config.fold_step);
+                layers.push(layer);
+                line_log_size -= config.fold_step;
+            }
+
+            // Do one last fold (of size 0 < k <= config.fold_step) to reach the correct size.
+            let last_fold_step = line_log_size - last_layer_log_domain_size;
+            let layer = FriInnerLayerProver::new(layer_evaluation, last_fold_step);
+            MC::mix_root(channel, layer.merkle_tree.root());
+            let folding_alpha = channel.draw_secure_felt();
+            layer_evaluation =
+                B::fold_line(&layer.evaluation, folding_alpha, twiddles, last_fold_step);
+            layers.push(layer);
+
+            (FriInnerLayers::InMemory(layers), layer_evaluation)
         }
     }
 

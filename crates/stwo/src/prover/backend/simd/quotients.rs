@@ -145,7 +145,7 @@ impl QuotientOps for SimdBackend {
                 .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
         };
 
-        if memory_mode == ProverMemoryMode::LowMemory {
+        if memory_mode.rematerializes_evaluations() {
             let eval_buffers_bytes = eval_domain
                 .size()
                 .div_ceil(crate::prover::backend::simd::m31::N_LANES)

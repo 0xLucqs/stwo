@@ -166,7 +166,7 @@ impl PolyOps for SimdBackend {
         pool: &BaseColumnPool<Self>,
         memory_mode: ProverMemoryMode,
     ) -> (Vec<Poly<Self>>, Vec<EvalMmapGuard>) {
-        if memory_mode != ProverMemoryMode::LowMemory {
+        if !memory_mode.rematerializes_evaluations() {
             let buffers: Vec<_> = polynomials
                 .iter()
                 .map(|poly_coeffs| {

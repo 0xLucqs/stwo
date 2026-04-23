@@ -103,7 +103,7 @@ where
     )
     .entered();
 
-    let composition_poly = if commitment_scheme.memory_mode == ProverMemoryMode::LowMemory {
+    let composition_poly = if commitment_scheme.memory_mode.rematerializes_evaluations() {
         commitment_scheme.release_recomputable_evaluations();
         phase_memory_checkpoint("prove_ex:after_initial_low_memory_trace_release");
 
@@ -173,7 +173,7 @@ where
     span1.exit();
     phase_memory_checkpoint("prove_ex:after_composition_generation");
 
-    if commitment_scheme.memory_mode == ProverMemoryMode::LowMemory {
+    if commitment_scheme.memory_mode.rematerializes_evaluations() {
         commitment_scheme.release_recomputable_evaluations();
         phase_memory_checkpoint("prove_ex:after_low_memory_trace_release");
     }

@@ -145,15 +145,75 @@ fn write_spilled_coefficients<B: crate::prover::backend::Backend>(
 }
 
 /// Controls prover memory usage strategies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Variants are ordered from most-memory / least-CPU (`Fast`) to least-memory / most-CPU
+/// (`UltraLow`). Callers generally pick a tier based on target device RAM; each tier composes
+/// a bundle of independent optimizations that can be queried via the capability predicates
+/// ([`Self::spills_coefficients_between_commits`], [`Self::rematerializes_evaluations`],
+/// [`Self::uses_checkpointed_merkle`]) and tunable knobs
+/// ([`Self::rematerialize_budget_bytes`], [`Self::merkle_checkpoint_stride`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProverMemoryMode {
-    /// Keep intermediate prover evaluations in memory to minimize recomputation.
+    /// Keep every intermediate evaluation in memory. Baseline for benchmarks and servers with
+    /// ample RAM (roughly: trace footprint + 5–10 GiB headroom).
     Fast,
-    /// Drop some FRI intermediates and recompute them during decommitment to reduce RAM usage.
+    /// Smooth the commit-phase peak by spilling accumulated polynomial coefficients to
+    /// file-backed mmap between tree commits. Evaluations stay heap-resident; no checkpointed
+    /// merkle trees. Targets big devices (≥8 GiB RAM) that need transient spike reduction
+    /// without paying the CPU cost of full recomputation.
+    SmoothedPeak,
+    /// Drop and re-materialize evaluations on-demand during composition and decommit. Uses
+    /// checkpointed merkle trees. Targets mid-range devices (2–4 GiB of usable app RAM).
     LowMemory,
+    /// All `LowMemory` optimizations, plus a tighter re-materialization budget that forces
+    /// more frequent mmap flushes. Targets memory-constrained phones (≤1 GiB app RAM).
+    UltraLow,
+}
+
+impl ProverMemoryMode {
+    /// Whether this mode spills accumulated polynomial coefficients between tree commits to
+    /// reduce the peak anonymous-heap footprint during Merkle construction.
+    pub const fn spills_coefficients_between_commits(self) -> bool {
+        !matches!(self, Self::Fast)
+    }
+
+    /// Whether this mode drops trace evaluations after commit and re-materializes them
+    /// on-demand for composition and decommit. Implies coefficients must be retained.
+    pub const fn rematerializes_evaluations(self) -> bool {
+        matches!(self, Self::LowMemory | Self::UltraLow)
+    }
+
+    /// Whether this mode uses checkpointed merkle trees (sparse layer storage + on-demand
+    /// reconstruction) instead of storing every tree layer.
+    pub const fn uses_checkpointed_merkle(self) -> bool {
+        matches!(self, Self::LowMemory | Self::UltraLow)
+    }
+
+    /// Heap budget in bytes for accumulating freshly materialized evaluation buffers before
+    /// flushing the batch to file-backed mmap. `Fast` and `SmoothedPeak` don't rematerialize,
+    /// so the budget is effectively unbounded (returns `usize::MAX`).
+    pub const fn rematerialize_budget_bytes(self) -> usize {
+        match self {
+            Self::Fast | Self::SmoothedPeak => usize::MAX,
+            Self::LowMemory => DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+            Self::UltraLow => ULTRA_LOW_MATERIALIZE_BUDGET_BYTES,
+        }
+    }
+
+    /// Stride between stored layers in the checkpointed merkle tree. Higher stride means more
+    /// memory savings but more CPU cost at decommit time. Only meaningful when
+    /// [`Self::uses_checkpointed_merkle`] returns true.
+    pub const fn merkle_checkpoint_stride(self) -> u32 {
+        LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE
+    }
 }
 
 const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
+
+/// Tight re-materialization budget for [`ProverMemoryMode::UltraLow`]. Deliberately smaller
+/// than any platform default so callers opting into this tier get the aggressive spill
+/// behavior regardless of target OS.
+const ULTRA_LOW_MATERIALIZE_BUDGET_BYTES: usize = 1 << 20;
 
 /// Default budget (in bytes) for heap-backed evaluation memory used during
 /// [`ProverMemoryMode::LowMemory`] re-materialization (composition polynomial generation and
@@ -288,11 +348,11 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         let _span = span!(Level::INFO, "Commitment").entered();
         phase_memory_checkpoint("pcs:commit:start");
 
-        // In LowMemory mode, spill all previously committed trees' coefficients to disk before
-        // building this tree. This prevents previously accumulated coefficient data from occupying
-        // anonymous heap during this tree's extension FFT and Merkle construction, which would
-        // otherwise push peak footprint to the sum of all trees built so far.
-        if self.memory_mode == ProverMemoryMode::LowMemory {
+        // Spill all previously committed trees' coefficients to disk before building this
+        // tree. This prevents previously accumulated coefficient data from occupying anonymous
+        // heap during this tree's extension FFT and Merkle construction, which would otherwise
+        // push peak footprint to the sum of all trees built so far.
+        if self.memory_mode.spills_coefficients_between_commits() {
             for tree in &mut self.trees.0 {
                 if let MaybeOwned::Owned(tree) = tree {
                     if tree.polynomials.iter().any(|p| p.coeffs.is_some()) {
@@ -309,7 +369,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         }
 
         let retain_coefficients =
-            self.store_polynomials_coefficients || self.memory_mode == ProverMemoryMode::LowMemory;
+            self.store_polynomials_coefficients || self.memory_mode.rematerializes_evaluations();
         let tree = CommitmentTreeProver::new_with_memory_mode(
             polynomials,
             self.config.fri_config.log_blowup_factor,
@@ -332,18 +392,22 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
         channel: &mut MC::C,
     ) {
-        let tree = match (self.memory_mode, tree) {
-            (ProverMemoryMode::LowMemory, MaybeOwned::Owned(tree)) => {
-                MaybeOwned::Owned(tree.into_memory_mode(ProverMemoryMode::LowMemory))
+        let tree = if self.memory_mode.uses_checkpointed_merkle() {
+            match tree {
+                MaybeOwned::Owned(tree) => {
+                    MaybeOwned::Owned(tree.into_memory_mode(self.memory_mode))
+                }
+                borrowed @ MaybeOwned::Borrowed(_) => borrowed,
             }
-            (_, tree) => tree,
+        } else {
+            tree
         };
         MC::mix_root(channel, tree.commitment.root());
         self.trees.push(tree);
 
-        // In LowMemory mode, immediately spill the just-committed tree's coefficients so they
-        // don't occupy anonymous heap during any subsequent tree's Merkle construction.
-        if self.memory_mode == ProverMemoryMode::LowMemory {
+        // Spill the just-committed tree's coefficients so they don't occupy anonymous heap
+        // during any subsequent tree's Merkle construction.
+        if self.memory_mode.spills_coefficients_between_commits() {
             if let Some(MaybeOwned::Owned(tree)) = self.trees.0.last_mut() {
                 if let Err(e) = tree.spill_coefficients() {
                     tracing::warn!(
@@ -391,7 +455,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
                 if tree.can_recompute_openings() {
-                    if self.memory_mode == ProverMemoryMode::LowMemory {
+                    if self.memory_mode.rematerializes_evaluations() {
                         tree.drop_evaluations();
                     } else {
                         tree.release_evaluations(&self.base_column_pool);
@@ -432,7 +496,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // with the prover satisfy this bound.
         crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
     {
-        let low_memory = self.memory_mode == ProverMemoryMode::LowMemory;
+        let low_memory = self.memory_mode.rematerializes_evaluations();
         match access_pattern {
             Some(access_pattern) => {
                 // The range/indices materialize variants currently always use the eager path.
@@ -469,9 +533,10 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                             // Per-poly materialize-and-spill: bounds the anonymous heap working
                             // set to one column at a time instead of the full tree's worth of
                             // re-materialized evals.
-                            tree.materialize_evaluations_low_memory(
+                            tree.materialize_evaluations_low_memory_with_budget(
                                 self.twiddles,
                                 &self.base_column_pool,
+                                self.memory_mode.rematerialize_budget_bytes(),
                             );
                         } else {
                             tree.materialize_evaluations(self.twiddles, &self.base_column_pool);
@@ -569,7 +634,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
 
         let lifting_log_size = self.trees.last().unwrap().commitment.height();
         let retain_coefficients =
-            self.store_polynomials_coefficients || self.memory_mode == ProverMemoryMode::LowMemory;
+            self.store_polynomials_coefficients || self.memory_mode.rematerializes_evaluations();
         let weights_hash_map = if retain_coefficients {
             None
         } else {
@@ -611,7 +676,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
-        let quotients = if self.memory_mode == ProverMemoryMode::LowMemory {
+        let quotients = if self.memory_mode.rematerializes_evaluations() {
             let polynomials = self.polynomials();
             print_polynomial_size_histogram::<B, MC>(&polynomials);
             compute_fri_quotients_from_polys(
@@ -639,7 +704,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         };
         phase_memory_checkpoint("pcs:prove_values:after_fri_quotients");
 
-        if self.memory_mode == ProverMemoryMode::LowMemory {
+        if self.memory_mode.rematerializes_evaluations() {
             for tree in &mut self.trees.0 {
                 if let MaybeOwned::Owned(tree) = tree {
                     if tree.can_recompute_openings() {
@@ -698,7 +763,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         for (tree, query_positions) in self.trees.0.iter_mut().zip_eq(query_positions_tree.iter()) {
             let (values, decommitment) = match tree {
                 MaybeOwned::Owned(tree) => {
-                    if self.memory_mode == ProverMemoryMode::LowMemory
+                    if self.memory_mode.rematerializes_evaluations()
                         && tree.can_recompute_openings()
                     {
                         // Per-poly materialize-and-spill keeps the anonymous heap working set
@@ -706,13 +771,14 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                         // `materialize_evaluations` allocated every column simultaneously,
                         // producing the multi-hundred-MB spike that OOM-killed the iOS app
                         // during decommit re-materialization.
-                        tree.materialize_evaluations_low_memory(
+                        tree.materialize_evaluations_low_memory_with_budget(
                             self.twiddles,
                             &self.base_column_pool,
+                            self.memory_mode.rematerialize_budget_bytes(),
                         );
                     }
                     let result = tree.decommit(query_positions);
-                    if self.memory_mode == ProverMemoryMode::LowMemory
+                    if self.memory_mode.rematerializes_evaluations()
                         && tree.can_recompute_openings()
                     {
                         // `drop_evaluations` knows how to forget any mmap-backed eval Vecs
@@ -733,7 +799,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         // Return evaluation buffers to the memory pool for reuse (owned trees only).
         for tree in &mut self.trees.0 {
             if let MaybeOwned::Owned(tree) = tree {
-                if self.memory_mode == ProverMemoryMode::LowMemory {
+                if self.memory_mode.rematerializes_evaluations() {
                     tree.drop_evaluations();
                 } else {
                     tree.release_evaluations(&self.base_column_pool);
@@ -873,7 +939,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         let span = span!(Level::INFO, "Extension").entered();
         phase_memory_checkpoint("pcs:tree:new:before_extension");
         let retain_coefficients =
-            store_polynomials_coefficients || memory_mode == ProverMemoryMode::LowMemory;
+            store_polynomials_coefficients || memory_mode.rematerializes_evaluations();
         let (mut polynomials, mut eval_mmap_guards) = B::evaluate_polynomials(
             polynomials,
             log_blowup_factor,
@@ -890,7 +956,7 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // holding in-memory coefficients simultaneously pushes peak footprint to:
         //   coefficients + extended_evals + leaf_layer + next_layer
         // Spilling coefficients (file-backed mmap) removes them from the anonymous page budget.
-        if memory_mode == ProverMemoryMode::LowMemory && retain_coefficients {
+        if memory_mode.spills_coefficients_between_commits() && retain_coefficients {
             if let Err(e) = spill_polys_coefficients(&mut polynomials) {
                 tracing::warn!(
                     "Failed to spill coefficients before Merkle construction: {e}. \
@@ -899,11 +965,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             }
         }
 
-        // In LowMemory mode, replace evaluation Vec backing with file-backed mmap.
+        // Replace evaluation Vec backing with file-backed mmap in rematerializing modes.
         // This converts ~5 GB of anonymous heap into OS-managed pages that can be evicted
         // under memory pressure and re-faulted from disk. Only the Merkle builder's working
         // set (~256 MB) needs to be physically resident.
-        if memory_mode == ProverMemoryMode::LowMemory && eval_mmap_guards.is_empty() {
+        if memory_mode.rematerializes_evaluations() && eval_mmap_guards.is_empty() {
             // Fallback for backends that do not eagerly convert evaluation buffers to mmap-backed
             // storage during extension.
             let polys_ptr = &mut polynomials as *mut Vec<Poly<B>>
@@ -930,22 +996,22 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .map(|poly: &Poly<B>| &poly.evals().values)
             .collect();
-        let tree =
-            match memory_mode {
-                ProverMemoryMode::Fast => CommitmentTreeMerkleProver::Full(
-                    MerkleProverLifted::commit(columns, lifting_log_size, 0),
-                ),
-                ProverMemoryMode::LowMemory => CommitmentTreeMerkleProver::Checkpointed(
-                    CheckpointedMerkleProverLifted::commit(
-                        columns,
-                        lifting_log_size,
-                        0,
-                        LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE,
-                    ),
-                ),
-            };
+        let tree = if memory_mode.uses_checkpointed_merkle() {
+            CommitmentTreeMerkleProver::Checkpointed(CheckpointedMerkleProverLifted::commit(
+                columns,
+                lifting_log_size,
+                0,
+                memory_mode.merkle_checkpoint_stride(),
+            ))
+        } else {
+            CommitmentTreeMerkleProver::Full(MerkleProverLifted::commit(
+                columns,
+                lifting_log_size,
+                0,
+            ))
+        };
 
-        if memory_mode == ProverMemoryMode::LowMemory {
+        if memory_mode.rematerializes_evaluations() {
             if !eval_mmap_guards.is_empty() {
                 let polys_ptr = &mut polynomials as *mut Vec<Poly<B>>
                     as *mut Vec<Poly<crate::prover::backend::simd::SimdBackend>>;
@@ -973,12 +1039,12 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     }
 
     fn into_memory_mode(mut self, memory_mode: ProverMemoryMode) -> Self {
-        if memory_mode == ProverMemoryMode::LowMemory {
+        if memory_mode.uses_checkpointed_merkle() {
             self.commitment = match self.commitment {
                 CommitmentTreeMerkleProver::Full(tree) => CommitmentTreeMerkleProver::Checkpointed(
                     CheckpointedMerkleProverLifted::from_full_tree(
                         tree,
-                        LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE,
+                        memory_mode.merkle_checkpoint_stride(),
                     ),
                 ),
                 checkpointed @ CommitmentTreeMerkleProver::Checkpointed(_) => checkpointed,
@@ -1086,20 +1152,17 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
 
     /// `LowMemory`-aware variant of [`Self::materialize_evaluations`].
     ///
-    /// Materializes polynomial evaluations in heap-backed buffers up to a fixed
-    /// byte budget, then flushes each full
-    /// batch to file-backed mmap. The final partial batch is left heap-backed: if the entire
-    /// set of re-materialized evals fits within the budget, **no spilling occurs at all** and
-    /// this function is effectively the eager `materialize_evaluations` path with one extra
-    /// atomic load.
+    /// Materializes polynomial evaluations in heap-backed buffers up to `budget_bytes`, then
+    /// flushes each full batch to file-backed mmap. The final partial batch is left
+    /// heap-backed: if the entire set of re-materialized evals fits within the budget, **no
+    /// spilling occurs at all** and this function is effectively the eager
+    /// `materialize_evaluations` path.
     ///
-    /// This lets callers with generous memory budgets (e.g. phones with 2+ GiB of headroom
-    /// during the decommit tail phase) trade RAM for wall-clock: each mmap flush costs a
-    /// file write, a sync, and a mmap call, which adds up to seconds of wall-clock on
-    /// mobile flash for a full privacy-demo-size trace. Defaulting the budget to 2 GiB
-    /// eliminates the spill overhead during the tail phase on phones that can afford it,
-    /// while still bounding the spike for memory-constrained devices that override the
-    /// budget down.
+    /// Callers with generous budgets (e.g. phones with 2+ GiB of headroom during the decommit
+    /// tail phase) trade RAM for wall-clock: each mmap flush costs a file write, a sync, and
+    /// a mmap call — seconds of wall-clock on mobile flash for a privacy-demo-size trace.
+    /// Budgets are typically sourced from
+    /// [`ProverMemoryMode::rematerialize_budget_bytes`].
     ///
     /// The mmap [`crate::prover::spill::EvalMmapGuard`]s are appended to
     /// [`Self::eval_mmap_guards`] so they live as long as the polynomials they back.
@@ -1110,20 +1173,6 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     /// Safe for `B = SimdBackend` only — see [`Self::forget_mmap_backed_evals_if_any`] for
     /// the reasoning. Non-Simd backends should fall back to the eager
     /// `materialize_evaluations`.
-    fn materialize_evaluations_low_memory(
-        &mut self,
-        twiddles: &TwiddleTree<B>,
-        base_column_pool: &BaseColumnPool<B>,
-    ) where
-        crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
-    {
-        self.materialize_evaluations_low_memory_with_budget(
-            twiddles,
-            base_column_pool,
-            DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
-        );
-    }
-
     fn materialize_evaluations_low_memory_with_budget(
         &mut self,
         twiddles: &TwiddleTree<B>,
@@ -1800,7 +1849,7 @@ mod tests {
         );
 
         // Round-trip must be repeatable: a second materialize+drop cycle must also succeed.
-        spilled_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        spilled_tree.materialize_evaluations_low_memory_with_budget(&twiddles, &pool, 1);
         assert!(spilled_tree.polynomials.iter().all(|p| p.evals.is_some()));
         spilled_tree.drop_evaluations();
         assert!(spilled_tree.polynomials.iter().all(|p| p.evals.is_none()));
