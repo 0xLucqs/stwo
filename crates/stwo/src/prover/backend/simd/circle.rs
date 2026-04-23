@@ -150,45 +150,7 @@ impl SimdBackend {
 /// (b) large allocations on iOS bypass libsystem_malloc's VA-retaining magazine path and are
 /// released cleanly to the kernel, so the larger transient is actually *less* malloc pressure
 /// than hundreds of tiny allocs.
-///
-/// Override via `STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES` (e.g. `1048576` to restore the
-/// historical 1 MiB value for regression comparison).
 const DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES: usize = 128 << 20;
-
-/// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`].
-const LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV: &str = "STWO_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES";
-
-/// Parses the spill batch threshold from a raw env var value (decimal bytes).
-///
-/// Returns `None` for empty, non-numeric, or negative inputs. Kept as a pure function so the
-/// parsing logic can be unit-tested without touching process-global env state.
-fn parse_low_memory_eval_spill_batch_bytes(value: &str) -> Option<usize> {
-    value.trim().parse::<usize>().ok()
-}
-
-/// Returns the eval-column spill batch threshold in bytes for the current process,
-/// honoring [`LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV`].
-///
-/// Falls back to [`DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES`] when the env var is unset
-/// or unparseable. An unparseable value emits a `tracing::warn!` so misconfiguration is
-/// surfaced rather than silently ignored.
-fn low_memory_eval_spill_batch_bytes() -> usize {
-    match std::env::var(LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV) {
-        Ok(raw) => match parse_low_memory_eval_spill_batch_bytes(&raw) {
-            Some(bytes) => bytes,
-            None => {
-                tracing::warn!(
-                    env_var = LOW_MEMORY_EVAL_SPILL_BATCH_BYTES_ENV,
-                    env_value = raw.as_str(),
-                    default_bytes = DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
-                    "Invalid spill batch threshold, using default"
-                );
-                DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES
-            }
-        },
-        Err(_) => DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
-    }
-}
 
 impl PolyOps for SimdBackend {
     // The twiddles type is i32, and not BaseField. This is because the fast AVX mul implementation
@@ -230,7 +192,7 @@ impl PolyOps for SimdBackend {
             );
         }
 
-        let spill_batch_threshold_bytes = low_memory_eval_spill_batch_bytes();
+        let spill_batch_threshold_bytes = DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES;
         let mut spilled_guards = Vec::new();
         let mut spilled_polynomials = Vec::with_capacity(polynomials.len());
         let mut batch = Vec::new();
@@ -806,9 +768,7 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
-    use super::{
-        parse_low_memory_eval_spill_batch_bytes, DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES,
-    };
+    use super::DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES;
     use crate::core::circle::CirclePoint;
     use crate::core::fields::m31::BaseField;
     use crate::core::poly::circle::CanonicCoset;
@@ -821,38 +781,6 @@ mod tests {
     use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 
     #[test]
-    fn parse_spill_batch_bytes_accepts_decimal() {
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("0"), Some(0));
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1"), Some(1));
-        assert_eq!(
-            parse_low_memory_eval_spill_batch_bytes("1048576"),
-            Some(1 << 20)
-        );
-        assert_eq!(
-            parse_low_memory_eval_spill_batch_bytes("268435456"),
-            Some(256 << 20)
-        );
-    }
-
-    #[test]
-    fn parse_spill_batch_bytes_trims_whitespace() {
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("  42  "), Some(42));
-        assert_eq!(
-            parse_low_memory_eval_spill_batch_bytes("\t1024\n"),
-            Some(1024)
-        );
-    }
-
-    #[test]
-    fn parse_spill_batch_bytes_rejects_invalid_inputs() {
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes(""), None);
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("abc"), None);
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("-1"), None);
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1.5"), None);
-        assert_eq!(parse_low_memory_eval_spill_batch_bytes("1MB"), None);
-    }
-
-    #[test]
     fn default_spill_batch_bytes_is_phone_friendly() {
         // The default must stay strictly below the historical 256 MiB tuning so that mobile
         // targets do not OOM during the LowMemory eval phase. If you bump this, also reconcile
@@ -861,6 +789,7 @@ mod tests {
             assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES > 0);
             assert!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES < 256 << 20);
         }
+        assert_eq!(DEFAULT_LOW_MEMORY_EVAL_SPILL_BATCH_BYTES, 128 << 20);
     }
     use crate::prover::poly::{BitReversedOrder, NaturalOrder};
 

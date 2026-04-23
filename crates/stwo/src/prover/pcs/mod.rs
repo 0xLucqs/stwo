@@ -168,13 +168,10 @@ const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 /// Raising this budget trades RAM for wall-clock: each mmap flush costs a file write, a
 /// sync, and a mmap call (tens of ms per column on mobile flash). Desktop-class targets keep
 /// a 2 GiB default so the tail phase can often avoid re-spill I/O entirely once the early
-/// commitment peak is gone. On iOS, the active low-memory path now rematerializes directly into
-/// mmap-backed batches instead of heap-then-spill, but the same knob still sets the target batch
-/// size for that direct-mmap path and the fallback heap budget for any non-SIMD callers. The old
-/// `1`-byte iOS default was a diagnostic setting used before direct-mmap rematerialization
-/// existed; with extended VA enabled it is now too aggressive and creates unnecessary extra spill
-/// work. So iOS defaults to a modest 64 MiB rematerialization budget unless the embedding app
-/// overrides it explicitly.
+/// commitment peak is gone. On iOS, the active low-memory path rematerializes directly into
+/// mmap-backed batches instead of heap-then-spill, but the same fixed budget still sets the
+/// target batch size for that direct-mmap path and the fallback heap budget for any non-SIMD
+/// callers.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP: usize = 2 << 30;
 #[cfg(target_os = "ios")]
@@ -188,165 +185,6 @@ const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = 64 << 20;
 #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 #[cfg(not(target_os = "ios"))]
 const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = crate::prover::spill::EVAL_SPILL_CHUNK_BYTES;
-
-/// Environment variable name for overriding [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
-const LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV: &str = "STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES";
-
-/// Process-wide override for the re-materialization heap budget.
-///
-/// Uses `0` as the "unset" sentinel because a 0-byte budget is semantically meaningless for
-/// this knob and would degenerate to per-poly spilling (which is exactly what the pre-budget
-/// behavior was — a caller who wants that can set it to `1` explicitly).
-static LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Sets a process-wide override for the [`ProverMemoryMode::LowMemory`] re-materialization
-/// heap budget in bytes.
-///
-/// This takes precedence over the `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES` environment
-/// variable and is intended for embedded targets (iOS) where shell env vars do not propagate
-/// into the app process. Call this once at startup, before the first
-/// [`CommitmentSchemeProver::prove_values`] invocation:
-///
-/// ```ignore
-/// // 1.5 GiB budget on a phone with ~2 GiB of app headroom.
-/// stwo::prover::set_low_memory_materialize_budget_bytes(1_500 * 1024 * 1024);
-/// ```
-///
-/// Passing `0` clears the override and returns control to the env var / default. Any other
-/// positive value wins unconditionally.
-pub fn set_low_memory_materialize_budget_bytes(bytes: usize) {
-    LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Release);
-    tracing::info!(bytes, "stwo low-memory materialize budget override set");
-}
-
-/// Parses the re-materialization budget from a raw env var value (decimal bytes).
-///
-/// Returns `None` for empty, non-numeric, zero, or negative inputs. `0` is rejected at this
-/// layer so it cannot be mistaken for "disable batching entirely".
-fn parse_low_memory_materialize_budget_bytes(value: &str) -> Option<usize> {
-    value.trim().parse::<usize>().ok().filter(|&b| b > 0)
-}
-
-/// Resolves the active re-materialization budget in bytes.
-///
-/// Resolution order (first match wins): programmatic override →
-/// `STWO_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES` env var →
-/// [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`].
-fn low_memory_materialize_budget_bytes() -> usize {
-    let override_val =
-        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-    if override_val > 0 {
-        return override_val;
-    }
-    match std::env::var(LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV) {
-        Ok(raw) => match parse_low_memory_materialize_budget_bytes(&raw) {
-            Some(b) => b,
-            None => {
-                tracing::warn!(
-                    env_var = LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_ENV,
-                    env_value = raw.as_str(),
-                    default_bytes = DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
-                    "Invalid re-materialize budget, using default"
-                );
-                DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES
-            }
-        },
-        Err(_) => DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
-    }
-}
-
-/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: no override set.
-const PROVER_MEMORY_MODE_OVERRIDE_UNSET: u8 = 0;
-/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: pin to
-/// [`ProverMemoryMode::Fast`].
-const PROVER_MEMORY_MODE_OVERRIDE_FAST: u8 = 1;
-/// Sentinel encoding for [`DEFAULT_PROVER_MEMORY_MODE_OVERRIDE`]: pin to
-/// [`ProverMemoryMode::LowMemory`].
-const PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY: u8 = 2;
-
-/// Process-wide override for the default prover memory mode.
-///
-/// Set via [`set_default_prover_memory_mode`]. When non-zero, this takes precedence over the
-/// `STWO_PROVER_MEMORY_MODE` environment variable in [`default_prover_memory_mode`]. Encoded
-/// as a `u8` so the override is lock-free and cheap to consult on every prover construction.
-static DEFAULT_PROVER_MEMORY_MODE_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(PROVER_MEMORY_MODE_OVERRIDE_UNSET);
-
-/// Sets a process-wide override for the default prover memory mode.
-///
-/// This takes precedence over the `STWO_PROVER_MEMORY_MODE` environment variable and applies
-/// to every [`CommitmentSchemeProver`] constructed *after* this call. Existing provers retain
-/// their original mode unless explicitly updated via [`CommitmentSchemeProver::set_memory_mode`].
-///
-/// Designed for embedded targets where shell environment variables do not propagate into the
-/// app process — for example, iOS apps that need to opt into [`ProverMemoryMode::LowMemory`]
-/// at startup. Call this once early in your `main`/`AppDelegate` before any prover is built:
-///
-/// ```ignore
-/// stwo::prover::set_default_prover_memory_mode(stwo::prover::ProverMemoryMode::LowMemory);
-/// ```
-///
-/// Calling this multiple times is permitted; the most recent call wins. Concurrent callers see
-/// linearizable updates via release/acquire ordering on an atomic `u8`.
-pub fn set_default_prover_memory_mode(mode: ProverMemoryMode) {
-    let encoded = match mode {
-        ProverMemoryMode::Fast => PROVER_MEMORY_MODE_OVERRIDE_FAST,
-        ProverMemoryMode::LowMemory => PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
-    };
-    DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Release);
-    tracing::info!(?mode, "stwo prover memory mode override set");
-}
-
-const fn parse_prover_memory_mode(value: &str) -> Option<ProverMemoryMode> {
-    if value.eq_ignore_ascii_case("fast") {
-        Some(ProverMemoryMode::Fast)
-    } else if value.eq_ignore_ascii_case("low_memory")
-        || value.eq_ignore_ascii_case("low-memory")
-        || value.eq_ignore_ascii_case("lowmemory")
-        || value.eq_ignore_ascii_case("checkpointed")
-    {
-        Some(ProverMemoryMode::LowMemory)
-    } else {
-        None
-    }
-}
-
-/// Resolves the prover memory mode for a freshly constructed [`CommitmentSchemeProver`].
-///
-/// Resolution order (first match wins):
-/// 1. Process-wide override set via [`set_default_prover_memory_mode`].
-/// 2. The `STWO_PROVER_MEMORY_MODE` environment variable.
-/// 3. [`ProverMemoryMode::Fast`] as the conservative default.
-///
-/// The resolved mode is logged at `info` level along with its source so the active mode is
-/// observable in production logs (e.g. iOS Console.app). This avoids silently falling back to
-/// `Fast` on platforms where the env var does not propagate to the app process.
-fn default_prover_memory_mode() -> ProverMemoryMode {
-    let override_value =
-        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-    let (mode, source) = match override_value {
-        PROVER_MEMORY_MODE_OVERRIDE_FAST => (ProverMemoryMode::Fast, "override"),
-        PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY => (ProverMemoryMode::LowMemory, "override"),
-        // PROVER_MEMORY_MODE_OVERRIDE_UNSET (and defensively any unknown sentinel) — fall back
-        // to the env var, then to the conservative default.
-        _ => match std::env::var("STWO_PROVER_MEMORY_MODE") {
-            Ok(value) => match parse_prover_memory_mode(&value) {
-                Some(mode) => (mode, "env"),
-                None => {
-                    tracing::warn!(
-                        env_value = value.as_str(),
-                        "Unknown STWO_PROVER_MEMORY_MODE, defaulting to fast mode"
-                    );
-                    (ProverMemoryMode::Fast, "default")
-                }
-            },
-            Err(_) => (ProverMemoryMode::Fast, "default"),
-        },
-    };
-    tracing::info!(?mode, source, "stwo prover memory mode resolved");
-    mode
-}
 
 pub enum CommitmentTreeMerkleProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
     Full(MerkleProverLifted<B, MC::H>),
@@ -383,12 +221,26 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     /// Creates a new empty commitment scheme prover with the given configuration and twiddles. The
     /// commitment scheme does not store the polynomials coefficients by default.
     pub fn new(config: PcsConfig, twiddles: &'a TwiddleTree<B>) -> Self {
+        Self::new_with_mode(config, twiddles, ProverMemoryMode::Fast)
+    }
+
+    /// Like [`Self::new`] but lets the caller pick the memory mode up front.
+    ///
+    /// Use this instead of [`Self::new`] + [`Self::set_memory_mode`] when the mode is known at
+    /// construction time: it guarantees the first `commit()` already runs under the chosen
+    /// policy, which matters for `LowMemory` since per-tree spill decisions happen during
+    /// commit and cannot be undone later.
+    pub fn new_with_mode(
+        config: PcsConfig,
+        twiddles: &'a TwiddleTree<B>,
+        memory_mode: ProverMemoryMode,
+    ) -> Self {
         CommitmentSchemeProver {
             trees: TreeVec::default(),
             config,
             twiddles,
             store_polynomials_coefficients: false,
-            memory_mode: default_prover_memory_mode(),
+            memory_mode,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
         }
     }
@@ -398,12 +250,23 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         twiddles: &'a TwiddleTree<B>,
         base_column_pool: &'a BaseColumnPool<B>,
     ) -> Self {
+        Self::with_memory_pool_and_mode(config, twiddles, base_column_pool, ProverMemoryMode::Fast)
+    }
+
+    /// Like [`Self::with_memory_pool`] but lets the caller pick the memory mode up front. See
+    /// [`Self::new_with_mode`] for why that matters.
+    pub fn with_memory_pool_and_mode(
+        config: PcsConfig,
+        twiddles: &'a TwiddleTree<B>,
+        base_column_pool: &'a BaseColumnPool<B>,
+        memory_mode: ProverMemoryMode,
+    ) -> Self {
         CommitmentSchemeProver {
             trees: TreeVec::default(),
             config,
             twiddles,
             store_polynomials_coefficients: false,
-            memory_mode: default_prover_memory_mode(),
+            memory_mode,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
         }
     }
@@ -1223,8 +1086,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
 
     /// `LowMemory`-aware variant of [`Self::materialize_evaluations`].
     ///
-    /// Materializes polynomial evaluations in heap-backed buffers up to a configurable
-    /// byte budget (see [`low_memory_materialize_budget_bytes`]), then flushes each full
+    /// Materializes polynomial evaluations in heap-backed buffers up to a fixed
+    /// byte budget, then flushes each full
     /// batch to file-backed mmap. The final partial batch is left heap-backed: if the entire
     /// set of re-materialized evals fits within the budget, **no spilling occurs at all** and
     /// this function is effectively the eager `materialize_evaluations` path with one extra
@@ -1252,6 +1115,21 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         twiddles: &TwiddleTree<B>,
         base_column_pool: &BaseColumnPool<B>,
     ) where
+        crate::prover::backend::simd::SimdBackend: BackendForChannel<MC>,
+    {
+        self.materialize_evaluations_low_memory_with_budget(
+            twiddles,
+            base_column_pool,
+            DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+        );
+    }
+
+    fn materialize_evaluations_low_memory_with_budget(
+        &mut self,
+        twiddles: &TwiddleTree<B>,
+        base_column_pool: &BaseColumnPool<B>,
+        budget_bytes: usize,
+    ) where
         // Required so the iOS-only SimdBackend-specialised branch below can
         // cast to `CommitmentTreeProver<SimdBackend, MC>` (which itself
         // requires `SimdBackend: BackendForChannel<MC>` to be a valid type).
@@ -1271,13 +1149,14 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             let pool_ptr = base_column_pool as *const BaseColumnPool<B>
                 as *const BaseColumnPool<crate::prover::backend::simd::SimdBackend>;
             unsafe {
-                (*self_ptr)
-                    .materialize_evaluations_low_memory_direct_mmap(&*twiddles_ptr, &*pool_ptr);
+                (*self_ptr).materialize_evaluations_low_memory_direct_mmap_with_budget(
+                    &*twiddles_ptr,
+                    &*pool_ptr,
+                    budget_bytes,
+                );
             }
             return;
         }
-
-        let budget_bytes = low_memory_materialize_budget_bytes();
         let total = self.polynomials.len();
         // Accumulated bytes of newly-materialized (heap-backed) polys in the current batch,
         // plus the half-open index range the batch spans. `pending_start` is `None` when no
@@ -1544,8 +1423,20 @@ where
         twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
         base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
     ) {
-        let target_batch_bytes =
-            low_memory_materialize_budget_bytes().max(DIRECT_MMAP_BATCH_FLOOR_BYTES);
+        self.materialize_evaluations_low_memory_direct_mmap_with_budget(
+            twiddles,
+            base_column_pool,
+            DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+        );
+    }
+
+    fn materialize_evaluations_low_memory_direct_mmap_with_budget(
+        &mut self,
+        twiddles: &TwiddleTree<crate::prover::backend::simd::SimdBackend>,
+        base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
+        budget_bytes: usize,
+    ) {
+        let target_batch_bytes = budget_bytes.max(DIRECT_MMAP_BATCH_FLOOR_BYTES);
         let mut batch_layouts = Vec::new();
         let mut batch_bytes = 0usize;
 
@@ -1720,14 +1611,9 @@ mod tests {
     use itertools::Itertools;
 
     use super::{
-        default_prover_memory_mode, parse_low_memory_materialize_budget_bytes,
-        parse_prover_memory_mode, set_default_prover_memory_mode,
-        set_low_memory_materialize_budget_bytes, CommitmentTreeMerkleProver, CommitmentTreeProver,
-        ProverMemoryMode, DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
-        DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP, DEFAULT_PROVER_MEMORY_MODE_OVERRIDE,
-        DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE, LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE,
-        PROVER_MEMORY_MODE_OVERRIDE_FAST, PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
-        PROVER_MEMORY_MODE_OVERRIDE_UNSET,
+        CommitmentTreeMerkleProver, CommitmentTreeProver, ProverMemoryMode,
+        DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES,
+        DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP, DIRECT_MMAP_FAIL_MIN_COLUMNS_OVERRIDE,
     };
     use crate::core::channel::MerkleChannel;
     use crate::core::fields::m31::M31;
@@ -1773,94 +1659,6 @@ mod tests {
             pool,
             memory_mode,
         )
-    }
-
-    #[test]
-    fn test_parse_prover_memory_mode_fast() {
-        assert_eq!(
-            parse_prover_memory_mode("fast"),
-            Some(ProverMemoryMode::Fast)
-        );
-    }
-
-    #[test]
-    fn test_parse_prover_memory_mode_low_memory_aliases() {
-        for value in ["low_memory", "low-memory", "lowmemory", "checkpointed"] {
-            assert_eq!(
-                parse_prover_memory_mode(value),
-                Some(ProverMemoryMode::LowMemory)
-            );
-        }
-    }
-
-    /// Exercises the process-wide [`set_default_prover_memory_mode`] override mechanism.
-    ///
-    /// All override scenarios are bundled into a single `#[test]` function to serialize them
-    /// against each other and against any other test in the binary that constructs a
-    /// [`CommitmentSchemeProver`] (which would otherwise observe a leaked override and read
-    /// the wrong default mode). The test saves and restores the override sentinel around each
-    /// scenario so concurrent tests in the same binary remain unaffected.
-    #[test]
-    fn test_set_default_prover_memory_mode_override() {
-        // Snapshot the current sentinel so we can restore it on every exit path, including
-        // panic propagation. We deliberately do not assert the initial state because parallel
-        // tests might have set it; we only require that we leave it as we found it.
-        let initial_override =
-            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-
-        // Scenario 1: setting LowMemory pins default_prover_memory_mode() to LowMemory
-        // regardless of the env var (we don't manipulate the env var here to keep this test
-        // free of process-global env interference).
-        set_default_prover_memory_mode(ProverMemoryMode::LowMemory);
-        assert_eq!(
-            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
-            PROVER_MEMORY_MODE_OVERRIDE_LOW_MEMORY,
-            "override sentinel must encode LowMemory after set_default_prover_memory_mode(LowMemory)"
-        );
-        assert_eq!(
-            default_prover_memory_mode(),
-            ProverMemoryMode::LowMemory,
-            "resolver must honor LowMemory override"
-        );
-
-        // Scenario 2: overriding to Fast wins over a previous LowMemory override.
-        set_default_prover_memory_mode(ProverMemoryMode::Fast);
-        assert_eq!(
-            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
-            PROVER_MEMORY_MODE_OVERRIDE_FAST,
-            "override sentinel must encode Fast after set_default_prover_memory_mode(Fast)"
-        );
-        assert_eq!(
-            default_prover_memory_mode(),
-            ProverMemoryMode::Fast,
-            "resolver must honor Fast override"
-        );
-
-        // Scenario 3: re-setting to LowMemory works (the override is not single-shot).
-        set_default_prover_memory_mode(ProverMemoryMode::LowMemory);
-        assert_eq!(
-            default_prover_memory_mode(),
-            ProverMemoryMode::LowMemory,
-            "override must be replaceable, not single-shot"
-        );
-
-        // Scenario 4: clearing the override (via the unset sentinel) returns control to the
-        // env-var/default fallback path. We can't easily test the env var branch here without
-        // mutating process state, so we just verify the sentinel transitions correctly.
-        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.store(
-            PROVER_MEMORY_MODE_OVERRIDE_UNSET,
-            std::sync::atomic::Ordering::Release,
-        );
-        assert_eq!(
-            DEFAULT_PROVER_MEMORY_MODE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire),
-            PROVER_MEMORY_MODE_OVERRIDE_UNSET,
-            "manual unset must clear the override sentinel"
-        );
-
-        // Restore the snapshot so unrelated tests in the same binary observe the same global
-        // state they started with.
-        DEFAULT_PROVER_MEMORY_MODE_OVERRIDE
-            .store(initial_override, std::sync::atomic::Ordering::Release);
     }
 
     /// Builds a SIMD `LowMemory` `CommitmentTreeProver` shaped like the privacy-demo workload:
@@ -1943,15 +1741,8 @@ mod tests {
     ///    on `Vec::drop` of mmap-backed memory — this is the regression that breaks if
     ///    [`CommitmentTreeProver::forget_mmap_backed_evals_if_any`] is wired incorrectly.
     ///
-    /// Called as a sub-scenario from [`test_materialize_low_memory_budget_and_round_trip`]
-    /// so that all budget-override-touching logic is serialized behind a single `#[test]`
-    /// entry point — two concurrent `#[test]` functions both mutating
-    /// [`LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE`] would race on save/restore and
-    /// corrupt each other's expected budget.
+    /// Called as a sub-scenario from [`test_materialize_low_memory_budget_and_round_trip`].
     fn run_simd_low_memory_materialize_round_trip_scenario() {
-        // Force the smallest meaningful budget so the spill code path is exercised.
-        // The caller is responsible for save/restore around this whole sub-scenario.
-        set_low_memory_materialize_budget_bytes(1);
         // Twiddle precomputation is shared between the two trees so the materialized values
         // are byte-identical.
         let pool = BaseColumnPool::<SimdBackend>::new();
@@ -1969,7 +1760,7 @@ mod tests {
         );
 
         // Step 2: materialize-and-spill per poly.
-        spilled_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        spilled_tree.materialize_evaluations_low_memory_with_budget(&twiddles, &pool, 1);
         assert!(
             spilled_tree.polynomials.iter().all(|p| p.evals.is_some()),
             "every poly must have evals after materialize_evaluations_low_memory"
@@ -2018,12 +1809,7 @@ mod tests {
         eager_tree.drop_evaluations();
     }
 
-    /// Single entry point for every test that mutates the global
-    /// [`LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE`]. Bundling them under one `#[test]`
-    /// serializes them within this function so that no two scenarios ever race on
-    /// save/restore (which would cause one scenario's restore to stomp on another's
-    /// expected budget). Exercises:
-    ///
+    /// Exercises:
     /// - **Round-trip correctness** at `budget = 1`: every poly spills, mmap-backed evals must
     ///   match the eager path byte-for-byte, `drop_evaluations`/`release_evaluations` must release
     ///   mmap pages cleanly.
@@ -2036,13 +1822,8 @@ mod tests {
     /// - **Medium budget**: budget smaller than one poly's eval bytes, so every materialize step
     ///   crosses the flush threshold. Validates the batching path end-to-end and that guards are
     ///   produced.
-    ///
-    /// The budget override is saved once at the top and restored once at the bottom.
     #[test]
     fn test_materialize_low_memory_budget_and_round_trip() {
-        let prev_budget =
-            LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-
         // Scenario 0: round-trip correctness with budget=1 (see
         // `run_simd_low_memory_materialize_round_trip_scenario` for the detailed contract).
         run_simd_low_memory_materialize_round_trip_scenario();
@@ -2051,7 +1832,6 @@ mod tests {
         let twiddles = SimdBackend::precompute_twiddles(CanonicCoset::new(8).half_coset());
 
         // ---- Scenario 1: huge budget → no spill, everything heap-backed ---------------
-        set_low_memory_materialize_budget_bytes(2usize << 30); // 2 GiB — far exceeds test data
         let mut huge_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
         assert!(
             huge_budget_tree
@@ -2060,7 +1840,11 @@ mod tests {
                 .all(|p| p.evals.is_none()),
             "precondition: LowMemory construction drops evals"
         );
-        huge_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        huge_budget_tree.materialize_evaluations_low_memory_with_budget(
+            &twiddles,
+            &pool,
+            2usize << 30,
+        );
         assert!(
             huge_budget_tree
                 .polynomials
@@ -2082,9 +1866,8 @@ mod tests {
             .all(|p| p.evals.is_none()));
 
         // ---- Scenario 2: tiny budget → spill every poly ------------------------------
-        set_low_memory_materialize_budget_bytes(1);
         let mut tiny_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
-        tiny_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        tiny_budget_tree.materialize_evaluations_low_memory_with_budget(&twiddles, &pool, 1);
         assert!(
             tiny_budget_tree
                 .polynomials
@@ -2104,9 +1887,8 @@ mod tests {
         // so we get ~6 flushes. The final partial batch is trivially empty in this case,
         // but the important assertion is that the batching path is exercised end-to-end
         // and guards get produced.
-        set_low_memory_materialize_budget_bytes(64);
         let mut medium_budget_tree = prepare_simd_low_memory_tree::<Blake2sMerkleChannel>(&pool);
-        medium_budget_tree.materialize_evaluations_low_memory(&twiddles, &pool);
+        medium_budget_tree.materialize_evaluations_low_memory_with_budget(&twiddles, &pool, 64);
         assert!(
             medium_budget_tree
                 .polynomials
@@ -2119,37 +1901,12 @@ mod tests {
             "medium budget must have spilled at least once with this tree shape"
         );
         medium_budget_tree.drop_evaluations();
-
-        // Restore global state so parallel tests see what they started with.
-        LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_OVERRIDE
-            .store(prev_budget, std::sync::atomic::Ordering::Release);
-    }
-
-    #[test]
-    fn test_parse_low_memory_materialize_budget_bytes() {
-        // Accepts positive decimal integers.
-        assert_eq!(parse_low_memory_materialize_budget_bytes("1"), Some(1));
-        assert_eq!(
-            parse_low_memory_materialize_budget_bytes("1073741824"),
-            Some(1usize << 30)
-        );
-        assert_eq!(
-            parse_low_memory_materialize_budget_bytes("  42  "),
-            Some(42)
-        );
-        // Rejects zero (0-byte budget is meaningless for this knob), negatives, non-numeric.
-        assert_eq!(parse_low_memory_materialize_budget_bytes("0"), None);
-        assert_eq!(parse_low_memory_materialize_budget_bytes(""), None);
-        assert_eq!(parse_low_memory_materialize_budget_bytes("-1"), None);
-        assert_eq!(parse_low_memory_materialize_budget_bytes("abc"), None);
-        assert_eq!(parse_low_memory_materialize_budget_bytes("1.5"), None);
-        assert_eq!(parse_low_memory_materialize_budget_bytes("1MB"), None);
     }
 
     #[test]
     fn test_platform_default_low_memory_materialize_budget_bytes() {
         #[cfg(target_os = "ios")]
-        assert_eq!(DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES, 1);
+        assert_eq!(DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES, 64 << 20);
 
         #[cfg(not(target_os = "ios"))]
         assert_eq!(

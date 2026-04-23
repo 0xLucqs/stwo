@@ -47,11 +47,7 @@ mod android_log {
 
     #[link(name = "log")]
     extern "C" {
-        fn __android_log_write(
-            priority: c_int,
-            tag: *const c_char,
-            text: *const c_char,
-        ) -> c_int;
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
     }
 
     pub fn write_info(line: &str) {
@@ -603,8 +599,8 @@ mod vm_walk_impl_linux {
             // Anonymous: inode=0 and either no path or a kernel pseudo-name
             // ([heap], [stack], [anon:...], [vvar], ...). Shared file-backed
             // mappings (e.g. stwo's MAP_SHARED tempfiles) carry 's' in perms.
-            let is_anon = inode == "0"
-                && pathname.map_or(true, |p| p.is_empty() || p.starts_with('['));
+            let is_anon =
+                inode == "0" && pathname.map_or(true, |p| p.is_empty() || p.starts_with('['));
             if is_anon {
                 out.anon_regions += 1;
                 out.anon_bytes += size;
@@ -665,8 +661,6 @@ mod merkle_slot_pool {
     const HASH_SLOT_BYTES: usize = 128 << 20;
     const DEFAULT_STATE_SLOT_COUNT: usize = 2;
     const DEFAULT_HASH_SLOT_COUNT: usize = 2;
-    const STATE_SLOT_COUNT_ENV: &str = "STWO_MERKLE_STATE_SLOT_COUNT";
-    const HASH_SLOT_COUNT_ENV: &str = "STWO_MERKLE_HASH_SLOT_COUNT";
 
     #[derive(Debug)]
     struct SlotPoolState {
@@ -826,27 +820,13 @@ mod merkle_slot_pool {
             ContiguousMappingPurpose::LiftedMerkleState => {
                 static STATE_POOL: OnceLock<Option<Mutex<SlotPoolState>>> = OnceLock::new();
                 STATE_POOL
-                    .get_or_init(|| {
-                        init_pool(
-                            "state",
-                            STATE_SLOT_BYTES,
-                            DEFAULT_STATE_SLOT_COUNT,
-                            STATE_SLOT_COUNT_ENV,
-                        )
-                    })
+                    .get_or_init(|| init_pool("state", STATE_SLOT_BYTES, DEFAULT_STATE_SLOT_COUNT))
                     .as_ref()
             }
             ContiguousMappingPurpose::LiftedMerkleHash => {
                 static HASH_POOL: OnceLock<Option<Mutex<SlotPoolState>>> = OnceLock::new();
                 HASH_POOL
-                    .get_or_init(|| {
-                        init_pool(
-                            "hash",
-                            HASH_SLOT_BYTES,
-                            DEFAULT_HASH_SLOT_COUNT,
-                            HASH_SLOT_COUNT_ENV,
-                        )
-                    })
+                    .get_or_init(|| init_pool("hash", HASH_SLOT_BYTES, DEFAULT_HASH_SLOT_COUNT))
                     .as_ref()
             }
         }
@@ -861,19 +841,9 @@ mod merkle_slot_pool {
     fn init_pool(
         label: &'static str,
         slot_size: usize,
-        default_slot_count: usize,
-        env_var: &str,
+        slot_count: usize,
     ) -> Option<Mutex<SlotPoolState>> {
         let page_size = page_size()?;
-        let slot_count = std::env::var(env_var)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(default_slot_count);
-        if slot_count == 0 {
-            eprintln!("MERKLE_SLOT_POOL disabled label={label} via {env_var}=0");
-            return None;
-        }
-
         let slot_size = align_up(slot_size, page_size);
         let total_len = slot_size.checked_mul(slot_count)?;
         let ptr = unsafe {

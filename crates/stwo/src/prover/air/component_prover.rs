@@ -405,19 +405,19 @@ impl<B: Backend> ComponentProvers<'_, B> {
 
 #[cfg(test)]
 mod tests {
+    use super::{reset_spilled_coefficient_load_count, spilled_coefficient_load_count, Poly};
     use crate::core::fields::m31::M31;
     use crate::core::poly::circle::CanonicCoset;
     use crate::prover::backend::CpuBackend;
     use crate::prover::poly::circle::CircleCoefficients;
     use crate::prover::spill::CoefficientSpillFile;
 
-    use super::{reset_spilled_coefficient_load_count, spilled_coefficient_load_count, Poly};
-
     fn make_spilled_cpu_poly(log_size: u32) -> Poly<CpuBackend> {
-        let coeffs = CircleCoefficients::<CpuBackend>::new(
-            (0..1u32 << log_size).map(M31::from).collect(),
-        );
-        let evals = coeffs.clone().evaluate(CanonicCoset::new(log_size).circle_domain());
+        let coeffs =
+            CircleCoefficients::<CpuBackend>::new((0..1u32 << log_size).map(M31::from).collect());
+        let evals = coeffs
+            .clone()
+            .evaluate(CanonicCoset::new(log_size).circle_domain());
 
         let mut spill = CoefficientSpillFile::new().unwrap();
         let spill_index = spill.write_coefficients(&coeffs.coeffs).unwrap();
@@ -438,9 +438,7 @@ mod tests {
     fn spilled_poly_eval_at_points_loads_coefficients_once() {
         let poly = make_spilled_cpu_poly(4);
         let domain = CanonicCoset::new(4).circle_domain();
-        let points = (0..4)
-            .map(|i| domain.at(i).into_ef())
-            .collect::<Vec<_>>();
+        let points = (0..4).map(|i| domain.at(i).into_ef()).collect::<Vec<_>>();
 
         reset_spilled_coefficient_load_count();
         let values = poly.eval_at_points(points.iter().copied(), None);
