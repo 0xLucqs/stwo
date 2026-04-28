@@ -210,10 +210,11 @@ impl ProverMemoryMode {
 
 const LOW_MEMORY_TRACE_MERKLE_CHECKPOINT_STRIDE: u32 = 4;
 
-/// Tight re-materialization budget for [`ProverMemoryMode::UltraLow`]. Deliberately smaller
-/// than any platform default so callers opting into this tier get the aggressive spill
-/// behavior regardless of target OS.
-const ULTRA_LOW_MATERIALIZE_BUDGET_BYTES: usize = 1 << 20;
+/// Re-materialization batch budget for [`ProverMemoryMode::UltraLow`]. Smaller than
+/// [`DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES`] so this tier flushes evaluations to
+/// file-backed mmap more aggressively, trading wall-clock for resident-memory headroom on
+/// memory-constrained phones.
+const ULTRA_LOW_MATERIALIZE_BUDGET_BYTES: usize = 16 << 20;
 
 /// Default budget (in bytes) for heap-backed evaluation memory used during
 /// [`ProverMemoryMode::LowMemory`] re-materialization (composition polynomial generation and
@@ -239,12 +240,6 @@ const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize = 64 << 20;
 #[cfg(not(target_os = "ios"))]
 const DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES: usize =
     DEFAULT_LOW_MEMORY_MATERIALIZE_BUDGET_BYTES_DESKTOP;
-
-#[cfg(target_os = "ios")]
-const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = 64 << 20;
-#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
-#[cfg(not(target_os = "ios"))]
-const DIRECT_MMAP_BATCH_FLOOR_BYTES: usize = crate::prover::spill::EVAL_SPILL_CHUNK_BYTES;
 
 pub enum CommitmentTreeMerkleProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
     Full(MerkleProverLifted<B, MC::H>),
@@ -1485,7 +1480,7 @@ where
         base_column_pool: &BaseColumnPool<crate::prover::backend::simd::SimdBackend>,
         budget_bytes: usize,
     ) {
-        let target_batch_bytes = budget_bytes.max(DIRECT_MMAP_BATCH_FLOOR_BYTES);
+        let target_batch_bytes = budget_bytes;
         let mut batch_layouts = Vec::new();
         let mut batch_bytes = 0usize;
 
