@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use tracing::{info, span, Level};
 
 use crate::core::channel::{Channel, MerkleChannel};
@@ -272,12 +272,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect::<Vec<_>>(),
         );
         let commitments = self.roots();
-        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = self
-            .trees
-            .as_ref()
-            .zip_eq(query_positions_tree)
+        let decommit_inputs = self.trees.as_ref().zip_eq(query_positions_tree).0;
+        #[cfg(not(feature = "parallel"))]
+        let decommit_iter = decommit_inputs.into_iter();
+        #[cfg(feature = "parallel")]
+        let decommit_iter = decommit_inputs.into_par_iter();
+        let decommit_results = decommit_iter
             .map(|(tree, query_positions)| tree.decommit(query_positions))
-            .0
+            .collect::<Vec<_>>();
+        let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = decommit_results
             .into_iter()
             .map(|(v, x)| (v, x.decommitment, x.aux))
             .multiunzip();
