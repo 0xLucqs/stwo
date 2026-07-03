@@ -40,8 +40,8 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
     ///
     /// # Note
     ///
-    /// If the length of a smallest column (e.g. the first) is smaller than `N_LANES`, the
-    /// implementation falls back to the CPU implementation.
+    /// If all columns are smaller than `N_LANES`, the implementation falls back to the CPU
+    /// implementation.
     #[allow(clippy::uninit_vec)]
     fn build_leaves(
         columns: &[&Col<Self, BaseField>],
@@ -51,13 +51,29 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for SimdBackend {
             let hasher = Blake2sMerkleHasher::default();
             return vec![hasher.finalize()];
         }
-        if columns.first().unwrap().len() < N_LANES {
+        if columns.last().unwrap().len() < N_LANES {
             let cpu_cols = columns.iter().map(|column| column.to_cpu()).collect_vec();
             return <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
                 &cpu_cols.iter().collect_vec(),
                 lifting_log_size,
             );
         }
+        let pre_lifted_columns = (columns.first().unwrap().len() < N_LANES).then(|| {
+            columns
+                .iter()
+                .take_while(|column| column.len() < N_LANES)
+                .map(|column| pre_lift_to_n_lanes(column))
+                .collect_vec()
+        });
+        let columns = if let Some(pre_lifted_columns) = &pre_lifted_columns {
+            pre_lifted_columns
+                .iter()
+                .chain(columns[pre_lifted_columns.len()..].iter().copied())
+                .collect_vec()
+        } else {
+            columns.to_vec()
+        };
+        let columns = columns.as_slice();
         // Note that, in this function, all variables that track log sizes
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
@@ -344,6 +360,16 @@ fn get_lifting_indices(
     res
 }
 
+fn pre_lift_to_n_lanes(column: &BaseColumn) -> BaseColumn {
+    let log_size = column.len().ilog2();
+    let log_ratio = LOG_N_LANES - log_size;
+    let values: [BaseField; N_LANES] = array::from_fn(|i| {
+        let src = ((i >> (log_ratio + 1)) << 1) + (i & 1);
+        column.at(src)
+    });
+    BaseColumn::from_cpu(&values)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -428,5 +454,33 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn test_build_leaves_mixed_tiny_and_large_columns() {
+        let columns = [4_usize, 8, 64, 1024]
+            .into_iter()
+            .enumerate()
+            .map(|(col, len)| {
+                (0..len)
+                    .map(|row| M31::from((col * 10_000 + row) as u32))
+                    .collect_vec()
+            })
+            .collect_vec();
+        let simd_columns = columns
+            .iter()
+            .map(|column| BaseColumn::from_cpu(column))
+            .collect_vec();
+
+        assert_eq!(
+            <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+                &columns.iter().collect_vec(),
+                10
+            ),
+            <SimdBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+                &simd_columns.iter().collect_vec(),
+                10
+            )
+        );
     }
 }
