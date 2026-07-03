@@ -257,6 +257,7 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
                 eval_domain.log_size(),
                 self.log_size(),
                 SecureField::zero(),
+                0,
             );
             let [mle_coeffs_col_eval] = eval.next_extension_interaction_mask(aux_interaction, [0]);
             let [carry_quotients_col_eval] =

@@ -192,6 +192,13 @@ impl Deref for RelationCounts {
     }
 }
 
+impl<E: FrameworkEval> FrameworkComponent<E> {
+    /// Total number of logup fractions this component writes per row.
+    pub fn n_logup_fracs(&self) -> usize {
+        self.info.logup_counts.total()
+    }
+}
+
 impl<E: FrameworkEval> Component for FrameworkComponent<E> {
     fn n_constraints(&self) -> usize {
         self.info.n_constraints

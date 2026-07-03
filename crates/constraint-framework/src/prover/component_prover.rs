@@ -174,6 +174,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         // `Sync` requirement on `Self`.
         let self_eval = &self.eval;
         let self_claimed_sum = self.claimed_sum;
+        let n_fracs = self.n_logup_fracs();
 
         iter.for_each(|(chunk_idx, mut chunk)| {
             let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
@@ -189,6 +190,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
                     eval_domain.log_size(),
                     self_eval.log_size(),
                     self_claimed_sum,
+                    n_fracs,
                 );
                 let row_res = self_eval.evaluate(eval).row_res;
 
@@ -281,6 +283,7 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
             eval_log_size,
             component.eval.log_size(),
             component.claimed_sum,
+            component.n_logup_fracs(),
         );
         let row_res = component.eval.evaluate(eval).row_res;
 

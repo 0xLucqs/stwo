@@ -28,6 +28,7 @@ pub struct CpuDomainEvaluator<'a> {
 
 impl<'a> CpuDomainEvaluator<'a> {
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_eval: &'a TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,
         row: usize,
@@ -36,6 +37,7 @@ impl<'a> CpuDomainEvaluator<'a> {
         eval_log_size: u32,
         log_size: u32,
         claimed_sum: SecureField,
+        n_fracs: usize,
     ) -> Self {
         Self {
             trace_eval,
@@ -49,7 +51,12 @@ impl<'a> CpuDomainEvaluator<'a> {
             constraint_index: 0,
             domain_log_size,
             eval_domain_log_size: eval_log_size,
-            logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
+            logup: LogupAtRow::new_with_capacity(
+                INTERACTION_TRACE_IDX,
+                claimed_sum,
+                log_size,
+                n_fracs,
+            ),
         }
     }
 }

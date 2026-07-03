@@ -34,6 +34,7 @@ pub struct SimdDomainEvaluator<'a> {
     pub logup: LogupAtRow<Self>,
 }
 impl<'a> SimdDomainEvaluator<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_eval: &'a TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
         vec_row: usize,
@@ -42,6 +43,7 @@ impl<'a> SimdDomainEvaluator<'a> {
         eval_log_size: u32,
         log_size: u32,
         claimed_sum: SecureField,
+        n_fracs: usize,
     ) -> Self {
         Self {
             trace_eval,
@@ -55,7 +57,12 @@ impl<'a> SimdDomainEvaluator<'a> {
             constraint_index: 0,
             domain_log_size,
             eval_domain_log_size: eval_log_size,
-            logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
+            logup: LogupAtRow::new_with_capacity(
+                INTERACTION_TRACE_IDX,
+                claimed_sum,
+                log_size,
+                n_fracs,
+            ),
         }
     }
 }

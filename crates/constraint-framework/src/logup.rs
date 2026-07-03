@@ -30,10 +30,21 @@ impl<E: EvalAtRow> Default for LogupAtRow<E> {
 }
 impl<E: EvalAtRow> LogupAtRow<E> {
     pub fn new(interaction: usize, claimed_sum: SecureField, log_size: u32) -> Self {
+        Self::new_with_capacity(interaction, claimed_sum, log_size, 0)
+    }
+
+    /// Like [`Self::new`], but pre-allocates room for `n_fracs` fractions, avoiding
+    /// repeated reallocation when the evaluator is constructed once per row.
+    pub fn new_with_capacity(
+        interaction: usize,
+        claimed_sum: SecureField,
+        log_size: u32,
+        n_fracs: usize,
+    ) -> Self {
         Self {
             interaction,
             cumsum_shift: claimed_sum / BaseField::from_u32_unchecked(1 << log_size),
-            fracs: vec![],
+            fracs: Vec::with_capacity(n_fracs),
             is_finalized: true,
             log_size,
         }

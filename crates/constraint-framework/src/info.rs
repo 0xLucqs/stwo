@@ -417,6 +417,11 @@ impl LogupCountPerRow {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &usize)> {
         self.data.iter()
     }
+
+    /// Total number of logup fractions written per row, across all relations.
+    pub fn total(&self) -> usize {
+        self.data.values().sum()
+    }
 }
 
 #[cfg(test)]
