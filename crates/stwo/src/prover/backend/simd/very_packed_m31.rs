@@ -11,6 +11,13 @@ use crate::core::fields::m31::M31;
 use crate::core::fields::qm31::QM31;
 use crate::core::fields::{batch_inverse_in_place, FieldExpOps};
 
+/// On aarch64 (NEON, 128-bit vector registers), a very-packed QM31 value at width 2 spans the
+/// entire vector register file (8 x u32x16 = 32 NEON registers), forcing spills throughout
+/// constraint evaluation; width 1 measures ~25% faster single-thread on the blake benchmark.
+/// Wider ISAs (e.g. AVX-512, where u32x16 is a single register) keep the wider batching.
+#[cfg(target_arch = "aarch64")]
+pub const LOG_N_VERY_PACKED_ELEMS: u32 = 0;
+#[cfg(not(target_arch = "aarch64"))]
 pub const LOG_N_VERY_PACKED_ELEMS: u32 = 1;
 pub const N_VERY_PACKED_ELEMS: usize = 1 << LOG_N_VERY_PACKED_ELEMS;
 
