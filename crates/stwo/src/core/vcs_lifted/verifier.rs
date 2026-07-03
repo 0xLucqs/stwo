@@ -93,6 +93,7 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
     ///
     /// * The witness is too long (not fully consumed).
     /// * The witness is too short (missing values).
+    /// * Queried values for duplicate positions are inconsistent.
     /// * The computed root does not match the expected root.
     ///
     /// # Note
@@ -140,7 +141,9 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
                 // map.
                 Entry::Occupied(entry) => {
                     let old_values = entry.get();
-                    assert_eq!(old_values, &values);
+                    if old_values != &values {
+                        return Err(MerkleVerificationError::InconsistentDuplicateQueryValues);
+                    }
                 }
             }
         }
@@ -204,6 +207,8 @@ pub enum MerkleVerificationError {
     WitnessTooShort,
     #[error("Witness is too long.")]
     WitnessTooLong,
+    #[error("Inconsistent queried values for duplicate query position.")]
+    InconsistentDuplicateQueryValues,
     #[error("Root mismatch.")]
     RootMismatch,
 }
@@ -319,5 +324,41 @@ mod tests {
         verifier
             .verify(&queries, values, decommitment.decommitment)
             .unwrap();
+    }
+
+    #[test]
+    fn test_merkle_inconsistent_duplicate_query_values_returns_error() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let log_sizes = vec![3, 4, 3];
+        let cols: Vec<Vec<BaseField>> = log_sizes
+            .iter()
+            .map(|&log_size| {
+                (0..(1 << log_size))
+                    .map(|_| BaseField::from(rng.gen_range(1..(1u32 << 30))))
+                    .collect()
+            })
+            .collect();
+        let max_log_size = *log_sizes.iter().max().unwrap();
+
+        let merkle = MerkleProverLifted::<CpuBackend, Blake2sMerkleHasher>::commit(
+            cols.iter().collect(),
+            max_log_size,
+            0,
+        );
+
+        let queries = vec![13, 3, 7, 3, 1];
+        let (mut values, decommitment) = merkle.decommit(&queries, cols.iter().collect());
+        let verifier = MerkleVerifierLifted::new(merkle.root(), log_sizes, None);
+
+        let first_duplicate_index = 1;
+        let second_duplicate_index = 3;
+        values[0][second_duplicate_index] = values[0][first_duplicate_index] + BaseField::from(1);
+
+        assert_eq!(
+            verifier
+                .verify(&queries, values, decommitment.decommitment)
+                .unwrap_err(),
+            MerkleVerificationError::InconsistentDuplicateQueryValues
+        );
     }
 }

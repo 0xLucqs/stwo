@@ -11,7 +11,9 @@ use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{
     CommitmentSchemeProof, CommitmentSchemeProofAux, ExtendedCommitmentSchemeProof, PointSample,
 };
-use crate::core::pcs::utils::prepare_preprocessed_query_positions;
+use crate::core::pcs::utils::{
+    prepare_preprocessed_query_positions, prepare_query_positions_for_height,
+};
 use crate::core::pcs::{PcsConfig, TreeSubspan, TreeVec};
 use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::MaybeOwned;
@@ -185,7 +187,21 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         )
         .entered();
 
-        let lifting_log_size = self.trees.last().unwrap().commitment.layers.len() as u32 - 1;
+        let lifting_log_size = self.config.lifting_log_size.unwrap_or_else(|| {
+            self.trees
+                .iter()
+                .zip(sampled_points.iter())
+                .flat_map(|(tree, sampled_columns)| {
+                    tree.polynomials
+                        .iter()
+                        .zip(sampled_columns)
+                        .filter_map(|(poly, points)| {
+                            (!points.is_empty()).then_some(poly.evals.domain.log_size())
+                        })
+                })
+                .max()
+                .unwrap()
+        });
         let weights_hash_map = if self.store_polynomials_coefficients {
             None
         } else {
@@ -253,20 +269,34 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             unsorted_query_locations,
         } = fri_prover.decommit(channel);
         // Build the query position tree.
-        let preprocessed_query_positions = prepare_preprocessed_query_positions(
-            &query_positions,
-            lifting_log_size,
-            self.trees[0].commitment.layers.len() as u32 - 1,
-        );
         let query_positions_tree = TreeVec::new(
             self.trees
                 .iter()
+                .zip(sampled_points.iter())
                 .enumerate()
-                .map(|(i, _)| {
+                .map(|(i, (tree, sampled_columns))| {
+                    let tree_log_size = tree.commitment.layers.len() as u32 - 1;
                     if i == 0 {
-                        preprocessed_query_positions.as_slice()
+                        return prepare_preprocessed_query_positions(
+                            &query_positions,
+                            lifting_log_size,
+                            tree_log_size,
+                        );
+                    }
+                    if sampled_columns.iter().any(|points| !points.is_empty()) {
+                        assert!(
+                            tree_log_size <= lifting_log_size,
+                            "The lifting log size is smaller than an active commitment tree."
+                        );
+                    }
+                    if tree_log_size <= lifting_log_size {
+                        prepare_query_positions_for_height(
+                            &query_positions,
+                            lifting_log_size,
+                            tree_log_size,
+                        )
                     } else {
-                        query_positions.as_slice()
+                        query_positions.clone()
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -278,7 +308,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         #[cfg(feature = "parallel")]
         let decommit_iter = decommit_inputs.into_par_iter();
         let decommit_results = decommit_iter
-            .map(|(tree, query_positions)| tree.decommit(query_positions))
+            .map(|(tree, query_positions)| tree.decommit(&query_positions))
             .collect::<Vec<_>>();
         let (queried_values, decommitments, aux): (Vec<_>, Vec<_>, Vec<_>) = decommit_results
             .into_iter()

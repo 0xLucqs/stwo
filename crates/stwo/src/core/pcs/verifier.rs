@@ -11,7 +11,10 @@ use super::utils::TreeVec;
 use super::PcsConfig;
 use crate::core::channel::{Channel, MerkleChannel};
 use crate::core::pcs::quotients::CommitmentSchemeProof;
-use crate::core::pcs::utils::prepare_preprocessed_query_positions;
+use crate::core::pcs::utils::{
+    prepare_preprocessed_query_positions, prepare_query_positions_for_height,
+    InvalidLiftingLogSizeError,
+};
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::MerkleVerifierLifted;
 use crate::core::verifier::VerificationError;
@@ -64,7 +67,19 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
     ) -> Result<(), VerificationError> {
         channel.mix_felts(&proof.sampled_values.flatten_cols_ref());
         let random_coeff = channel.draw_secure_felt();
-        let lifting_log_size = self.trees.last().unwrap().height;
+        let lifting_log_size = self.config.lifting_log_size.unwrap_or_else(|| {
+            self.trees
+                .iter()
+                .zip(sampled_points.iter())
+                .flat_map(|(tree, sampled_columns)| {
+                    tree.column_log_sizes
+                        .iter()
+                        .zip(sampled_columns)
+                        .filter_map(|(log_size, points)| (!points.is_empty()).then_some(*log_size))
+                })
+                .max()
+                .unwrap()
+        });
         let bound =
             CirclePolyDegreeBound::new(lifting_log_size - self.config.fri_config.log_blowup_factor);
 
@@ -79,27 +94,39 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         channel.mix_u64(proof.proof_of_work);
         // Get FRI query positions.
         let query_positions = fri_verifier.sample_query_positions(channel);
-        let preprocessed_query_positions = prepare_preprocessed_query_positions(
-            &query_positions,
-            lifting_log_size,
-            self.trees[0].height,
-        );
 
-        // Build the query positions tree: the preprocessed tree needs a different treatment than
-        // the other trees.
-        let query_positions_tree = TreeVec::new(
-            self.trees
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    if i == 0 {
-                        preprocessed_query_positions.as_slice()
-                    } else {
-                        query_positions.as_slice()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        // Build the query positions tree.
+        let mut query_positions_by_tree = Vec::with_capacity(self.trees.len());
+        for (i, (tree, sampled_columns)) in self.trees.iter().zip(sampled_points.iter()).enumerate()
+        {
+            if i == 0 {
+                query_positions_by_tree.push(prepare_preprocessed_query_positions(
+                    &query_positions,
+                    lifting_log_size,
+                    tree.height,
+                ));
+                continue;
+            }
+            if sampled_columns.iter().any(|points| !points.is_empty())
+                && tree.height > lifting_log_size
+            {
+                return Err(InvalidLiftingLogSizeError {
+                    lifting_log_size,
+                    min_log_size: tree.height,
+                }
+                .into());
+            }
+            if tree.height <= lifting_log_size {
+                query_positions_by_tree.push(prepare_query_positions_for_height(
+                    &query_positions,
+                    lifting_log_size,
+                    tree.height,
+                ));
+            } else {
+                query_positions_by_tree.push(query_positions.clone());
+            }
+        }
+        let query_positions_tree = TreeVec::new(query_positions_by_tree);
         // Verify decommitments.
         self.trees
             .as_ref()
@@ -108,7 +135,7 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
             .zip_eq(query_positions_tree)
             .map(
                 |(((tree, decommitment), queried_values), query_positions)| {
-                    tree.verify(query_positions, queried_values, decommitment)
+                    tree.verify(&query_positions, queried_values, decommitment)
                 },
             )
             .0

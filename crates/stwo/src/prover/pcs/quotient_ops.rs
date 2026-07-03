@@ -178,6 +178,7 @@ mod tests {
     use crate::core::channel::Blake2sChannel;
     use crate::core::circle::SECURE_FIELD_CIRCLE_GEN;
     use crate::core::fields::m31::M31;
+    use crate::core::fri::FriConfig;
     use crate::core::pcs::quotients::PointSample;
     use crate::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
     use crate::core::poly::circle::CanonicCoset;
@@ -296,6 +297,108 @@ mod tests {
         let mut verifier = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
         verifier.commit(proof.proof.commitments[0], &sizes, &mut channel);
         verifier.verify_values(TreeVec(sampled_points), proof.proof, &mut channel)
+    }
+
+    fn prove_and_verify_pcs_tree_log_sizes(
+        tree_specs: &[(Option<u32>, bool)],
+    ) -> Result<(), VerificationError> {
+        const LOG_BLOWUP_FACTOR: u32 = 1;
+        let max_log_size = tree_specs
+            .iter()
+            .filter_map(|(log_size, _)| *log_size)
+            .max()
+            .unwrap_or_default();
+
+        let mut prover_channel = Blake2sChannel::default();
+        let config = PcsConfig {
+            pow_bits: 0,
+            fri_config: FriConfig::new(0, LOG_BLOWUP_FACTOR, 64, 1),
+            lifting_log_size: None,
+        };
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(max_log_size + LOG_BLOWUP_FACTOR).half_coset(),
+        );
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+
+        let mut verifier_log_sizes = vec![];
+        for (tree_index, (log_size, _)) in tree_specs.iter().enumerate() {
+            let mut tree_builder = commitment_scheme.tree_builder();
+            if let Some(log_size) = log_size {
+                let offset = tree_index as u32 * 1000;
+                let polynomial = CircleCoefficients::new(
+                    (0..1 << log_size)
+                        .map(|i| M31::from(offset + i as u32))
+                        .collect(),
+                );
+                verifier_log_sizes.push(vec![polynomial.log_size()]);
+                tree_builder.extend_polys(vec![polynomial]);
+            } else {
+                verifier_log_sizes.push(vec![]);
+            }
+            tree_builder.commit(&mut prover_channel);
+        }
+
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampled_points = TreeVec(
+            tree_specs
+                .iter()
+                .map(|(log_size, is_sampled)| match (log_size, is_sampled) {
+                    (Some(_), true) => vec![vec![SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>())]],
+                    (Some(_), false) => vec![vec![]],
+                    (None, _) => vec![],
+                })
+                .collect_vec(),
+        );
+        let proof = commitment_scheme.prove_values(sampled_points.clone(), &mut prover_channel);
+
+        let mut verifier_channel = Blake2sChannel::default();
+        let mut verifier = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        for (commitment, log_sizes) in proof.proof.commitments.iter().zip(verifier_log_sizes) {
+            verifier.commit(*commitment, &log_sizes, &mut verifier_channel);
+        }
+
+        verifier.verify_values(sampled_points, proof.proof, &mut verifier_channel)
+    }
+
+    #[test]
+    fn pcs_short_non_first_tree_proves_and_verifies() {
+        const MAX_LOG_SIZE: u32 = 6;
+        const SHORT_LOG_SIZE: u32 = 4;
+
+        assert!(prove_and_verify_pcs_tree_log_sizes(&[
+            (Some(MAX_LOG_SIZE), true),
+            (Some(SHORT_LOG_SIZE), true),
+            (Some(MAX_LOG_SIZE), true),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn pcs_short_non_first_tree_with_max_not_last_proves_and_verifies() {
+        const MAX_LOG_SIZE: u32 = 6;
+        const SHORT_LOG_SIZE: u32 = 4;
+
+        assert!(prove_and_verify_pcs_tree_log_sizes(&[
+            (None, false),
+            (Some(MAX_LOG_SIZE), true),
+            (Some(SHORT_LOG_SIZE), true),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn pcs_taller_unused_preprocessed_tree_proves_and_verifies() {
+        const PREPROCESSED_LOG_SIZE: u32 = 7;
+        const ACTIVE_LOG_SIZE: u32 = 5;
+        const SHORT_LOG_SIZE: u32 = 4;
+
+        assert!(prove_and_verify_pcs_tree_log_sizes(&[
+            (Some(PREPROCESSED_LOG_SIZE), false),
+            (Some(ACTIVE_LOG_SIZE), true),
+            (Some(SHORT_LOG_SIZE), true),
+        ])
+        .is_ok());
     }
 
     #[test]

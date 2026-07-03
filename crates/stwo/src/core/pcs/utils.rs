@@ -204,6 +204,21 @@ impl<T: Copy> TreeVec<ColumnVec<Vec<T>>> {
     }
 }
 
+pub fn prepare_query_positions_for_height(
+    query_positions: &[usize],
+    max_log_size: u32,
+    tree_log_size: u32,
+) -> Vec<usize> {
+    if tree_log_size == 0 {
+        return vec![];
+    };
+    assert!(tree_log_size <= max_log_size);
+    query_positions
+        .iter()
+        .map(|pos| (pos >> (max_log_size - tree_log_size + 1) << 1) + (pos & 1))
+        .collect()
+}
+
 pub fn prepare_preprocessed_query_positions(
     query_positions: &[usize],
     max_log_size: u32,
@@ -218,10 +233,7 @@ pub fn prepare_preprocessed_query_positions(
             .map(|pos| (pos >> 1 << (pp_max_log_size - max_log_size + 1)) + (pos & 1))
             .collect();
     }
-    query_positions
-        .iter()
-        .map(|pos| (pos >> (max_log_size - pp_max_log_size + 1) << 1) + (pos & 1))
-        .collect()
+    prepare_query_positions_for_height(query_positions, max_log_size, pp_max_log_size)
 }
 
 #[derive(Clone, Copy, Debug, Error)]
@@ -244,4 +256,43 @@ pub fn try_get_lifting_log_size(
     }
 
     Ok(lifting_log_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use std_shims::vec;
+
+    use super::{prepare_preprocessed_query_positions, prepare_query_positions_for_height};
+
+    #[test]
+    fn prepare_query_positions_for_height_is_identity_at_max_height() {
+        let query_positions = vec![0, 1, 2, 3, 30, 31];
+
+        assert_eq!(
+            prepare_query_positions_for_height(&query_positions, 5, 5),
+            query_positions
+        );
+    }
+
+    #[test]
+    fn prepare_query_positions_for_height_projects_to_shorter_height() {
+        assert_eq!(
+            prepare_query_positions_for_height(&[0, 1, 2, 3, 8, 9, 10, 11], 5, 3),
+            vec![0, 1, 0, 1, 2, 3, 2, 3]
+        );
+    }
+
+    #[test]
+    fn prepare_query_positions_for_height_preprocessed_projects_to_taller_height() {
+        assert_eq!(
+            prepare_preprocessed_query_positions(&[0, 1, 2, 3, 8, 9, 10, 11], 3, 5),
+            vec![0, 1, 8, 9, 32, 33, 40, 41]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn prepare_query_positions_for_height_panics_when_tree_exceeds_max() {
+        prepare_query_positions_for_height(&[0], 3, 4);
+    }
 }
