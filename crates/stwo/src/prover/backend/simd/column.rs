@@ -60,20 +60,17 @@ impl BaseColumn {
         }
     }
 
-    /// Returns a vector of `BaseColumnMutSlice`s, each mutably owning
+    /// Returns `BaseColumnMutSlice`s, each mutably owning
     /// `chunk_size` `PackedBaseField`s (i.e, `chuck_size` * `N_LANES` elements).
-    pub fn chunks_mut(&mut self, chunk_size: usize) -> Vec<BaseColumnMutSlice<'_>> {
-        self.data
-            .chunks_mut(chunk_size)
-            .map(BaseColumnMutSlice)
-            .collect_vec()
+    pub fn chunks_mut(
+        &mut self,
+        chunk_size: usize,
+    ) -> impl ExactSizeIterator<Item = BaseColumnMutSlice<'_>> {
+        self.data.chunks_mut(chunk_size).map(BaseColumnMutSlice)
     }
 
-    pub fn chunks(&self, chunk_size: usize) -> Vec<BaseColumnSlice<'_>> {
-        self.data
-            .chunks(chunk_size)
-            .map(BaseColumnSlice)
-            .collect_vec()
+    pub fn chunks(&self, chunk_size: usize) -> impl ExactSizeIterator<Item = BaseColumnSlice<'_>> {
+        self.data.chunks(chunk_size).map(BaseColumnSlice)
     }
 
     pub fn into_secure_column(self) -> SecureColumn {
@@ -865,7 +862,7 @@ mod tests {
         let mut col = values.into_iter().collect::<BaseColumn>();
 
         const CHUNK_SIZE: usize = 2;
-        let mut chunks = col.chunks_mut(CHUNK_SIZE);
+        let mut chunks: Vec<_> = col.chunks_mut(CHUNK_SIZE).collect();
         chunks[2].set(19, BaseField::from(1234));
         chunks[3].set(1, BaseField::from(5678));
 
