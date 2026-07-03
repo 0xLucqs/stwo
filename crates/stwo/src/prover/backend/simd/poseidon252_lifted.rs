@@ -25,7 +25,7 @@ impl MerkleOpsLifted<Poseidon252MerkleHasher> for SimdBackend {
         if columns.is_empty() {
             return vec![<Poseidon252MerkleHasher as MerkleHasherLifted>::Hash::default()];
         }
-        if columns.first().unwrap().len() < N_LANES {
+        if columns.last().unwrap().len() < N_LANES {
             let cpu_cols = columns.iter().map(|column| column.to_cpu()).collect_vec();
             return <CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
                 &cpu_cols.iter().collect_vec(),
