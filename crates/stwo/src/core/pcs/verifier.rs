@@ -62,7 +62,7 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         proof: CommitmentSchemeProof<MC::H>,
         channel: &mut MC::C,
     ) -> Result<(), VerificationError> {
-        channel.mix_felts(&proof.sampled_values.clone().flatten_cols());
+        channel.mix_felts(&proof.sampled_values.flatten_cols_ref());
         let random_coeff = channel.draw_secure_felt();
         let lifting_log_size = self.trees.last().unwrap().height;
         let bound =

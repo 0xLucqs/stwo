@@ -193,6 +193,17 @@ impl<T> TreeVec<ColumnVec<Vec<T>>> {
     }
 }
 
+impl<T: Copy> TreeVec<ColumnVec<Vec<T>>> {
+    /// Flattens by copying values without cloning the tree and column containers.
+    pub fn flatten_cols_ref(&self) -> Vec<T> {
+        self.iter()
+            .flat_map(|columns| columns.iter())
+            .flat_map(|column| column.iter())
+            .copied()
+            .collect()
+    }
+}
+
 pub fn prepare_preprocessed_query_positions(
     query_positions: &[usize],
     max_log_size: u32,
