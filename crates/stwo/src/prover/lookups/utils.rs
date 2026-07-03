@@ -1,5 +1,5 @@
 use std::iter::zip;
-use std::ops::{Add, Deref, Mul, Neg, Sub};
+use std::ops::{Add, AddAssign, Deref, Mul, Neg, Sub};
 
 use num_traits::Zero;
 
@@ -124,6 +124,15 @@ impl<F: Field> Add for UnivariatePoly<F> {
         }
 
         Self(res)
+    }
+}
+
+impl<F: Field> AddAssign<&UnivariatePoly<F>> for UnivariatePoly<F> {
+    fn add_assign(&mut self, rhs: &UnivariatePoly<F>) {
+        self.0.resize(self.0.len().max(rhs.0.len()), F::zero());
+        for (lhs, rhs) in zip(&mut self.0, rhs.0.iter()) {
+            *lhs += *rhs;
+        }
     }
 }
 
@@ -263,6 +272,24 @@ mod tests {
         let eval = horner_eval(&coeffs, x);
 
         assert_eq!(eval, coeffs[0] + coeffs[1] * x + coeffs[2] * x.square());
+    }
+
+    #[test]
+    fn univariate_poly_add_assign_by_ref_matches_add() {
+        let mut lhs = UnivariatePoly::new(vec![
+            SecureField::from(BaseField::from(1)),
+            SecureField::from(BaseField::from(2)),
+        ]);
+        let rhs = UnivariatePoly::new(vec![
+            SecureField::from(BaseField::from(3)),
+            SecureField::from(BaseField::from(4)),
+            SecureField::from(BaseField::from(5)),
+        ]);
+        let expected = lhs.clone() + rhs.clone();
+
+        lhs += &rhs;
+
+        assert_eq!(&*lhs, &*expected);
     }
 
     #[test]
