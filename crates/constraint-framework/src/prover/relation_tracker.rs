@@ -3,6 +3,8 @@ use std::fmt::Debug;
 
 use itertools::Itertools;
 use num_traits::Zero;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::TreeVec;
@@ -24,7 +26,7 @@ pub struct RelationTrackerEntry {
     pub values: Vec<M31>,
 }
 
-pub fn add_to_relation_entries<E: FrameworkEval>(
+pub fn add_to_relation_entries<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
     trace: &TreeVec<Vec<&Vec<BaseField>>>,
 ) -> Vec<RelationTrackerEntry> {
@@ -44,12 +46,24 @@ pub fn add_to_relation_entries<E: FrameworkEval>(
         .map(|idx| trace[PREPROCESSED_TRACE_IDX][*idx])
         .collect();
 
-    (0..1 << log_size)
+    let eval = &component.eval;
+
+    #[cfg(not(feature = "parallel"))]
+    let entries = (0..1 << log_size)
         .flat_map(|row| {
             let evaluator = RelationTrackerEvaluator::new(&sub_tree, row, log_size);
-            component.eval.evaluate(evaluator).entries()
+            eval.evaluate(evaluator).entries()
         })
-        .collect()
+        .collect();
+    #[cfg(feature = "parallel")]
+    let entries = (0..1 << log_size)
+        .into_par_iter()
+        .flat_map_iter(|row| {
+            let evaluator = RelationTrackerEvaluator::new(&sub_tree, row, log_size);
+            eval.evaluate(evaluator).entries()
+        })
+        .collect();
+    entries
 }
 
 /// Aggregates relation entries.
