@@ -135,9 +135,12 @@ fn random_linear_combination(
     polys: &[UnivariatePoly<SecureField>],
     alpha: SecureField,
 ) -> UnivariatePoly<SecureField> {
-    polys
-        .iter()
-        .rfold(Zero::zero(), |acc, poly| acc * alpha + poly.clone())
+    let mut acc = UnivariatePoly::zero();
+    for poly in polys.iter().rev() {
+        acc = acc * alpha;
+        acc += poly;
+    }
+    acc
 }
 
 /// Partially verifies a sum-check proof.
@@ -204,14 +207,16 @@ pub type RoundIndex = usize;
 #[cfg(test)]
 mod tests {
 
-    use num_traits::One;
+    use num_traits::{One, Zero};
 
     use crate::core::channel::{Blake2sChannel, Channel};
+    use crate::core::fields::m31::BaseField;
     use crate::core::fields::qm31::SecureField;
     use crate::core::fields::Field;
     use crate::prover::backend::CpuBackend;
     use crate::prover::lookups::mle::Mle;
     use crate::prover::lookups::sumcheck::{partially_verify, prove_batch};
+    use crate::prover::lookups::utils::UnivariatePoly;
 
     #[test]
     fn sumcheck_works() {
@@ -284,6 +289,30 @@ mod tests {
             prove_batch(invalid_claim, invalid_mle, lambda, &mut test_channel());
 
         assert!(partially_verify(claim, &invalid_proof, &mut test_channel()).is_err());
+    }
+
+    #[test]
+    fn random_linear_combination_matches_clone_based_formula_for_unequal_degrees() {
+        let polys = vec![
+            UnivariatePoly::new(vec![
+                SecureField::from(BaseField::from(1)),
+                SecureField::from(BaseField::from(2)),
+                SecureField::from(BaseField::from(3)),
+            ]),
+            UnivariatePoly::new(vec![SecureField::from(BaseField::from(4))]),
+            UnivariatePoly::new(vec![
+                SecureField::from(BaseField::from(5)),
+                SecureField::from(BaseField::from(6)),
+            ]),
+        ];
+        let alpha = SecureField::from(BaseField::from(7));
+        let expected = polys.iter().rfold(UnivariatePoly::zero(), |acc, poly| {
+            acc * alpha + poly.clone()
+        });
+
+        let actual = super::random_linear_combination(&polys, alpha);
+
+        assert_eq!(&*actual, &*expected);
     }
 
     fn test_channel() -> Blake2sChannel {
