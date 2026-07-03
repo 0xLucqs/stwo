@@ -45,9 +45,9 @@ macro_rules! xor_table_eval {
                             (i ^ j) << XorTable::new(ELEM_BITS, EXPAND_BITS, 2).limb_bits(),
                         ));
 
-                    self.eval.add_to_relation(RelationEntry::new(
+                    self.eval.add_to_relation(RelationEntry::base(
                         self.lookup_elements,
-                        -E::EF::from(multiplicity),
+                        -multiplicity,
                         &[a, b, c],
                     ));
                 }

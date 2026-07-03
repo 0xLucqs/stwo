@@ -143,15 +143,22 @@ pub trait EvalAtRow {
         &mut self,
         entry: RelationEntry<'_, Self::F, Self::EF, R>,
     ) {
-        let frac = Fraction::new(
-            entry.multiplicity.clone(),
-            entry.relation.combine(entry.values),
-        );
-        self.write_logup_frac(frac);
+        let denominator = entry.relation.combine(entry.values);
+        self.write_logup_frac_typed(entry.multiplicity.clone(), denominator);
     }
 
     // TODO(alont): Remove these once LogupAtRow is no longer used.
-    fn write_logup_frac(&mut self, _fraction: Fraction<Self::EF, Self::EF>) {
+    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        self.write_logup_frac_typed(Multiplicity::Ext(fraction.numerator), fraction.denominator);
+    }
+
+    /// Writes a logup fraction whose numerator keeps its multiplicity representation, letting
+    /// the finalize step use cheaper formulas for constant (±1) and base-field numerators.
+    fn write_logup_frac_typed(
+        &mut self,
+        _numerator: Multiplicity<Self::F, Self::EF>,
+        _denominator: Self::EF,
+    ) {
         unimplemented!()
     }
     fn finalize_logup_batched(&mut self, _batch_size: usize) {
@@ -172,25 +179,51 @@ pub trait EvalAtRow {
 /// TODO(alont): Remove once LogupAtRow is no longer used.
 macro_rules! logup_proxy {
     () => {
-        fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        fn write_logup_frac_typed(
+            &mut self,
+            numerator: $crate::Multiplicity<Self::F, Self::EF>,
+            denominator: Self::EF,
+        ) {
             if self.logup.fracs.is_empty() {
                 self.logup.is_finalized = false;
             }
-            self.logup.fracs.push(fraction);
+            self.logup.fracs.push((numerator, denominator));
         }
 
         /// Finalize the logup by adding the constraints for the fractions, batched into
         /// consecutive groups of `batch_size`. If the number of fractions is not a multiple
         /// of `batch_size`, the last group is smaller.
+        // Not all `EF` types implement `MulAssign`, so `den = den * d` cannot be `den *= d`.
+        #[allow(clippy::assign_op_pattern)]
         fn finalize_logup_batched(&mut self, batch_size: usize) {
             assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
             assert!(batch_size > 0, "Batch size must be positive");
 
+            // Sum each chunk of fractions. Numerators keep their multiplicity representation so
+            // that constant (±1) and base-field numerators use cheaper multiplication formulas.
+            // The resulting values are identical to the generic `Fraction` sum: multiplying by
+            // one is the identity and base-field multiplication agrees with the lifted
+            // extension-field multiplication, in exact field arithmetic.
             let mut batched: std_shims::Vec<Fraction<Self::EF, Self::EF>> = self
                 .logup
                 .fracs
                 .chunks(batch_size)
-                .map(|chunk| chunk.iter().cloned().sum())
+                .map(|chunk| {
+                    let (first_num, first_den) = chunk[0].clone();
+                    let mut rest = chunk[1..].iter().cloned();
+                    let Some((second_num, second_den)) = rest.next() else {
+                        return Fraction::new(first_num.to_ef(), first_den);
+                    };
+                    // (n1/d1) + (n2/d2) = (n1*d2 + n2*d1) / (d1*d2), with n1, n2 still typed.
+                    let mut num =
+                        first_num.mul_by(second_den.clone()) + second_num.mul_by(first_den.clone());
+                    let mut den = first_den * second_den;
+                    for (n, d) in rest {
+                        num = d.clone() * num + n.mul_by(den.clone());
+                        den = den * d;
+                    }
+                    Fraction::new(num, den)
+                })
                 .collect();
 
             let last_frac = batched.pop().expect("No fractions to finalize");
@@ -254,6 +287,54 @@ pub trait Relation<F: Clone, EF: RelationEFTraitBound<F>>: Sized {
     fn get_size(&self) -> usize;
 }
 
+/// A logup multiplicity, kept in its cheapest available representation.
+///
+/// Multiplying an extension-field denominator by a multiplicity costs a full EF×EF
+/// multiplication only in the general [`Multiplicity::Ext`] case. Constant ±1 multiplicities
+/// (plain uses/yields) and base-field multiplicities (e.g. table multiplicity columns) admit
+/// strictly cheaper formulas that produce bit-identical field values.
+#[derive(Clone, Debug)]
+pub enum Multiplicity<F, EF> {
+    /// Multiplicity is exactly one (a plain "use").
+    One,
+    /// Multiplicity is exactly minus one (a plain "yield").
+    NegOne,
+    /// Multiplicity in the base field (e.g. a multiplicity trace column).
+    Base(F),
+    /// General extension-field multiplicity.
+    Ext(EF),
+}
+
+impl<F, EF> Multiplicity<F, EF> {
+    /// Multiplies `rhs` by this multiplicity. Identical in value to `self.to_ef() * rhs`.
+    pub fn mul_by(self, rhs: EF) -> EF
+    where
+        EF: Neg<Output = EF> + Mul<F, Output = EF> + Mul<EF, Output = EF>,
+    {
+        match self {
+            Self::One => rhs,
+            Self::NegOne => -rhs,
+            Self::Base(f) => rhs * f,
+            // `rhs * e` (not `e * rhs`) matches the operand order of the previous generic
+            // `Fraction` sum exactly, keeping formal expression trees byte-identical.
+            Self::Ext(e) => rhs * e,
+        }
+    }
+
+    /// Lifts the multiplicity to the extension field.
+    pub fn to_ef(self) -> EF
+    where
+        EF: One + Neg<Output = EF> + From<F>,
+    {
+        match self {
+            Self::One => EF::one(),
+            Self::NegOne => -EF::one(),
+            Self::Base(f) => EF::from(f),
+            Self::Ext(e) => e,
+        }
+    }
+}
+
 /// A struct representing a relation entry.
 /// `relation` is the relation into which elements are entered.
 /// `multiplicity` is the multiplicity of the elements.
@@ -262,14 +343,44 @@ pub trait Relation<F: Clone, EF: RelationEFTraitBound<F>>: Sized {
 /// `values` are elements in the base field that are entered into the relation.
 pub struct RelationEntry<'a, F: Clone, EF: RelationEFTraitBound<F>, R: Relation<F, EF>> {
     relation: &'a R,
-    multiplicity: EF,
+    multiplicity: Multiplicity<F, EF>,
     values: &'a [F],
 }
 impl<'a, F: Clone, EF: RelationEFTraitBound<F>, R: Relation<F, EF>> RelationEntry<'a, F, EF, R> {
+    /// General extension-field multiplicity. Prefer [`Self::unit`], [`Self::neg_unit`] or
+    /// [`Self::base`] when the multiplicity is a constant ±1 or a base-field value — they
+    /// produce identical constraint values with strictly fewer field multiplications.
     pub const fn new(relation: &'a R, multiplicity: EF, values: &'a [F]) -> Self {
         Self {
             relation,
-            multiplicity,
+            multiplicity: Multiplicity::Ext(multiplicity),
+            values,
+        }
+    }
+
+    /// Entry with multiplicity exactly one (a plain "use").
+    pub const fn unit(relation: &'a R, values: &'a [F]) -> Self {
+        Self {
+            relation,
+            multiplicity: Multiplicity::One,
+            values,
+        }
+    }
+
+    /// Entry with multiplicity exactly minus one (a plain "yield").
+    pub const fn neg_unit(relation: &'a R, values: &'a [F]) -> Self {
+        Self {
+            relation,
+            multiplicity: Multiplicity::NegOne,
+            values,
+        }
+    }
+
+    /// Entry whose multiplicity is a base-field value (e.g. a multiplicity trace column).
+    pub const fn base(relation: &'a R, multiplicity: F, values: &'a [F]) -> Self {
+        Self {
+            relation,
+            multiplicity: Multiplicity::Base(multiplicity),
             values,
         }
     }

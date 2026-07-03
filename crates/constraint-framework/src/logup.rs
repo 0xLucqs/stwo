@@ -6,9 +6,12 @@ use std_shims::{vec, Vec};
 use stwo::core::channel::Channel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::Fraction;
 
-use super::EvalAtRow;
+use super::{EvalAtRow, Multiplicity};
+
+/// Logup fractions as (numerator, denominator) pairs, with numerators kept in their
+/// [`Multiplicity`] representation.
+pub type TypedFracs<F, EF> = Vec<(Multiplicity<F, EF>, EF)>;
 
 /// Evaluates constraints for batched logups.
 /// These constraint enforce the sum of multiplicity_i / (z + sum_j alpha^j * x_j) = claimed_sum.
@@ -17,8 +20,10 @@ pub struct LogupAtRow<E: EvalAtRow> {
     pub interaction: usize,
     /// The total sum of all the fractions divided by n_rows.
     pub cumsum_shift: SecureField,
-    /// The evaluation of the last cumulative sum column.
-    pub fracs: Vec<Fraction<E::EF, E::EF>>,
+    /// The fractions written so far for the current row, as (numerator, denominator) pairs.
+    /// Numerators keep their [`Multiplicity`] representation so the finalize step can use
+    /// cheaper formulas for constant (±1) and base-field numerators.
+    pub fracs: TypedFracs<E::F, E::EF>,
     pub is_finalized: bool,
     pub log_size: u32,
 }
@@ -128,10 +133,43 @@ impl<const N: usize> LookupElements<N> {
 
 #[cfg(test)]
 mod tests {
+    use num_traits::One;
     use stwo::core::channel::Blake2sChannel;
     use stwo::core::fields::m31::BaseField;
     use stwo::core::fields::qm31::SecureField;
     use stwo::core::fields::FieldExpOps;
+
+    use super::Multiplicity;
+
+    /// The finalize step relies on `m.mul_by(x)` being value-identical to the generic
+    /// `x * m.to_ef()` used by the previous `Fraction` sum, for every multiplicity variant.
+    #[test]
+    fn multiplicity_mul_by_matches_generic_lift() {
+        let x = SecureField::from_m31_array([5, 17, 29, 2].map(BaseField::from));
+        let e = SecureField::from_m31_array([3, 999, 41, 7].map(BaseField::from));
+        let f = BaseField::from(1234567);
+
+        let cases: [Multiplicity<BaseField, SecureField>; 4] = [
+            Multiplicity::One,
+            Multiplicity::NegOne,
+            Multiplicity::Base(f),
+            Multiplicity::Ext(e),
+        ];
+        for m in cases {
+            let expected = x * m.clone().to_ef();
+            assert_eq!(m.clone().mul_by(x), expected);
+            // Exact commutativity in QM31, both operand orders are bit-identical.
+            assert_eq!(m.clone().to_ef() * x, expected);
+        }
+        assert_eq!(
+            Multiplicity::<BaseField, SecureField>::One.to_ef(),
+            SecureField::one()
+        );
+        assert_eq!(
+            Multiplicity::<BaseField, SecureField>::NegOne.to_ef(),
+            -SecureField::one()
+        );
+    }
 
     use super::LookupElements;
 

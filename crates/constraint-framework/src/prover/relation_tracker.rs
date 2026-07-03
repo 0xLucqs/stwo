@@ -147,7 +147,7 @@ impl EvalAtRow for RelationTrackerEvaluator<'_> {
     ) {
         let relation = entry.relation.get_name().to_owned();
         let values = entry.values.to_vec();
-        let mult = entry.multiplicity.to_m31_array()[0];
+        let mult = entry.multiplicity.clone().to_ef().to_m31_array()[0];
 
         self.entries.push(RelationTrackerEntry {
             relation: relation.clone(),

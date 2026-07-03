@@ -99,11 +99,8 @@ impl EvalAtRow for InfoEvaluator {
         entry: RelationEntry<'_, Self::F, Self::EF, R>,
     ) {
         self.logup_counts.inc(entry.relation.get_name());
-        let frac = Fraction::new(
-            entry.multiplicity.clone(),
-            entry.relation.combine(entry.values),
-        );
-        self.write_logup_frac(frac);
+        let denominator = entry.relation.combine(entry.values);
+        self.write_logup_frac_typed(entry.multiplicity.clone(), denominator);
     }
 
     super::logup_proxy!();

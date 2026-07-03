@@ -8,12 +8,12 @@ use super::degree::NamedExprs;
 use super::{BaseExpr, ExtExpr};
 use crate::expr::ColumnExpr;
 use crate::preprocessed_columns::PreProcessedColumnId;
-use crate::{EvalAtRow, Relation, RelationEntry, INTERACTION_TRACE_IDX};
+use crate::{EvalAtRow, Multiplicity, Relation, RelationEntry, INTERACTION_TRACE_IDX};
 
 pub struct FormalLogupAtRow {
     pub interaction: usize,
     pub claimed_sum: ExtExpr,
-    pub fracs: Vec<Fraction<ExtExpr, ExtExpr>>,
+    pub fracs: Vec<(Multiplicity<BaseExpr, ExtExpr>, ExtExpr)>,
     pub is_finalized: bool,
     pub is_first: BaseExpr,
     pub cumsum_shift: ExtExpr,
@@ -236,7 +236,7 @@ impl EvalAtRow for ExprEvaluator {
     ) {
         let intermediate =
             self.add_extension_intermediate(combine_formal(entry.relation, entry.values));
-        let frac = Fraction::new(entry.multiplicity.clone(), intermediate);
+        let frac = Fraction::new(entry.multiplicity.clone().to_ef(), intermediate);
         self.write_logup_frac(frac);
     }
 

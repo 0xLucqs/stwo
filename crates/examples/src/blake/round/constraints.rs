@@ -66,9 +66,8 @@ impl<E: EvalAtRow> BlakeRoundEval<'_, E> {
         );
 
         // Yield `Round(input_v, output_v, message)`.
-        self.eval.add_to_relation(RelationEntry::new(
+        self.eval.add_to_relation(RelationEntry::neg_unit(
             self.round_lookup_elements,
-            -E::EF::one(),
             &chain![
                 input_v.iter().cloned().flat_map(Fu32::into_felts),
                 v.iter().cloned().flat_map(Fu32::into_felts),

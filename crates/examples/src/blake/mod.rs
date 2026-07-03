@@ -5,7 +5,6 @@ use std::fmt::Debug;
 use std::ops::{Add, AddAssign, Mul, Sub};
 use std::simd::u32x16;
 
-use num_traits::One;
 use stwo::core::channel::Channel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::FieldExpOps;
@@ -89,24 +88,24 @@ impl BlakeXorElements {
     fn use_relation<E: EvalAtRow>(&self, eval: &mut E, w: u32, values: [&[E::F]; 2]) {
         match w {
             12 => {
-                eval.add_to_relation(RelationEntry::new(&self.xor12, E::EF::one(), values[0]));
-                eval.add_to_relation(RelationEntry::new(&self.xor12, E::EF::one(), values[1]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor12, values[0]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor12, values[1]));
             }
             9 => {
-                eval.add_to_relation(RelationEntry::new(&self.xor9, E::EF::one(), values[0]));
-                eval.add_to_relation(RelationEntry::new(&self.xor9, E::EF::one(), values[1]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor9, values[0]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor9, values[1]));
             }
             8 => {
-                eval.add_to_relation(RelationEntry::new(&self.xor8, E::EF::one(), values[0]));
-                eval.add_to_relation(RelationEntry::new(&self.xor8, E::EF::one(), values[1]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor8, values[0]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor8, values[1]));
             }
             7 => {
-                eval.add_to_relation(RelationEntry::new(&self.xor7, E::EF::one(), values[0]));
-                eval.add_to_relation(RelationEntry::new(&self.xor7, E::EF::one(), values[1]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor7, values[0]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor7, values[1]));
             }
             4 => {
-                eval.add_to_relation(RelationEntry::new(&self.xor4, E::EF::one(), values[0]));
-                eval.add_to_relation(RelationEntry::new(&self.xor4, E::EF::one(), values[1]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor4, values[0]));
+                eval.add_to_relation(RelationEntry::unit(&self.xor4, values[1]));
             }
             _ => panic!("Invalid w"),
         };
