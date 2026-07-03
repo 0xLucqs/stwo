@@ -224,4 +224,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_build_leaves_mixed_tiny_and_large_columns() {
+        let columns = [4_usize, 8, 64, 1024]
+            .into_iter()
+            .enumerate()
+            .map(|(col, len)| {
+                (0..len)
+                    .map(|row| M31::from((col * 10_000 + row) as u32))
+                    .collect_vec()
+            })
+            .collect_vec();
+        let simd_columns = columns
+            .iter()
+            .map(|column| BaseColumn::from_cpu(column))
+            .collect_vec();
+
+        assert_eq!(
+            <CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                &columns.iter().collect_vec(),
+                10
+            ),
+            <SimdBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                &simd_columns.iter().collect_vec(),
+                10
+            )
+        );
+    }
 }
