@@ -43,6 +43,7 @@ impl M31 {
     /// let val = 2 * P - 19;
     /// assert_eq!(M31::partial_reduce(val), M31::from(P - 19));
     /// ```
+    #[inline]
     pub fn partial_reduce(val: u32) -> Self {
         Self(val.checked_sub(P).unwrap_or(val))
     }
@@ -55,14 +56,17 @@ impl M31 {
     /// let val = (P as u64).pow(2) - 19;
     /// assert_eq!(M31::reduce(val), M31::from(P - 19));
     /// ```
+    #[inline]
     pub const fn reduce(val: u64) -> Self {
         Self((((((val >> MODULUS_BITS) + val + 1) >> MODULUS_BITS) + val) & (P as u64)) as u32)
     }
 
+    #[inline]
     pub const fn from_u32_unchecked(arg: u32) -> Self {
         Self(arg)
     }
 
+    #[inline]
     pub fn inverse(&self) -> Self {
         assert!(!self.is_zero(), "0 has no inverse");
         pow2147483645(*self)
@@ -78,6 +82,7 @@ impl Display for M31 {
 impl Add for M31 {
     type Output = Self;
 
+    #[inline]
     fn add(self, rhs: Self) -> Self::Output {
         Self::partial_reduce(self.0 + rhs.0)
     }
@@ -86,6 +91,7 @@ impl Add for M31 {
 impl Neg for M31 {
     type Output = Self;
 
+    #[inline]
     fn neg(self) -> Self::Output {
         Self::partial_reduce(P - self.0)
     }
@@ -94,6 +100,7 @@ impl Neg for M31 {
 impl Sub for M31 {
     type Output = Self;
 
+    #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
         Self::partial_reduce(self.0 + P - rhs.0)
     }
@@ -102,6 +109,7 @@ impl Sub for M31 {
 impl Mul for M31 {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         Self::reduce((self.0 as u64) * (rhs.0 as u64))
     }
@@ -116,46 +124,54 @@ impl FieldExpOps for M31 {
     /// let v = BaseField::from(19);
     /// assert_eq!(v.inverse() * v, BaseField::one());
     /// ```
+    #[inline]
     fn inverse(&self) -> Self {
         self.inverse()
     }
 }
 
 impl ComplexConjugate for M31 {
+    #[inline]
     fn complex_conjugate(&self) -> Self {
         *self
     }
 }
 
 impl One for M31 {
+    #[inline]
     fn one() -> Self {
         Self(1)
     }
 }
 
 impl Zero for M31 {
+    #[inline]
     fn zero() -> Self {
         Self(0)
     }
 
+    #[inline]
     fn is_zero(&self) -> bool {
         *self == Self::zero()
     }
 }
 
 impl From<usize> for M31 {
+    #[inline]
     fn from(value: usize) -> Self {
         M31::reduce(value.try_into().unwrap())
     }
 }
 
 impl From<u32> for M31 {
+    #[inline]
     fn from(value: u32) -> Self {
         M31::reduce(value.into())
     }
 }
 
 impl From<i32> for M31 {
+    #[inline]
     fn from(value: i32) -> Self {
         if value < 0 {
             const P2: u64 = 2 * P as u64;
@@ -194,6 +210,7 @@ macro_rules! m31 {
 /// let v = BaseField::from(19);
 /// assert_eq!(pow2147483645(v), v.pow(2147483645));
 /// ```
+#[inline]
 pub fn pow2147483645<T: FieldExpOps>(v: T) -> T {
     let t0 = sqn::<2, T>(v.clone()) * v.clone();
     let t1 = sqn::<1, T>(t0.clone()) * t0.clone();
@@ -219,14 +236,17 @@ mod tests {
 
     use super::{M31, P};
 
+    #[inline]
     const fn mul_p(a: u32, b: u32) -> u32 {
         ((a as u64 * b as u64) % P as u64) as u32
     }
 
+    #[inline]
     const fn add_p(a: u32, b: u32) -> u32 {
         (a + b) % P
     }
 
+    #[inline]
     const fn neg_p(a: u32) -> u32 {
         if a == 0 {
             0

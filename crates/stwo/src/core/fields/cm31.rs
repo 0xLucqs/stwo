@@ -20,10 +20,12 @@ impl_field!(CM31, P2);
 impl_extension_field!(CM31, M31);
 
 impl CM31 {
+    #[inline]
     pub const fn from_u32_unchecked(a: u32, b: u32) -> CM31 {
         Self(M31::from_u32_unchecked(a), M31::from_u32_unchecked(b))
     }
 
+    #[inline]
     pub const fn from_m31(a: M31, b: M31) -> CM31 {
         Self(a, b)
     }
@@ -44,6 +46,7 @@ impl Debug for CM31 {
 impl Mul for CM31 {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         // (a + bi) * (c + di) = (ac - bd) + (ad + bc)i.
         Self(
@@ -56,6 +59,7 @@ impl Mul for CM31 {
 impl TryInto<M31> for CM31 {
     type Error = ();
 
+    #[inline]
     fn try_into(self) -> Result<M31, Self::Error> {
         if self.1 != M31::zero() {
             return Err(());
@@ -65,6 +69,7 @@ impl TryInto<M31> for CM31 {
 }
 
 impl FieldExpOps for CM31 {
+    #[inline]
     fn inverse(&self) -> Self {
         assert!(!self.is_zero(), "0 has no inverse");
         // 1 / (a + bi) = (a - bi) / (a^2 + b^2).
