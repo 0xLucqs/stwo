@@ -34,7 +34,7 @@ macro_rules! xor_table_gen {
         pub fn generate_interaction_trace<
             const ELEM_BITS: u32,
             const EXPAND_BITS: u32,
-            X: Relation<PackedBaseField, PackedSecureField>,
+            X: Relation<PackedBaseField, PackedSecureField> + Sync,
         >(
             lookup_data: XorTableLookupData<ELEM_BITS, EXPAND_BITS>,
             lookup_elements: &X,
@@ -57,8 +57,6 @@ macro_rules! xor_table_gen {
                 .enumerate()
                 .array_chunks::<2>();
             for [(i0, mults0), (i1, mults1)] in &mut iter {
-                let mut col_gen = logup_gen.new_col();
-
                 // Extract ah, bh from column index.
                 let ah0 = i0 as u32 >> EXPAND_BITS;
                 let bh0 = i0 as u32 & ((1 << EXPAND_BITS) - 1);
@@ -66,9 +64,8 @@ macro_rules! xor_table_gen {
                 let bh1 = i1 as u32 & ((1 << EXPAND_BITS) - 1);
 
                 // Each column has 2^(2*LIMB_BITS) rows, packed in N_LANES.
-                for vec_row in
-                    0..(1 << (XorTable::new(ELEM_BITS, EXPAND_BITS, 0).column_bits() - LOG_N_LANES))
-                {
+                logup_gen.col_from_fn(|vec_row| {
+                    let vec_row = vec_row as u32;
                     // vec_row is LIMB_BITS of al and LIMB_BITS - LOG_N_LANES of bl.
                     // Extract al, blh from vec_row.
                     let al = vec_row >> (limb_bits - LOG_N_LANES);
@@ -94,21 +91,18 @@ macro_rules! xor_table_gen {
                     let num =
                         p1 * mults0.data[vec_row as usize] + p0 * mults1.data[vec_row as usize];
                     let denom = p0 * p1;
-                    col_gen.write_frac(vec_row as usize, -num, denom);
-                }
-                col_gen.finalize_col();
+                    (-num, denom)
+                });
             }
 
             // If there is an odd number of lookup expressions, handle the last one.
             let rem = iter.into_remainder();
             if let Some((i, mults)) = rem.collect_vec().pop() {
-                let mut col_gen = logup_gen.new_col();
                 let ah = i as u32 >> EXPAND_BITS;
                 let bh = i as u32 & ((1 << EXPAND_BITS) - 1);
 
-                for vec_row in
-                    0..(1 << (XorTable::new(ELEM_BITS, EXPAND_BITS, 0).column_bits() - LOG_N_LANES))
-                {
+                logup_gen.col_from_fn(|vec_row| {
+                    let vec_row = vec_row as u32;
                     // vec_row is LIMB_BITS of a, and LIMB_BITS - LOG_N_LANES of b.
                     let al = vec_row >> (limb_bits - LOG_N_LANES);
                     let a = u32x16::splat((ah << limb_bits) | al);
@@ -123,9 +117,8 @@ macro_rules! xor_table_gen {
 
                     let num = mults.data[vec_row as usize];
                     let denom = p;
-                    col_gen.write_frac(vec_row as usize, PackedSecureField::from(-num), denom);
-                }
-                col_gen.finalize_col();
+                    (PackedSecureField::from(-num), denom)
+                });
             }
 
             logup_gen.finalize_last()

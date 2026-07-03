@@ -104,6 +104,21 @@ impl LogupTraceGenerator {
         .finalize_col();
     }
 
+    /// Generates a lookup column from a per-`vec_row` fraction function, running in parallel
+    /// when the `parallel` feature is enabled.
+    ///
+    /// `f(vec_row)` returns the `(numerator, denominator)` fraction for that packed row.
+    pub fn col_from_fn(
+        &mut self,
+        f: impl Fn(usize) -> (PackedSecureField, PackedSecureField) + Sync + Send,
+    ) {
+        let n_vec_rows = 1 << (self.log_size - LOG_N_LANES);
+        #[cfg(not(feature = "parallel"))]
+        self.col_from_iter((0..n_vec_rows).map(f));
+        #[cfg(feature = "parallel")]
+        self.col_from_par_iter((0..n_vec_rows).into_par_iter().map(f));
+    }
+
     /// Finalize the trace. Returns the trace and the total sum of the last column.
     /// The last column is shifted by the cumsum_shift.
     pub fn finalize_last(

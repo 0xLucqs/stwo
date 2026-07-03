@@ -254,26 +254,20 @@ pub fn generate_interaction_trace(
     let mut logup_gen = LogupTraceGenerator::new(log_size);
 
     for [(w0, l0), (w1, l1)] in lookup_data.xor_lookups.checked_as_chunks::<2>().iter() {
-        let mut col_gen = logup_gen.new_col();
-
-        for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+        logup_gen.col_from_fn(|vec_row| {
             let p0: PackedSecureField =
                 xor_lookup_elements.combine(*w0, &l0.each_ref().map(|l| l.data[vec_row]));
             let p1: PackedSecureField =
                 xor_lookup_elements.combine(*w1, &l1.each_ref().map(|l| l.data[vec_row]));
-            col_gen.write_frac(vec_row, p0 + p1, p0 * p1);
-        }
-
-        col_gen.finalize_col();
+            (p0 + p1, p0 * p1)
+        });
     }
 
-    let mut col_gen = logup_gen.new_col();
-    for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+    logup_gen.col_from_fn(|vec_row| {
         let p = round_lookup_elements
             .combine(&lookup_data.round_lookup.each_ref().map(|l| l.data[vec_row]));
-        col_gen.write_frac(vec_row, -PackedSecureField::one(), p);
-    }
-    col_gen.finalize_col();
+        (-PackedSecureField::one(), p)
+    });
 
     logup_gen.finalize_last()
 }

@@ -128,23 +128,18 @@ pub fn gen_interaction_trace(
 
     let (pairs, reminder) = lookup_data.round_lookups.as_chunks::<2>();
     for [l0, l1] in pairs.iter() {
-        let mut col_gen = logup_gen.new_col();
-
-        for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+        logup_gen.col_from_fn(|vec_row| {
             let p0: PackedSecureField =
                 round_lookup_elements.combine(&l0.each_ref().map(|l| l.data[vec_row]));
             let p1: PackedSecureField =
                 round_lookup_elements.combine(&l1.each_ref().map(|l| l.data[vec_row]));
-            col_gen.write_frac(vec_row, p0 + p1, p0 * p1);
-        }
-
-        col_gen.finalize_col();
+            (p0 + p1, p0 * p1)
+        });
     }
 
     // Last pair. If the number of round is odd (as in blake3), we combine that last round lookup
     // with the entire blake lookup.
-    let mut col_gen = logup_gen.new_col();
-    for vec_row in 0..(1 << (log_size - LOG_N_LANES)) {
+    logup_gen.col_from_fn(|vec_row| {
         let p_blake: PackedSecureField = blake_lookup_elements.combine(
             &lookup_data
                 .blake_lookups
@@ -155,13 +150,12 @@ pub fn gen_interaction_trace(
             let p_round: PackedSecureField =
                 round_lookup_elements.combine(&reminder[0].each_ref().map(|l| l.data[vec_row]));
             // TODO(alont): Remove.
-            col_gen.write_frac(vec_row, p_blake, p_round * p_blake);
+            (p_blake, p_round * p_blake)
         } else {
             // TODO(alont): Remove.
-            col_gen.write_frac(vec_row, PackedSecureField::zero(), p_blake);
+            (PackedSecureField::zero(), p_blake)
         }
-    }
-    col_gen.finalize_col();
+    });
 
     logup_gen.finalize_last()
 }
