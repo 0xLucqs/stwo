@@ -165,6 +165,15 @@ pub trait EvalAtRow {
         unimplemented!()
     }
 
+    /// Finalize the logup with an explicit per-entry batch assignment, for irregular
+    /// batchings that a uniform batch size cannot express (e.g. solo entries kept out
+    /// of pairs for degree-bound reasons). `batching[i]` is the 0-based batch index of
+    /// entry `i`; batch ids must cover `0..=max` contiguously. Restores the semantics
+    /// of the pre-#1404 `finalize_logup_batched(&Batching)` API.
+    fn finalize_logup_batched_by(&mut self, _batching: &Batching) {
+        unimplemented!()
+    }
+
     fn finalize_logup(&mut self) {
         unimplemented!();
     }
@@ -201,29 +210,11 @@ macro_rules! logup_proxy {
 
             // Sum each chunk of fractions. Numerators keep their multiplicity representation so
             // that constant (±1) and base-field numerators use cheaper multiplication formulas.
-            // The resulting values are identical to the generic `Fraction` sum: multiplying by
-            // one is the identity and base-field multiplication agrees with the lifted
-            // extension-field multiplication, in exact field arithmetic.
             let mut batched: std_shims::Vec<Fraction<Self::EF, Self::EF>> = self
                 .logup
                 .fracs
                 .chunks(batch_size)
-                .map(|chunk| {
-                    let (first_num, first_den) = chunk[0].clone();
-                    let mut rest = chunk[1..].iter().cloned();
-                    let Some((second_num, second_den)) = rest.next() else {
-                        return Fraction::new(first_num.to_ef(), first_den);
-                    };
-                    // (n1/d1) + (n2/d2) = (n1*d2 + n2*d1) / (d1*d2), with n1, n2 still typed.
-                    let mut num =
-                        first_num.mul_by(second_den.clone()) + second_num.mul_by(first_den.clone());
-                    let mut den = first_den * second_den;
-                    for (n, d) in rest {
-                        num = d.clone() * num + n.mul_by(den.clone());
-                        den = den * d;
-                    }
-                    Fraction::new(num, den)
-                })
+                .map(|chunk| $crate::sum_typed_fracs(chunk))
                 .collect();
 
             let last_frac = batched.pop().expect("No fractions to finalize");
@@ -246,6 +237,57 @@ macro_rules! logup_proxy {
             // Instead of checking diff = num / denom, check diff = num / denom - cumsum_shift.
             // This makes (num / denom - cumsum_shift) have sum zero, which makes the constraint
             // uniform - apply on all rows.
+            let shifted_diff = diff + self.logup.cumsum_shift.clone();
+
+            self.add_constraint(shifted_diff * last_frac.denominator - last_frac.numerator);
+
+            self.logup.is_finalized = true;
+        }
+
+        /// Finalize the logup with an explicit per-entry batch assignment. See the trait
+        /// docs; restores the pre-#1404 `Batching`-vector semantics, including entry
+        /// order within each batch and batch-index order for column emission.
+        fn finalize_logup_batched_by(&mut self, batching: &$crate::Batching) {
+            assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
+            assert_eq!(
+                batching.len(),
+                self.logup.fracs.len(),
+                "Batching must be of the same length as the number of entries"
+            );
+            let last_batch = *batching.iter().max().expect("No fractions to finalize");
+
+            let mut fracs_by_batch: std_shims::Vec<
+                std_shims::Vec<($crate::Multiplicity<Self::F, Self::EF>, Self::EF)>,
+            > = (0..=last_batch).map(|_| std_shims::Vec::new()).collect();
+            for (batch, frac) in batching.iter().zip(self.logup.fracs.iter()) {
+                fracs_by_batch[*batch].push(frac.clone());
+            }
+            assert!(
+                fracs_by_batch.iter().all(|batch| !batch.is_empty()),
+                "Batching must contain all consecutive batches"
+            );
+
+            let mut prev_col_cumsum = <Self::EF as num_traits::Zero>::zero();
+
+            // All batches except the last are cumulatively summed in new interaction
+            // columns.
+            for batch in &fracs_by_batch[..last_batch] {
+                let cur_frac = $crate::sum_typed_fracs(batch);
+                let [cur_cumsum] =
+                    self.next_extension_interaction_mask(self.logup.interaction, [0]);
+                let diff = cur_cumsum.clone() - prev_col_cumsum.clone();
+                prev_col_cumsum = cur_cumsum;
+                self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+            }
+
+            let last_frac = $crate::sum_typed_fracs(&fracs_by_batch[last_batch]);
+            let [prev_row_cumsum, cur_cumsum] =
+                self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
+
+            let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum.clone();
+            // Instead of checking diff = num / denom, check diff = num / denom -
+            // cumsum_shift. This makes (num / denom - cumsum_shift) have sum zero, which
+            // makes the constraint uniform - apply on all rows.
             let shifted_diff = diff + self.logup.cumsum_shift.clone();
 
             self.add_constraint(shifted_diff * last_frac.denominator - last_frac.numerator);
@@ -333,6 +375,43 @@ impl<F, EF> Multiplicity<F, EF> {
             Self::Ext(e) => e,
         }
     }
+}
+
+/// Per-entry batch assignment for [`EvalAtRow::finalize_logup_batched_by`].
+pub type Batching = std_shims::Vec<usize>;
+
+/// Sums a group of typed logup fractions into a single [`Fraction`], using the cheapest
+/// correct formula per numerator representation. Values are identical to the generic
+/// `Fraction` sum: multiplying by one is the identity and base-field multiplication
+/// agrees with the lifted extension-field multiplication, in exact field arithmetic.
+///
+/// # Panics
+///
+/// Panics if `fracs` is empty.
+#[allow(clippy::assign_op_pattern)]
+pub fn sum_typed_fracs<F: Clone, EF>(fracs: &[(Multiplicity<F, EF>, EF)]) -> Fraction<EF, EF>
+where
+    EF: Clone
+        + One
+        + Zero
+        + Neg<Output = EF>
+        + From<F>
+        + Mul<F, Output = EF>
+        + Mul<EF, Output = EF>,
+{
+    let (first_num, first_den) = fracs[0].clone();
+    let mut rest = fracs[1..].iter().cloned();
+    let Some((second_num, second_den)) = rest.next() else {
+        return Fraction::new(first_num.to_ef(), first_den);
+    };
+    // (n1/d1) + (n2/d2) = (n1*d2 + n2*d1) / (d1*d2), with n1, n2 still typed.
+    let mut num = first_num.mul_by(second_den.clone()) + second_num.mul_by(first_den.clone());
+    let mut den = first_den * second_den;
+    for (n, d) in rest {
+        num = d.clone() * num + n.mul_by(den.clone());
+        den = den * d;
+    }
+    Fraction::new(num, den)
 }
 
 /// A struct representing a relation entry.

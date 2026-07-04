@@ -138,8 +138,37 @@ mod tests {
     use stwo::core::fields::m31::BaseField;
     use stwo::core::fields::qm31::SecureField;
     use stwo::core::fields::FieldExpOps;
+    use stwo::core::Fraction;
 
     use super::Multiplicity;
+    use crate::sum_typed_fracs;
+
+    /// `sum_typed_fracs` must be value-identical to the generic `Fraction` sum for any
+    /// mix of multiplicity variants and any group size (1, 2, and >2 exercise all
+    /// three code paths).
+    #[test]
+    fn sum_typed_fracs_matches_generic_fraction_sum() {
+        let qm = |a: u32, b: u32, c: u32, d: u32| {
+            SecureField::from_m31_array([a, b, c, d].map(BaseField::from))
+        };
+        let fracs: [(Multiplicity<BaseField, SecureField>, SecureField); 4] = [
+            (Multiplicity::One, qm(3, 1, 4, 1)),
+            (Multiplicity::NegOne, qm(5, 9, 2, 6)),
+            (Multiplicity::Base(BaseField::from(271828)), qm(5, 3, 5, 8)),
+            (Multiplicity::Ext(qm(9, 7, 9, 3)), qm(2, 3, 8, 4)),
+        ];
+        for len in 1..=fracs.len() {
+            let group = &fracs[..len];
+            let expected: Fraction<SecureField, SecureField> = group
+                .iter()
+                .cloned()
+                .map(|(n, d)| Fraction::new(n.to_ef(), d))
+                .sum();
+            let actual = sum_typed_fracs(group);
+            assert_eq!(actual.numerator, expected.numerator, "len {len}");
+            assert_eq!(actual.denominator, expected.denominator, "len {len}");
+        }
+    }
 
     /// The finalize step relies on `m.mul_by(x)` being value-identical to the generic
     /// `x * m.to_ef()` used by the previous `Fraction` sum, for every multiplicity variant.
