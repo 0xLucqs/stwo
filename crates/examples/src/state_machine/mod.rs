@@ -189,7 +189,7 @@ mod tests {
     use stwo::core::poly::circle::CanonicCoset;
     use stwo_constraint_framework::expr::ExprEvaluator;
     use stwo_constraint_framework::{
-        assert_constraints_on_polys, FrameworkEval, Relation, TraceLocationAllocator,
+        assert_constraints_on_polys, EvalAtRow, FrameworkEval, Relation, TraceLocationAllocator,
     };
 
     use super::components::{
@@ -371,5 +371,214 @@ mod tests {
 
         assert_eq!(counts0["StateMachineElements"], (1 << log_n_rows) * 2);
         assert_eq!(counts1["StateMachineElements"], (1 << (log_n_rows - 1)) * 2);
+    }
+
+    /// Wraps a [FrameworkEval], raising only its declared constraint degree bound to
+    /// `log_size + log_excess` while keeping the constraints unchanged.
+    #[derive(Clone)]
+    struct RaisedBoundEval<E: FrameworkEval> {
+        inner: E,
+        log_excess: u32,
+    }
+    impl<E: FrameworkEval> FrameworkEval for RaisedBoundEval<E> {
+        fn log_size(&self) -> u32 {
+            self.inner.log_size()
+        }
+        fn max_constraint_log_degree_bound(&self) -> u32 {
+            self.inner.log_size() + self.log_excess
+        }
+        fn evaluate<E2: EvalAtRow>(&self, eval: E2) -> E2 {
+            self.inner.evaluate(eval)
+        }
+    }
+
+    /// Proves and verifies the two-component state machine where component 1 declares
+    /// `max_constraint_log_degree_bound = log_size + log_excess` with unchanged constraints.
+    /// Both components share one commitment scheme; the LogUp cumulative-sum constraint uses a
+    /// `[-1, 0]` interaction mask and pair batching.
+    fn prove_and_verify_state_machine_with_raised_bound(
+        log_excess: u32,
+        config: PcsConfig,
+        store_coefficients: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use stwo::core::air::Component;
+        use stwo::core::verifier::verify;
+        use stwo::prover::poly::circle::PolyOps;
+        use stwo::prover::{prove, ComponentProver};
+        use stwo_constraint_framework::FrameworkComponent;
+
+        let log_n_rows = 8;
+        let initial_state = [M31::zero(); STATE_SIZE];
+        let (x_axis_log_rows, y_axis_log_rows) = (log_n_rows, log_n_rows - 1);
+
+        // Twiddles must cover the composition polynomial, whose log degree is
+        // `max component log_size + log_excess`.
+        let twiddles = stwo::prover::backend::simd::SimdBackend::precompute_twiddles(
+            CanonicCoset::new(
+                log_n_rows + config.fri_config.log_blowup_factor + log_excess.max(1),
+            )
+            .circle_domain()
+            .half_coset,
+        );
+
+        let prover_channel = &mut Blake2sChannel::default();
+        config.mix_into(prover_channel);
+        let mut commitment_scheme = stwo::prover::CommitmentSchemeProver::<
+            _,
+            stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
+        >::new(config, &twiddles);
+        if store_coefficients {
+            commitment_scheme.set_store_polynomials_coefficients();
+        }
+
+        let trace_op0 = gen_trace(x_axis_log_rows, initial_state, 0);
+        let mut intermediate_state = initial_state;
+        intermediate_state[0] += M31::from_u32_unchecked(1 << x_axis_log_rows);
+        let trace_op1 = gen_trace(y_axis_log_rows, intermediate_state, 1);
+
+        let tree_builder = commitment_scheme.tree_builder();
+        tree_builder.commit(prover_channel);
+
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(
+            itertools::chain![trace_op0.clone(), trace_op1.clone()].collect::<Vec<_>>(),
+        );
+        tree_builder.commit(prover_channel);
+
+        let lookup_elements = StateMachineElements::draw(prover_channel);
+        let (interaction_trace_op0, claimed_sum_op0) =
+            gen_interaction_trace(&trace_op0, 0, &lookup_elements);
+        let (interaction_trace_op1, claimed_sum_op1) =
+            gen_interaction_trace(&trace_op1, 1, &lookup_elements);
+
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(
+            itertools::chain![interaction_trace_op0, interaction_trace_op1].collect::<Vec<_>>(),
+        );
+        tree_builder.commit(prover_channel);
+
+        let tree_span_provider = &mut TraceLocationAllocator::default();
+        let component0 = FrameworkComponent::new(
+            tree_span_provider,
+            StateTransitionEval::<0> {
+                log_n_rows: x_axis_log_rows,
+                lookup_elements: lookup_elements.clone(),
+                claimed_sum: claimed_sum_op0,
+            },
+            claimed_sum_op0,
+        );
+        let component1 = FrameworkComponent::new(
+            tree_span_provider,
+            RaisedBoundEval {
+                inner: StateTransitionEval::<1> {
+                    log_n_rows: y_axis_log_rows,
+                    lookup_elements: lookup_elements.clone(),
+                    claimed_sum: claimed_sum_op1,
+                },
+                log_excess,
+            },
+            claimed_sum_op1,
+        );
+
+        let stark_proof = prove(
+            &[
+                &component0 as &dyn ComponentProver<stwo::prover::backend::simd::SimdBackend>,
+                &component1,
+            ],
+            prover_channel,
+            commitment_scheme,
+        )?;
+
+        // Verify.
+        let verifier_channel = &mut Blake2sChannel::default();
+        config.mix_into(verifier_channel);
+        let commitment_scheme_verifier = &mut stwo::core::pcs::CommitmentSchemeVerifier::<
+            stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
+        >::new(config);
+
+        // Trace tree: STATE_SIZE columns per component; interaction tree: one pair-batched
+        // LogUp fraction per component = SECURE_EXTENSION_DEGREE columns per component.
+        let sizes = TreeVec::new(vec![
+            vec![],
+            itertools::chain![
+                vec![x_axis_log_rows; STATE_SIZE],
+                vec![y_axis_log_rows; STATE_SIZE]
+            ]
+            .collect(),
+            itertools::chain![vec![x_axis_log_rows; 4], vec![y_axis_log_rows; 4]].collect(),
+        ]);
+
+        commitment_scheme_verifier.commit(stark_proof.commitments[0], &sizes[0], verifier_channel);
+        commitment_scheme_verifier.commit(stark_proof.commitments[1], &sizes[1], verifier_channel);
+        let _verifier_lookup_elements = StateMachineElements::draw(verifier_channel);
+        commitment_scheme_verifier.commit(stark_proof.commitments[2], &sizes[2], verifier_channel);
+
+        verify(
+            &[&component0 as &dyn Component, &component1],
+            verifier_channel,
+            commitment_scheme_verifier,
+            stark_proof,
+        )?;
+        Ok(())
+    }
+
+    /// The raised bound is invisible at the constraint-debug layer: trace-domain constraint
+    /// assertion never consults `max_constraint_log_degree_bound` and passes.
+    #[test]
+    fn test_raised_degree_bound_invisible_to_assert_constraints() {
+        let log_n_rows = 8;
+        let initial_state = [M31::zero(); STATE_SIZE];
+
+        let trace = gen_trace(log_n_rows, initial_state, 0);
+        let lookup_elements = StateMachineElements::draw(&mut Blake2sChannel::default());
+        let (interaction_trace, claimed_sum) = gen_interaction_trace(&trace, 0, &lookup_elements);
+
+        let raised_eval = RaisedBoundEval {
+            inner: StateTransitionEval::<0> {
+                log_n_rows,
+                lookup_elements,
+                claimed_sum,
+            },
+            log_excess: 2,
+        };
+        assert_eq!(raised_eval.max_constraint_log_degree_bound(), log_n_rows + 2);
+
+        let trace = TreeVec::new(vec![vec![], trace, interaction_trace]);
+        let trace_polys = trace.map_cols(|c| c.interpolate());
+        assert_constraints_on_polys(
+            &trace_polys,
+            CanonicCoset::new(log_n_rows),
+            |assert_eval| {
+                raised_eval.evaluate(assert_eval);
+            },
+            claimed_sum,
+        );
+    }
+
+    /// A component declaring `bound = log_size + 2` with unchanged constraints must prove and
+    /// verify. Blowup 1 < excess 2 forces the `ExtendToEvalDomain` path (stored coefficients).
+    #[test]
+    fn test_state_machine_raised_degree_bound_extend_path() {
+        prove_and_verify_state_machine_with_raised_bound(2, PcsConfig::default(), true).unwrap();
+    }
+
+    /// Same as above with blowup 2 >= excess 2: the committed evaluations already cover the
+    /// constraint evaluation domain, so no stored coefficients are needed (SubDomain path).
+    #[test]
+    fn test_state_machine_raised_degree_bound_subdomain_path() {
+        let config = PcsConfig {
+            pow_bits: 10,
+            fri_config: stwo::core::fri::FriConfig::new(0, 2, 3, 1),
+            lifting_log_size: None,
+        };
+        prove_and_verify_state_machine_with_raised_bound(2, config, false).unwrap();
+    }
+
+    /// Blowup 1 < excess 2 requires low-degree extension, which needs stored coefficients.
+    /// Without them the prover must fail loudly, not silently produce wrong math.
+    #[test]
+    #[should_panic(expected = "coefficients are not stored")]
+    fn test_state_machine_raised_degree_bound_requires_coefficients() {
+        let _ = prove_and_verify_state_machine_with_raised_bound(2, PcsConfig::default(), false);
     }
 }
