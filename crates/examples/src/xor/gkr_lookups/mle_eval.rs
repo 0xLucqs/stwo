@@ -200,7 +200,11 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
         trace: &Trace<'_, SimdBackend>,
         accumulator: &mut DomainEvaluationAccumulator<SimdBackend>,
     ) {
-        let eval_domain = CanonicCoset::new(self.max_constraint_log_degree_bound()).circle_domain();
+        // The quotient must be evaluated on a domain of log size
+        // `log_size + composition_log_split` so that its accumulated lift matches the verifier's
+        // uniform lifting (see `DomainEvaluationAccumulator::composition_log_split`).
+        let eval_domain = CanonicCoset::new(self.log_size() + accumulator.composition_log_split())
+            .circle_domain();
         let trace_domain = CanonicCoset::new(self.log_size());
 
         let mut component_trace = trace
