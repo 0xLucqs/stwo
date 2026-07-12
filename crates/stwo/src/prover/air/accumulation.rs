@@ -7,7 +7,6 @@
 use itertools::Itertools;
 use tracing::{span, Level};
 
-use crate::core::air::Component;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::poly::circle::CanonicCoset;
@@ -36,36 +35,18 @@ impl EvaluationMode {
     /// Determines whether the committed trace columns can be used directly for constraint
     /// evaluation or must be extended to the evaluation domain.
     ///
-    /// Returns `SubDomain { log_expansion }` when all components share the same expansion ratio
-    /// (`log_blowup_factor - constraint_log_degree`).
-    /// Otherwise returns `ExtendToEvalDomain`.
-    pub fn infer(components: &[&dyn Component], log_blowup_factor: u32) -> Self {
-        let mut common_log_expansion: Option<u32> = None;
-        for c in components {
-            let trace_log_size = c
-                .trace_log_degree_bounds()
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(0);
-            let constraint_log_degree = c
-                .max_constraint_log_degree_bound()
-                .saturating_sub(trace_log_size);
-            if constraint_log_degree > log_blowup_factor {
-                return EvaluationMode::ExtendToEvalDomain;
-            }
-            let log_expansion = log_blowup_factor - constraint_log_degree;
-            match common_log_expansion {
-                None => common_log_expansion = Some(log_expansion),
-                Some(prev) if prev != log_expansion => {
-                    return EvaluationMode::ExtendToEvalDomain;
-                }
-                _ => {}
-            }
+    /// Every component evaluates its constraint quotient on a domain of log size
+    /// `trace_log_size + composition_log_split`, a subdomain of its committed domain
+    /// (`trace_log_size + log_blowup_factor`) whenever
+    /// `composition_log_split <= log_blowup_factor`. In that case the committed evaluations are
+    /// reused directly with a uniform `log_expansion`; otherwise all columns must be low-degree
+    /// extended.
+    pub const fn infer(composition_log_split: u32, log_blowup_factor: u32) -> Self {
+        if composition_log_split > log_blowup_factor {
+            return EvaluationMode::ExtendToEvalDomain;
         }
         EvaluationMode::SubDomain {
-            log_expansion: common_log_expansion.unwrap_or(0),
+            log_expansion: log_blowup_factor - composition_log_split,
         }
     }
 }
@@ -82,6 +63,11 @@ pub struct DomainEvaluationAccumulator<B: Backend> {
     sub_accumulations: Vec<Option<SecureColumnByCoords<B>>>,
     /// Specifies how the constraints are evaluated.
     evaluation_mode: EvaluationMode,
+    /// The composition polynomial's log degree excess over the maximal trace log size (the
+    /// number of mid-splits applied before commitment). Every component must evaluate its
+    /// constraint quotient on a domain of log size `trace_log_size + composition_log_split`, so
+    /// that the accumulated lifts stay consistent with the verifier's uniform lifting.
+    composition_log_split: u32,
 }
 
 impl<B: Backend> DomainEvaluationAccumulator<B> {
@@ -93,12 +79,14 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
         max_log_size: u32,
         total_columns: usize,
         evaluation_mode: EvaluationMode,
+        composition_log_split: u32,
     ) -> Self {
         let max_log_size = max_log_size as usize;
         Self {
             random_coeff_powers: B::generate_secure_powers(random_coeff, total_columns),
             sub_accumulations: (0..(max_log_size + 1)).map(|_| None).collect(),
             evaluation_mode,
+            composition_log_split,
         }
     }
 
@@ -133,6 +121,13 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
     /// Returns the evaluation mode.
     pub const fn evaluation_mode(&self) -> EvaluationMode {
         self.evaluation_mode
+    }
+
+    /// Returns the composition polynomial's log degree excess over the maximal trace log size.
+    /// Components must evaluate their constraint quotients on domains of log size
+    /// `trace_log_size + composition_log_split`.
+    pub const fn composition_log_split(&self) -> u32 {
+        self.composition_log_split
     }
 
     /// Returns the log size of the resulting polynomial.
@@ -269,6 +264,7 @@ mod tests {
             LOG_SIZE_BOUND - 1,
             evaluations.len(),
             EvaluationMode::SubDomain { log_expansion: 0 },
+            1,
         );
         let n_cols_per_size: [(u32, usize); (LOG_SIZE_BOUND - LOG_SIZE_MIN) as usize] =
             array::from_fn(|i| {

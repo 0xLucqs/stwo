@@ -414,11 +414,9 @@ mod tests {
         // Twiddles must cover the composition polynomial, whose log degree is
         // `max component log_size + log_excess`.
         let twiddles = stwo::prover::backend::simd::SimdBackend::precompute_twiddles(
-            CanonicCoset::new(
-                log_n_rows + config.fri_config.log_blowup_factor + log_excess.max(1),
-            )
-            .circle_domain()
-            .half_coset,
+            CanonicCoset::new(log_n_rows + config.fri_config.log_blowup_factor + log_excess.max(1))
+                .circle_domain()
+                .half_coset,
         );
 
         let prover_channel = &mut Blake2sChannel::default();
@@ -541,7 +539,10 @@ mod tests {
             },
             log_excess: 2,
         };
-        assert_eq!(raised_eval.max_constraint_log_degree_bound(), log_n_rows + 2);
+        assert_eq!(
+            raised_eval.max_constraint_log_degree_bound(),
+            log_n_rows + 2
+        );
 
         let trace = TreeVec::new(vec![vec![], trace, interaction_trace]);
         let trace_polys = trace.map_cols(|c| c.interpolate());

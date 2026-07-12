@@ -74,7 +74,12 @@ impl<B: Backend> Poly<B> {
         if let Some(coeffs) = &self.coeffs {
             coeffs.evaluate_with_twiddles(domain, twiddles)
         } else {
-            panic!("The polynomial's coefficients are not stored");
+            panic!(
+                "The polynomial's coefficients are not stored. Constraint evaluation requires a \
+                 low-degree extension (the constraint log degree excess exceeds the FRI \
+                 log_blowup_factor); call CommitmentSchemeProver::\
+                 set_store_polynomials_coefficients() before committing, or increase the blowup."
+            );
         }
     }
 }
@@ -103,17 +108,15 @@ impl<B: Backend> ComponentProvers<'_, B> {
         log_blowup_factor: u32,
     ) -> SecureCirclePoly<B> {
         let total_constraints: usize = self.components.iter().map(|c| c.n_constraints()).sum();
-        let components: Vec<&dyn Component> = self
-            .components
-            .iter()
-            .map(|c| *c as &dyn Component)
-            .collect();
-        let evaluation_mode = EvaluationMode::infer(&components, log_blowup_factor);
+        let components = self.components();
+        let composition_log_split = components.composition_log_split();
+        let evaluation_mode = EvaluationMode::infer(composition_log_split, log_blowup_factor);
         let mut accumulator = DomainEvaluationAccumulator::new(
             random_coeff,
-            self.components().composition_log_degree_bound(),
+            components.composition_log_degree_bound(),
             total_constraints,
             evaluation_mode,
+            composition_log_split,
         );
         for component in &self.components {
             component.evaluate_constraint_quotients_on_domain(trace, &mut accumulator)

@@ -16,12 +16,40 @@ pub struct Components<'a> {
 }
 
 impl Components<'_> {
+    /// Log degree bound of the composition polynomial.
+    ///
+    /// Each component's quotient enters the composition lifted to the maximal trace log size
+    /// `n_max`, so the composition log degree is `n_max` plus the maximal constraint log degree
+    /// excess over trace log size across components (see [`Self::composition_log_split`]).
+    /// When every component declares `bound = log_size + 1` this equals the maximal declared
+    /// bound.
     pub fn composition_log_degree_bound(&self) -> u32 {
+        let max_trace_log_size = self
+            .components
+            .iter()
+            .map(|component| component_trace_log_size(*component))
+            .max()
+            .unwrap();
+        max_trace_log_size + self.composition_log_split()
+    }
+
+    /// The number of times the composition polynomial is split in half before commitment, so
+    /// that each of the `2^split` parts has log degree at most the maximal trace log size (the
+    /// lifting boundary all sampled columns are lifted to).
+    ///
+    /// Equals the maximal `max_constraint_log_degree_bound() - trace_log_size` over components,
+    /// and at least 1 (the composition always has one more log degree than the trace).
+    pub fn composition_log_split(&self) -> u32 {
         self.components
             .iter()
-            .map(|component| component.max_constraint_log_degree_bound())
+            .map(|component| {
+                component
+                    .max_constraint_log_degree_bound()
+                    .saturating_sub(component_trace_log_size(*component))
+            })
             .max()
             .unwrap()
+            .max(1)
     }
 
     pub fn mask_points(
@@ -70,6 +98,10 @@ impl Components<'_> {
         evaluation_accumulator.finalize()
     }
 
+    pub fn n_composition_parts(&self) -> usize {
+        1 << self.composition_log_split()
+    }
+
     pub fn column_log_sizes(&self) -> TreeVec<ColumnVec<u32>> {
         let mut preprocessed_columns_trace_log_sizes = vec![0; self.n_preprocessed_columns];
         let mut visited_columns = vec![false; self.n_preprocessed_columns];
@@ -105,4 +137,15 @@ impl Components<'_> {
 
         column_log_sizes
     }
+}
+
+/// The maximal log size over a component's trace columns.
+fn component_trace_log_size(component: &dyn Component) -> u32 {
+    component
+        .trace_log_degree_bounds()
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .unwrap_or(0)
 }

@@ -24,35 +24,57 @@ pub struct ExtendedStarkProof<H: MerkleHasherLifted> {
 
 impl<H: MerkleHasherLifted> StarkProof<H> {
     /// Extracts the composition trace Out-Of-Domain-Sample evaluation from the mask.
+    ///
+    /// The composition polynomial of log degree `max_log_degree_bound + composition_log_split`
+    /// is committed as `2^composition_log_split` parts of log degree `max_log_degree_bound`
+    /// each, obtained by recursively splitting the coefficients at the midpoint (left before
+    /// right). The evaluation is reconstructed by folding adjacent part evaluations: parts of
+    /// log degree `max_log_degree_bound + level - 1` combine with the multiplier
+    /// `x(oods_point doubled max_log_degree_bound + level - 2 times)`, for
+    /// `level = 1..=composition_log_split`.
     pub(crate) fn extract_composition_oods_eval(
         &self,
         oods_point: CirclePoint<SecureField>,
         max_log_degree_bound: u32,
+        composition_log_split: u32,
     ) -> Option<SecureField> {
         // TODO(andrew): `[.., composition_mask, _quotients_mask]` when add quotients
         // commitment.
-        let [.., left_and_right_composition_mask] = &**self.sampled_values else {
+        let [.., composition_mask] = &**self.sampled_values else {
             return None;
         };
-        let left_and_right_coordinate_evals: [SecureField; 2 * SECURE_EXTENSION_DEGREE] =
-            left_and_right_composition_mask
-                .iter()
-                .map(|columns| {
-                    let &[eval] = &columns[..] else {
-                        return None;
-                    };
-                    Some(eval)
-                })
-                .collect::<Option<Vec<_>>>()?
-                .try_into()
-                .ok()?;
+        let n_parts = 1usize << composition_log_split;
+        if composition_mask.len() != n_parts * SECURE_EXTENSION_DEGREE {
+            return None;
+        }
+        let coordinate_evals = composition_mask
+            .iter()
+            .map(|columns| {
+                let &[eval] = &columns[..] else {
+                    return None;
+                };
+                Some(eval)
+            })
+            .collect::<Option<Vec<_>>>()?;
 
-        let (left_coordinate_evals, right_coordinate_evals) =
-            left_and_right_coordinate_evals.split_at(SECURE_EXTENSION_DEGREE);
+        // Each part contributes `SECURE_EXTENSION_DEGREE` consecutive coordinate columns.
+        let mut part_evals = coordinate_evals
+            .chunks(SECURE_EXTENSION_DEGREE)
+            .map(|coords| SecureField::from_partial_evals(coords.try_into().unwrap()))
+            .collect::<Vec<_>>();
 
-        let left_eval = SecureField::from_partial_evals(left_coordinate_evals.try_into().ok()?);
-        let right_eval = SecureField::from_partial_evals(right_coordinate_evals.try_into().ok()?);
-        let value = left_eval + oods_point.repeated_double(max_log_degree_bound - 1).x * right_eval;
+        for level in 1..=composition_log_split {
+            let mid_basis_x = oods_point
+                .repeated_double(max_log_degree_bound + level - 2)
+                .x;
+            part_evals = part_evals
+                .chunks(2)
+                .map(|pair| pair[0] + mid_basis_x * pair[1])
+                .collect();
+        }
+        let &[value] = &part_evals[..] else {
+            return None;
+        };
         Some(value)
     }
 

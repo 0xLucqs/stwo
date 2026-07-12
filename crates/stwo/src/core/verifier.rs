@@ -12,10 +12,6 @@ use crate::core::proof::StarkProof;
 use crate::core::vcs_lifted::verifier::MerkleVerificationError;
 pub const PREPROCESSED_TRACE_IDX: usize = 0;
 
-// TODO(Leo): remove this once the composition poly split can be dependant on a config instead of
-// being hardcoded.
-pub const COMPOSITION_LOG_SPLIT: u32 = 1;
-
 pub fn verify<MC: MerkleChannel>(
     components: &[&dyn Component],
     channel: &mut MC::C,
@@ -47,8 +43,9 @@ pub fn verify_ex<MC: MerkleChannel>(
         components: components.to_vec(),
         n_preprocessed_columns,
     };
+    let composition_log_split = components.composition_log_split();
     let split_composition_log_degree_bound =
-        components.composition_log_degree_bound() - COMPOSITION_LOG_SPLIT;
+        components.composition_log_degree_bound() - composition_log_split;
     tracing::info!(
         "Split composition polynomial log degree bound: {}",
         split_composition_log_degree_bound
@@ -80,7 +77,7 @@ pub fn verify_ex<MC: MerkleChannel>(
     // Read composition polynomial commitment.
     commitment_scheme.commit(
         *proof.commitments.last().unwrap(),
-        &[max_log_degree_bound; 2 * SECURE_EXTENSION_DEGREE],
+        &vec![max_log_degree_bound; components.n_composition_parts() * SECURE_EXTENSION_DEGREE],
         channel,
     );
 
@@ -93,7 +90,11 @@ pub fn verify_ex<MC: MerkleChannel>(
         include_all_preprocessed_columns,
     );
     // Add the composition polynomial mask points.
-    sample_points.push(vec![vec![oods_point]; 2 * SECURE_EXTENSION_DEGREE]);
+    sample_points.push(vec![
+        vec![oods_point];
+        components.n_composition_parts()
+            * SECURE_EXTENSION_DEGREE
+    ]);
 
     let sample_points_by_column = sample_points.as_cols_ref().flatten();
     tracing::info!("Sampling {} columns.", sample_points_by_column.len());
@@ -103,7 +104,7 @@ pub fn verify_ex<MC: MerkleChannel>(
     );
 
     let composition_oods_eval = proof
-        .extract_composition_oods_eval(oods_point, max_log_degree_bound)
+        .extract_composition_oods_eval(oods_point, max_log_degree_bound, composition_log_split)
         .ok_or(VerificationError::InvalidStructure(
             std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
         ))?;

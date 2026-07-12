@@ -89,15 +89,52 @@ Paper: `.agents/papers/llm/Stwo_Whitepaper.llm.md` —
 composition and cross-domain quotient construction (`prot:STARK:IOPP`,
 `e:crossdomain:quotient`) requires split handling by degree/domain.
 
-Code: `crates/stwo/src/core/verifier.rs` — `COMPOSITION_LOG_SPLIT: u32 = 1`
-is hardcoded. The split produces `2 * SECURE_EXTENSION_DEGREE` columns.
-A TODO in the module notes this should be configurable.
+Code (historical): `crates/stwo/src/core/verifier.rs` —
+`COMPOSITION_LOG_SPLIT: u32 = 1` was hardcoded. The split produced
+`2 * SECURE_EXTENSION_DEGREE` columns.
 
-Type: Intentional deviation (simplified)
-Risk: PERFORMANCE (limits flexibility for higher-degree constraints)
-Status: OPEN
-Notes: The TODO acknowledges this limitation. For production stwo-cairo usage,
-the current split may be sufficient.
+Type: Intentional deviation (simplified) — now generalized
+Risk: PERFORMANCE (limited constraint degree to `trace log size + 1`)
+Status: ADDRESSED (2026-07-12) — pending human cryptography review
+Notes: The hardcoded single split silently forced every component to declare
+`max_constraint_log_degree_bound == log_size + 1`. Any component declaring a
+higher bound desynced the prover and verifier by doublings and failed the
+OODS sanity check (`ConstraintsNotSatisfied`) while trace-domain
+`assert_constraints` still passed. Degree accounting of the generalization
+(now in `Components::composition_log_split`):
+
+- Let `n_i` = component trace log size, `b_i` = declared bound,
+  `n_max = max n_i`, `K = max(b_i - n_i)` (clamped to >= 1),
+  `N = lifting_log_size - log_blowup` (the uniform lifting boundary,
+  `= n_max` by default).
+- PCS sampling evaluates the LIFT of each column to log degree `N`: the
+  sample of column T at point s is `T(δ^{N-n_i}(s))` where δ is point
+  doubling. The verifier's per-component quotient (mask step `step_N`,
+  denominator `v_N(p)`) therefore computes `q_i(δ^{N-n_i}(p))`, of log
+  degree `b_i + N - n_i <= N + K`. This is intrinsic to uniform lifting: no
+  choice of mask points or denominator can lower it, because the sampled
+  first argument is pinned at `δ^{N-n_i}(p)`.
+- The old invariant: the prover evaluated `q_i` on a domain of size
+  `2^{b_i}` and the accumulator lifted it by `M - b_i` (`M = max b_i`); with
+  one split, `N = M - 1`, so prover and verifier agreed iff `b_i = n_i + 1`
+  exactly, for every component.
+- The fix (this fork): the composition log degree is `n_max + K`; every
+  component evaluates its quotient on a domain of log size `n_i + K` (lift
+  exponent `n_max - n_i = N - n_i`, matching the verifier); the composition
+  is split `K` times into `2^K` parts of log degree `n_max`, each FRI-bound
+  at the committed domain `n_max + log_blowup`.
+- Soundness: the OODS identity enforced is unchanged —
+  `v_N * F = Σ α^k U_i∘δ^{N-n_i}` (Schwartz-Zippel over the OODS point, then
+  α-batching separates components; constraint vanishing is enforced by
+  divisibility by `v_N`, not by F's degree). Only F's degree bound rises to
+  `2^{n_max+K}`, carried by `2^K` FRI-bound parts. `K = 1` reproduces the
+  previous protocol bit-for-bit.
+- Caveat (completeness/lint, not soundness): a component under-declaring its
+  bound is no longer guaranteed to fail at proving time when another
+  component raises `K`, since the shared evaluation domain `n_i + K` may
+  cover its true degree. The enforced degree bound was always global.
+- Repro/regression: `crates/examples/src/state_machine/mod.rs` —
+  `test_state_machine_raised_degree_bound_*`.
 
 ### DIVERGENCE-005: Pairwise LogUp Column Grouping
 

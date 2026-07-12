@@ -73,12 +73,19 @@ fn get_trace_columns<'a, B: Backend>(
 /// Constructs the inputs needed for constraint quotient evaluation from a component and trace.
 /// Computes the eval/trace domains, prepares trace columns (borrowing or extending as needed),
 /// and precomputes denominator inverses.
+///
+/// The quotient is evaluated on a domain of log size `log_size + composition_log_split`
+/// (uniform across components), so that its lift to the composition polynomial's domain matches
+/// the verifier's uniform lifting of the sampled mask values. Note that this may exceed the
+/// component's own declared degree bound when another component in the composition declares a
+/// larger constraint degree excess.
 fn get_constraint_quotient_inputs<'a, E: FrameworkEval, B: Backend>(
     component: &FrameworkComponent<E>,
     trace: &'a Trace<'a, B>,
     mode: EvaluationMode,
+    composition_log_split: u32,
 ) -> ConstraintQuotientInputs<'a, B> {
-    let max_constraint_log_degree_bound = component.max_constraint_log_degree_bound();
+    let eval_log_size = component.eval.log_size() + composition_log_split;
     let trace_domain = CanonicCoset::new(component.eval.log_size());
 
     let mut component_polys = trace.polys.sub_tree(&component.trace_locations);
@@ -90,11 +97,9 @@ fn get_constraint_quotient_inputs<'a, E: FrameworkEval, B: Backend>(
 
     let eval_domain = match mode {
         EvaluationMode::SubDomain { log_expansion } => {
-            subdomain_eval_domain(max_constraint_log_degree_bound, log_expansion)
+            subdomain_eval_domain(eval_log_size, log_expansion)
         }
-        EvaluationMode::ExtendToEvalDomain => {
-            CanonicCoset::new(max_constraint_log_degree_bound).circle_domain()
-        }
+        EvaluationMode::ExtendToEvalDomain => CanonicCoset::new(eval_log_size).circle_domain(),
     };
     let trace = get_trace_columns(component_polys, eval_domain, mode);
 
@@ -128,7 +133,12 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             trace_domain,
             trace,
             denom_inv,
-        } = get_constraint_quotient_inputs(self, trace, evaluation_accumulator.evaluation_mode());
+        } = get_constraint_quotient_inputs(
+            self,
+            trace,
+            evaluation_accumulator.evaluation_mode(),
+            evaluation_accumulator.composition_log_split(),
+        );
 
         let [mut accum] =
             evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
@@ -225,7 +235,12 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
             trace_domain,
             trace,
             denom_inv,
-        } = get_constraint_quotient_inputs(self, trace, evaluation_accumulator.evaluation_mode());
+        } = get_constraint_quotient_inputs(
+            self,
+            trace,
+            evaluation_accumulator.evaluation_mode(),
+            evaluation_accumulator.composition_log_split(),
+        );
 
         let [mut accum] =
             evaluation_accumulator.columns([(eval_domain.log_size(), self.n_constraints())]);
@@ -251,15 +266,15 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
     }
 }
 
-/// Computes the evaluation subdomain for a component given its constraint degree bound
-/// and the log_expansion from `EvaluationMode::SubDomain`.
+/// Computes the evaluation subdomain for a component given its quotient evaluation log size
+/// (`trace log size + composition_log_split`) and the log_expansion from
+/// `EvaluationMode::SubDomain`.
 ///
 /// When `log_expansion == 0`, returns the canonical domain.
 /// When `log_expansion > 0`, returns the first subdomain obtained by splitting the
 /// committed domain `log_expansion` times.
-fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u32) -> CircleDomain {
-    let committed_domain =
-        CanonicCoset::new(max_constraint_log_degree_bound + log_expansion).circle_domain();
+fn subdomain_eval_domain(eval_log_size: u32, log_expansion: u32) -> CircleDomain {
+    let committed_domain = CanonicCoset::new(eval_log_size + log_expansion).circle_domain();
     committed_domain.split(log_expansion).0
 }
 
