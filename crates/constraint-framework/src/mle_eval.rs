@@ -245,29 +245,56 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
         // The quotient must be evaluated on a domain of log size
         // `log_size + composition_log_split` so that its accumulated lift matches the verifier's
         // uniform lifting (see `DomainEvaluationAccumulator::composition_log_split`).
-        let eval_domain = CanonicCoset::new(self.log_size() + accumulator.composition_log_split())
-            .circle_domain();
+        //
+        // In `SubDomain` mode (`log_blowup > composition_log_split`) the committed evaluations
+        // live on the LARGER blowup domain and the quotient domain is its subdomain: the
+        // bit-reversed committed evals are read as a prefix (exactly the `FrameworkComponent`
+        // scheme), and the auxiliary columns are therefore evaluated on the full committed-size
+        // canonic domain so their prefix reads line up with the committed columns'.
+        let eval_log_size = self.log_size() + accumulator.composition_log_split();
+        let (eval_domain, aux_domain) = match accumulator.evaluation_mode() {
+            stwo::prover::EvaluationMode::SubDomain { log_expansion } => {
+                let committed_domain =
+                    CanonicCoset::new(eval_log_size + log_expansion).circle_domain();
+                (
+                    committed_domain.split(log_expansion).0,
+                    CanonicCoset::new(eval_log_size + log_expansion).circle_domain(),
+                )
+            }
+            stwo::prover::EvaluationMode::ExtendToEvalDomain => {
+                let domain = CanonicCoset::new(eval_log_size).circle_domain();
+                (domain, domain)
+            }
+        };
         let trace_domain = CanonicCoset::new(self.log_size());
 
         let mut component_trace = trace
             .polys
             .sub_tree(&self.trace_locations)
             .map_cols(|c| &c.evals);
+        if matches!(
+            accumulator.evaluation_mode(),
+            stwo::prover::EvaluationMode::ExtendToEvalDomain
+        ) {
+            // The committed evals cannot be borrowed as a subdomain prefix in this mode; the
+            // consumers in this repo always prove with `log_blowup >= composition_log_split`.
+            unimplemented!("MleEvalProverComponent requires SubDomain evaluation mode");
+        }
 
-        // Build auxiliary trace.
+        // Build auxiliary trace (on `aux_domain`, see above).
         let span = span!(Level::INFO, "Extension").entered();
         let mle_coeffs_column_lde = self
             .mle_coeff_column_poly
-            .evaluate_with_twiddles(eval_domain, self.twiddles)
+            .evaluate_with_twiddles(aux_domain, self.twiddles)
             .into_coordinate_evals();
         let carry_quotients_column_lde = gen_carry_quotient_col(&self.mle_eval_point.p)
             .interpolate_with_twiddles(self.twiddles)
-            .evaluate_with_twiddles(eval_domain, self.twiddles)
+            .evaluate_with_twiddles(aux_domain, self.twiddles)
             .into_coordinate_evals();
         let is_first_lde = IsFirst::new(self.log_size())
             .gen_column_simd()
             .interpolate_with_twiddles(self.twiddles)
-            .evaluate_with_twiddles(eval_domain, self.twiddles);
+            .evaluate_with_twiddles(aux_domain, self.twiddles);
         let aux_interaction = component_trace.len();
         let aux_trace = chain![
             &mle_coeffs_column_lde,
