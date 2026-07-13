@@ -181,15 +181,19 @@ impl<O: MleCoeffColumnOracle> Component for MleEvalProverComponent<'_, O> {
         vec![]
     }
 
-    // TODO(Leo): make this function compatible with the lifted protocol (i.e. make suitable use of
-    // `max_log_degree_bound`).
     fn evaluate_constraint_quotients_at_point(
         &self,
         point: CirclePoint<SecureField>,
         mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
         accumulator: &mut PointEvaluationAccumulator,
-        _max_log_degree_bound: u32,
+        max_log_degree_bound: u32,
     ) {
+        // Lifted protocol: every column of trace log-size `l` is SAMPLED at
+        // `point.repeated_double(max_log_degree_bound - l)`, so all analytic
+        // evaluations (coeff poly, carry quotients, is_first, trace vanishing)
+        // must use the same mapped point to be consistent with the mask values.
+        let point = point.repeated_double(max_log_degree_bound - self.log_size());
+
         // Consistency check the MLE coeffs column polynomial and oracle. This is a
         // prover-side COMPLETENESS self-check only (the verifier recomputes the
         // oracle itself); adversarial tests that deliberately desync the committed
@@ -412,15 +416,16 @@ impl<O: MleCoeffColumnOracle> Component for MleEvalVerifierComponent<O> {
         vec![]
     }
 
-    // TODO(Leo): make this function compatible with the lifted protocol (i.e. make suitable use of
-    // `max_log_degree_bound`).
     fn evaluate_constraint_quotients_at_point(
         &self,
         point: CirclePoint<SecureField>,
         mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
         accumulator: &mut PointEvaluationAccumulator,
-        _max_log_degree_bound: u32,
+        max_log_degree_bound: u32,
     ) {
+        // Lifted protocol: see `MleEvalProverComponent::evaluate_constraint_quotients_at_point`.
+        let point = point.repeated_double(max_log_degree_bound - self.log_size());
+
         let component_mask = mask.sub_tree(&self.trace_location);
         let trace_coset = CanonicCoset::new(self.log_size()).coset;
         let vanish_on_trace_eval_inv = coset_vanishing(trace_coset, point).inverse();

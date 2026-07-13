@@ -41,8 +41,9 @@ pub const ORIGINAL_TRACE_IDX: usize = 1;
 pub const INTERACTION_TRACE_IDX: usize = 2;
 /// Maximum number of trace interactions (i.e. trace polynomials committed before the composition
 /// polynomial is computed). Currently all components need at most 3 interactions, except
-/// [`examples::xor::gkr_lookups::MleEvalProverComponent`] which uses 4.
-pub const MAX_N_INTERACTIONS: usize = 4;
+/// [`mle_eval::MleEvalProverComponent`]: hosted in a post-interaction (tree-3) slot it spans 4
+/// committed trees plus its internal aux tree, i.e. 5 interactions.
+pub const MAX_N_INTERACTIONS: usize = 5;
 
 /// A trait for evaluating expressions at some point or row.
 pub trait EvalAtRow {
