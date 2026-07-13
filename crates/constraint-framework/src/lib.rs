@@ -8,6 +8,8 @@ mod component;
 pub mod expr;
 mod info;
 pub mod logup;
+#[cfg(all(feature = "prover", feature = "std"))]
+pub mod mle_eval;
 mod point;
 pub mod preprocessed_columns;
 #[cfg(all(feature = "prover", feature = "std"))]
