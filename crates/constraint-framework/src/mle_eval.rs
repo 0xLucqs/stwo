@@ -75,15 +75,16 @@ impl IsFirst {
 ///
 /// See <https://eprint.iacr.org/2023/1284.pdf> (Section 5.1).
 #[allow(dead_code)]
-pub struct MleEvalProverComponent<'twiddles, 'oracle, O: MleCoeffColumnOracle> {
+pub struct MleEvalProverComponent<'twiddles, O: MleCoeffColumnOracle> {
     /// Polynomials encoding the multilinear Lagrange basis coefficients of the MLE.
     mle_coeff_column_poly: SecureCirclePoly<SimdBackend>,
     /// Oracle for the polynomial encoding the multilinear Lagrange basis coefficients of the MLE.
     ///
     /// The oracle values should match `mle_coeff_column_poly` for any given evaluation point. The
     /// polynomial is only stored directly to speed up constraint evaluation. The oracle is stored
-    /// to perform consistency checks with `mle_coeff_column_poly`.
-    mle_coeff_column_oracle: &'oracle O,
+    /// to perform consistency checks with `mle_coeff_column_poly`. Owned; pass a
+    /// reference (`&O` also implements [`MleCoeffColumnOracle`]) to borrow.
+    mle_coeff_column_oracle: O,
     /// Multilinear evaluation point.
     mle_eval_point: MleEvalPoint,
     /// Equals `mle_claim / 2^mle_n_variables`.
@@ -96,7 +97,7 @@ pub struct MleEvalProverComponent<'twiddles, 'oracle, O: MleCoeffColumnOracle> {
     twiddles: &'twiddles TwiddleTree<SimdBackend>,
 }
 
-impl<'twiddles, 'oracle, O: MleCoeffColumnOracle> MleEvalProverComponent<'twiddles, 'oracle, O> {
+impl<'twiddles, O: MleCoeffColumnOracle> MleEvalProverComponent<'twiddles, O> {
     /// Generates prover component that carries out univariate IOP for MLE eval at point.
     ///
     /// # Panics
@@ -104,7 +105,7 @@ impl<'twiddles, 'oracle, O: MleCoeffColumnOracle> MleEvalProverComponent<'twiddl
     /// Panics if the eval point has a coordinate that is zero or one. This is a completeness bug.
     pub fn generate(
         location_allocator: &mut TraceLocationAllocator,
-        mle_coeff_column_oracle: &'oracle O,
+        mle_coeff_column_oracle: O,
         mle_eval_point: &[SecureField],
         mle: Mle<SimdBackend, SecureField>,
         mle_claim: SecureField,
@@ -146,7 +147,7 @@ impl<'twiddles, 'oracle, O: MleCoeffColumnOracle> MleEvalProverComponent<'twiddl
     }
 }
 
-impl<O: MleCoeffColumnOracle> Component for MleEvalProverComponent<'_, '_, O> {
+impl<O: MleCoeffColumnOracle> Component for MleEvalProverComponent<'_, O> {
     fn n_constraints(&self) -> usize {
         self.eval_info().n_constraints
     }
@@ -189,10 +190,17 @@ impl<O: MleCoeffColumnOracle> Component for MleEvalProverComponent<'_, '_, O> {
         accumulator: &mut PointEvaluationAccumulator,
         _max_log_degree_bound: u32,
     ) {
-        // Consistency check the MLE coeffs column polynomial and oracle.
+        // Consistency check the MLE coeffs column polynomial and oracle. This is a
+        // prover-side COMPLETENESS self-check only (the verifier recomputes the
+        // oracle itself); adversarial tests that deliberately desync the committed
+        // coeff column from the base trace may skip it via the env var to obtain a
+        // proof the verifier must then reject.
         let mle_coeff_col_eval = self.mle_coeff_column_poly.eval_at_point(point);
-        let oracle_mle_coeff_col_eval = self.mle_coeff_column_oracle.evaluate_at_point(point, mask);
-        assert_eq!(mle_coeff_col_eval, oracle_mle_coeff_col_eval);
+        if std::env::var_os("STWO_MLE_EVAL_SKIP_ORACLE_CONSISTENCY").is_none() {
+            let oracle_mle_coeff_col_eval =
+                self.mle_coeff_column_oracle.evaluate_at_point(point, mask);
+            assert_eq!(mle_coeff_col_eval, oracle_mle_coeff_col_eval);
+        }
 
         let component_mask = mask.sub_tree(&self.trace_locations);
         let trace_coset = CanonicCoset::new(self.log_size()).coset;
@@ -224,7 +232,7 @@ impl<O: MleCoeffColumnOracle> Component for MleEvalProverComponent<'_, '_, O> {
     }
 }
 
-impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComponent<'_, '_, O> {
+impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComponent<'_, O> {
     fn evaluate_constraint_quotients_on_domain(
         &self,
         trace: &Trace<'_, SimdBackend>,
@@ -322,9 +330,9 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
 /// Verifier component that carries out a univariate IOP for multilinear eval at point.
 ///
 /// See <https://eprint.iacr.org/2023/1284.pdf> (Section 5.1).
-pub struct MleEvalVerifierComponent<'oracle, O: MleCoeffColumnOracle> {
+pub struct MleEvalVerifierComponent<O: MleCoeffColumnOracle> {
     /// Oracle for the polynomial encoding the multilinear Lagrange basis coefficients of the MLE.
-    mle_coeff_column_oracle: &'oracle O,
+    mle_coeff_column_oracle: O,
     /// Multilinear evaluation point.
     mle_eval_point: MleEvalPoint,
     /// Equals `mle_claim / 2^mle_n_variables`.
@@ -335,10 +343,10 @@ pub struct MleEvalVerifierComponent<'oracle, O: MleCoeffColumnOracle> {
     trace_location: TreeVec<TreeSubspan>,
 }
 
-impl<'oracle, O: MleCoeffColumnOracle> MleEvalVerifierComponent<'oracle, O> {
+impl<O: MleCoeffColumnOracle> MleEvalVerifierComponent<O> {
     pub fn new(
         location_allocator: &mut TraceLocationAllocator,
-        mle_coeff_column_oracle: &'oracle O,
+        mle_coeff_column_oracle: O,
         eval_point: &[SecureField],
         claim: SecureField,
         interaction: usize,
@@ -370,7 +378,7 @@ impl<'oracle, O: MleCoeffColumnOracle> MleEvalVerifierComponent<'oracle, O> {
     }
 }
 
-impl<O: MleCoeffColumnOracle> Component for MleEvalVerifierComponent<'_, O> {
+impl<O: MleCoeffColumnOracle> Component for MleEvalVerifierComponent<O> {
     fn n_constraints(&self) -> usize {
         self.eval_info().n_constraints
     }
@@ -472,6 +480,17 @@ pub trait MleCoeffColumnOracle {
         point: CirclePoint<SecureField>,
         mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
     ) -> SecureField;
+}
+
+/// Borrowed oracles work wherever an owned one is expected.
+impl<T: MleCoeffColumnOracle + ?Sized> MleCoeffColumnOracle for &T {
+    fn evaluate_at_point(
+        &self,
+        point: CirclePoint<SecureField>,
+        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
+    ) -> SecureField {
+        (*self).evaluate_at_point(point, mask)
+    }
 }
 
 /// Evaluates constraints that guarantee an MLE evaluates to a claim at a given point.
