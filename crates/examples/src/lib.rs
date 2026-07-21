@@ -1,5 +1,6 @@
 #![feature(portable_simd, iter_array_chunks)]
 pub mod blake;
+pub mod gkr_e2e;
 pub mod plonk;
 pub mod poseidon;
 pub mod state_machine;
