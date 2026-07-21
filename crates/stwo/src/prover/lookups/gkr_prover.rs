@@ -6,6 +6,8 @@ use std::ops::Deref;
 use educe::Educe;
 use itertools::Itertools;
 use num_traits::{One, Zero};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 use super::gkr_verifier::{GkrArtifact, GkrBatchProof, GkrMask};
@@ -410,10 +412,14 @@ pub fn prove_batch<B: GkrOps>(
     let n_layers = *n_layers_by_instance.iter().max().unwrap();
 
     // Evaluate all instance circuits and collect the layer values.
-    let mut layers_by_instance = input_layer_by_instance
-        .into_iter()
+    #[cfg(not(feature = "parallel"))]
+    let iter = input_layer_by_instance.into_iter();
+    #[cfg(feature = "parallel")]
+    let iter = input_layer_by_instance.into_par_iter();
+
+    let mut layers_by_instance = iter
         .map(|input_layer| gen_layers(input_layer).into_iter().rev())
-        .collect_vec();
+        .collect::<Vec<_>>();
 
     let mut output_claims_by_instance = vec![None; n_instances];
     let mut layer_masks_by_instance = (0..n_instances).map(|_| Vec::new()).collect_vec();
@@ -563,4 +569,99 @@ pub fn correct_sum_as_poly_in_first_variable(
         ],
         &[r_at_0, r_at_1, r_at_2, r_at_b],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::channel::{Blake2sChannel, Channel};
+    use crate::core::fields::qm31::SecureField;
+    use crate::core::test_utils::test_channel;
+    use crate::prover::backend::CpuBackend;
+    use crate::prover::lookups::gkr_prover::{prove_batch, Layer};
+    use crate::prover::lookups::gkr_verifier::{GkrArtifact, GkrBatchProof};
+    use crate::prover::lookups::mle::Mle;
+
+    const INPUT_SEED: u64 = 0x4549_5f47_4b52;
+    const SAME_SIZE_LOGS: [usize; 3] = [6, 6, 6];
+    const UNEQUAL_SIZE_LOGS: [usize; 3] = [4, 6, 5];
+    const SAME_SIZE_DIGEST: [u8; 32] = [
+        0xc5, 0x8a, 0x49, 0x77, 0xe8, 0x5d, 0x9c, 0x76, 0xb7, 0xcb, 0x5d, 0x21, 0x4e, 0x01, 0x68,
+        0x4c, 0x46, 0x90, 0x15, 0xcd, 0x27, 0x9b, 0x91, 0x01, 0xdb, 0x5e, 0xbb, 0x0a, 0xa8, 0x0a,
+        0xd8, 0x4f,
+    ];
+    const UNEQUAL_SIZE_DIGEST: [u8; 32] = [
+        0xcc, 0x54, 0xdc, 0x43, 0xd5, 0xe4, 0xe5, 0xae, 0xd0, 0x31, 0xc4, 0x88, 0x2e, 0x64, 0xf7,
+        0xe5, 0x4b, 0xdc, 0x18, 0x32, 0x3b, 0x8f, 0xdc, 0x47, 0x94, 0x3f, 0x87, 0xc1, 0x32, 0x52,
+        0x6e, 0xed,
+    ];
+
+    fn mix_len(channel: &mut Blake2sChannel, len: usize) {
+        channel.mix_u64(len as u64);
+    }
+
+    fn mix_felts(channel: &mut Blake2sChannel, felts: &[SecureField]) {
+        mix_len(channel, felts.len());
+        channel.mix_felts(felts);
+    }
+
+    fn proof_and_artifact_digest(proof: &GkrBatchProof, artifact: &GkrArtifact) -> [u8; 32] {
+        let mut channel = Blake2sChannel::default();
+
+        mix_len(&mut channel, proof.sumcheck_proofs.len());
+        for sumcheck_proof in &proof.sumcheck_proofs {
+            mix_len(&mut channel, sumcheck_proof.round_polys.len());
+            for round_poly in &sumcheck_proof.round_polys {
+                mix_felts(&mut channel, round_poly);
+            }
+        }
+
+        mix_len(&mut channel, proof.layer_masks_by_instance.len());
+        for masks in &proof.layer_masks_by_instance {
+            mix_len(&mut channel, masks.len());
+            for mask in masks {
+                mix_len(&mut channel, mask.columns().len());
+                for column in mask.columns() {
+                    mix_felts(&mut channel, column);
+                }
+            }
+        }
+
+        mix_len(&mut channel, proof.output_claims_by_instance.len());
+        for claims in &proof.output_claims_by_instance {
+            mix_felts(&mut channel, claims);
+        }
+
+        mix_felts(&mut channel, &artifact.ood_point);
+        mix_len(&mut channel, artifact.claims_to_verify_by_instance.len());
+        for claims in &artifact.claims_to_verify_by_instance {
+            mix_felts(&mut channel, claims);
+        }
+        mix_len(&mut channel, artifact.n_variables_by_instance.len());
+        for &n_variables in &artifact.n_variables_by_instance {
+            channel.mix_u64(n_variables as u64);
+        }
+
+        channel.digest().into()
+    }
+
+    fn batch_digest(log_sizes: &[usize]) -> [u8; 32] {
+        let mut input_channel = test_channel();
+        input_channel.mix_u64(INPUT_SEED);
+        let layers = log_sizes
+            .iter()
+            .map(|&log_size| {
+                let values = input_channel.draw_secure_felts(1 << log_size);
+                Layer::GrandProduct(Mle::<CpuBackend, SecureField>::new(values))
+            })
+            .collect();
+        let (proof, artifact) = prove_batch(&mut test_channel(), layers);
+
+        proof_and_artifact_digest(&proof, &artifact)
+    }
+
+    #[test]
+    fn batch_proof_and_artifact_digest_is_stable() {
+        assert_eq!(batch_digest(&SAME_SIZE_LOGS), SAME_SIZE_DIGEST);
+        assert_eq!(batch_digest(&UNEQUAL_SIZE_LOGS), UNEQUAL_SIZE_DIGEST);
+    }
 }

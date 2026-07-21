@@ -6,8 +6,9 @@
 
 use std::iter::zip;
 
-use itertools::Itertools;
 use num_traits::{One, Zero};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use thiserror::Error;
 
 use super::utils::UnivariatePoly;
@@ -59,7 +60,7 @@ pub trait MultivariatePolyOracle: Sized {
 /// - The degree of any multivariate polynomial exceeds [`MAX_DEGREE`] in any variable.
 /// - The round polynomials are inconsistent with their corresponding claimed sum on `0` and `1`.
 // TODO: Consider returning constant oracles as separate type.
-pub fn prove_batch<O: MultivariatePolyOracle>(
+pub fn prove_batch<O: MultivariatePolyOracle + Send + Sync>(
     mut claims: Vec<SecureField>,
     mut multivariate_polys: Vec<O>,
     lambda: SecureField,
@@ -81,8 +82,12 @@ pub fn prove_batch<O: MultivariatePolyOracle>(
     for round in 0..n_variables {
         let n_remaining_rounds = n_variables - round;
 
-        let this_round_polys = zip(&multivariate_polys, &claims)
-            .enumerate()
+        #[cfg(not(feature = "parallel"))]
+        let iter = zip(&multivariate_polys, &claims).enumerate();
+        #[cfg(feature = "parallel")]
+        let iter = multivariate_polys.par_iter().zip(&claims).enumerate();
+
+        let this_round_polys = iter
             .map(|(i, (multivariate_poly, &claim))| {
                 let round_poly = if n_remaining_rounds == multivariate_poly.n_variables() {
                     multivariate_poly.sum_as_poly_in_first_variable(claim)
@@ -97,7 +102,7 @@ pub fn prove_batch<O: MultivariatePolyOracle>(
 
                 round_poly
             })
-            .collect_vec();
+            .collect::<Vec<_>>();
 
         let round_poly = random_linear_combination(&this_round_polys, lambda);
 
@@ -110,8 +115,12 @@ pub fn prove_batch<O: MultivariatePolyOracle>(
             .map(|round_poly| round_poly.eval_at_point(challenge))
             .collect();
 
-        multivariate_polys = multivariate_polys
-            .into_iter()
+        #[cfg(not(feature = "parallel"))]
+        let iter = multivariate_polys.into_iter();
+        #[cfg(feature = "parallel")]
+        let iter = multivariate_polys.into_par_iter();
+
+        multivariate_polys = iter
             .map(|multivariate_poly| {
                 if n_remaining_rounds != multivariate_poly.n_variables() {
                     return multivariate_poly;
