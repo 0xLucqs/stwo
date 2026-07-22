@@ -4,7 +4,7 @@ use std::ops::{Add, AddAssign, Deref, Mul, Neg, Sub};
 use num_traits::Zero;
 
 use crate::core::fields::qm31::SecureField;
-use crate::core::fields::{ExtensionOf, Field};
+use crate::core::fields::{batch_inverse, ExtensionOf, Field};
 use crate::core::Fraction;
 
 /// Univariate polynomial stored as coefficients in the monomial basis.
@@ -26,16 +26,24 @@ impl<F: Field> UnivariatePoly<F> {
     pub fn interpolate_lagrange(xs: &[F], ys: &[F]) -> Self {
         assert_eq!(xs.len(), ys.len());
 
+        // Batch the Lagrange basis denominator inversions: one field inversion
+        // instead of one per (i, j) pair.
+        let denoms = xs
+            .iter()
+            .enumerate()
+            .map(|(i, xi)| {
+                xs.iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .fold(F::one(), |acc, (_, xj)| acc * (*xi - *xj))
+            })
+            .collect::<Vec<F>>();
+        let denom_invs = batch_inverse(&denoms);
+
         let mut coeffs = Self::zero();
 
-        for (i, (xi, yi)) in zip(xs, ys).enumerate() {
-            let mut prod = *yi;
-
-            for (j, xj) in xs.iter().enumerate() {
-                if i != j {
-                    prod /= *xi - *xj;
-                }
-            }
+        for (i, (yi, denom_inv)) in zip(ys, denom_invs).enumerate() {
+            let prod = *yi * denom_inv;
 
             let mut term = Self::new(vec![prod]);
 
