@@ -1,7 +1,13 @@
 use core::ops::Sub;
+#[cfg(not(feature = "parallel"))]
 use std::iter::zip;
 use std::ops::{Add, Mul};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+#[cfg(feature = "parallel")]
+use super::gkr::PACKED_CHUNK_SIZE;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::prover::backend::simd::column::SecureColumn;
@@ -29,14 +35,25 @@ impl MleOps<BaseField> for SimdBackend {
         let packed_midpoint = midpoint / N_LANES;
         let (evals_at_0x, evals_at_1x) = mle.data.split_at(packed_midpoint);
 
-        let res = zip(evals_at_0x, evals_at_1x)
+        #[cfg(not(feature = "parallel"))]
+        let iter = zip(evals_at_0x, evals_at_1x);
+        #[cfg(feature = "parallel")]
+        let iter = evals_at_0x
+            .par_iter()
+            .zip(evals_at_1x)
+            .with_min_len(PACKED_CHUNK_SIZE);
+
+        let data = iter
             // MLE at points `({0, 1}, rev(bits(i)), v)` for all `v` in `{0, 1}^LOG_N_SIMD_LANES`.
             .map(|(&packed_eval_at_0iv, &packed_eval_at_1iv)| {
                 fold_packed_mle_evals(packed_assignment, packed_eval_at_0iv, packed_eval_at_1iv)
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        Mle::new(res)
+        Mle::new(SecureColumn {
+            data,
+            length: midpoint,
+        })
     }
 }
 
@@ -58,13 +75,21 @@ impl MleOps<SecureField> for SimdBackend {
         let packed_assignment = PackedSecureField::broadcast(assignment);
         let mut packed_evals = mle.into_evals().data;
 
-        for i in 0..packed_midpoint {
+        let (evals_at_0x, evals_at_1x) = packed_evals.split_at_mut(packed_midpoint);
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = zip(evals_at_0x, &*evals_at_1x);
+        #[cfg(feature = "parallel")]
+        let iter = evals_at_0x
+            .par_iter_mut()
+            .zip(&*evals_at_1x)
+            .with_min_len(PACKED_CHUNK_SIZE);
+
+        iter.for_each(|(packed_eval_at_0iv, &packed_eval_at_1iv)| {
             // MLE at points `({0, 1}, rev(bits(i)), v)` for all `v` in `{0, 1}^LOG_N_SIMD_LANES`.
-            let packed_eval_at_0iv = packed_evals[i];
-            let packed_eval_at_1iv = packed_evals[i + packed_midpoint];
-            packed_evals[i] =
-                fold_packed_mle_evals(packed_assignment, packed_eval_at_0iv, packed_eval_at_1iv);
-        }
+            *packed_eval_at_0iv =
+                fold_packed_mle_evals(packed_assignment, *packed_eval_at_0iv, packed_eval_at_1iv);
+        });
 
         packed_evals.truncate(packed_midpoint);
 
