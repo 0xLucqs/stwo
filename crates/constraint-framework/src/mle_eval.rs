@@ -45,7 +45,9 @@ use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, Trace};
 use tracing::{span, Level};
 
 use crate::preprocessed_columns::PreProcessedColumnId;
-use crate::{EvalAtRow, InfoEvaluator, PointEvaluator, SimdDomainEvaluator, TraceLocationAllocator};
+use crate::{
+    EvalAtRow, InfoEvaluator, PointEvaluator, SimdDomainEvaluator, TraceLocationAllocator,
+};
 
 /// A column with `1` at the first position, and `0` elsewhere. Preprocessed
 /// selector for the eq/prefix-sum constraints (promoted from the example).
@@ -826,7 +828,6 @@ fn hadamard_product(
     }
 }
 
-
 /// Evaluates a multilinear polynomial at `point` (test/debug oracle).
 #[cfg(test)]
 fn mle_eval_at_point<B, F>(evaluation: &Mle<B, F>, point: &[SecureField]) -> SecureField
@@ -869,7 +870,11 @@ mod tests {
     }
     impl IsStepWithOffset {
         const fn new(log_size: u32, log_step: u32, offset: usize) -> Self {
-            Self { log_size, log_step, offset }
+            Self {
+                log_size,
+                log_step,
+                offset,
+            }
         }
         fn gen_column_simd(&self) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
             let mut col = Col::<SimdBackend, BaseField>::zeros(1 << self.log_size);
@@ -899,29 +904,28 @@ mod tests {
     use stwo::core::fields::qm31::SecureField;
     use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
     use stwo::core::poly::circle::CanonicCoset;
-    use stwo::core::utils::{bit_reverse, coset_order_to_circle_domain_order};
+    use stwo::core::utils::{
+        bit_reverse, bit_reverse_index, coset_index_to_circle_domain_index,
+        coset_order_to_circle_domain_order,
+    };
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use stwo::core::verifier::{verify, VerificationError};
     use stwo::prover::backend::simd::prefix_sum::inclusive_prefix_sum;
     use stwo::prover::backend::simd::qm31::PackedSecureField;
     use stwo::prover::backend::simd::SimdBackend;
+    use stwo::prover::backend::{Col, Column};
     use stwo::prover::lookups::mle::Mle;
     use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
     use stwo::prover::poly::BitReversedOrder;
     use stwo::prover::secure_column::SecureColumnByCoords;
     use stwo::prover::{prove, CommitmentSchemeProver, ComponentProver};
-    use crate::{assert_constraints_on_polys, EvalAtRow, TraceLocationAllocator};
-    use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
-    use stwo::prover::backend::{Col, Column};
 
     use super::{
         build_trace, eval_carry_quotient_col, eval_eq_constraints, eval_mle_eval_constraints,
-        eval_prefix_sum_constraints, gen_carry_quotient_col, MleEvalPoint, MleEvalProverComponent,
-        MleEvalVerifierComponent,
+        eval_prefix_sum_constraints, eval_step_selector_with_offset, gen_carry_quotient_col,
+        mle_eval_at_point, IsFirst, MleEvalPoint, MleEvalProverComponent, MleEvalVerifierComponent,
     };
-    use super::eval_step_selector_with_offset;
-    use super::mle_eval_at_point;
-    use super::IsFirst;
+    use crate::{assert_constraints_on_polys, EvalAtRow, TraceLocationAllocator};
 
     #[test]
     fn mle_eval_prover_component() -> Result<(), VerificationError> {
@@ -1354,9 +1358,9 @@ mod tests {
         use stwo::prover::lookups::mle::Mle;
         use stwo::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
         use stwo::prover::poly::BitReversedOrder;
-        use crate::{EvalAtRow, FrameworkComponent, FrameworkEval, PointEvaluator};
 
         use super::super::MleCoeffColumnOracle;
+        use crate::{EvalAtRow, FrameworkComponent, FrameworkEval, PointEvaluator};
 
         pub type MleCoeffColumnComponent = FrameworkComponent<MleCoeffColumnEval>;
 
@@ -1438,4 +1442,3 @@ mod tests {
         }
     }
 }
-
