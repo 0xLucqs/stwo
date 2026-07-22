@@ -6,6 +6,7 @@ members = [
     "crates/constraint-framework",
     "crates/examples",
     "crates/std-shims",
+    "mobile-bench/bench-runner",
 ]
 exclude = ["ensure-verifier-no_std"]
 resolver = "2"
