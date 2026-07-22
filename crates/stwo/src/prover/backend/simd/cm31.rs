@@ -74,6 +74,7 @@ impl PackedCM31 {
 impl Add for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self([self.a() + rhs.a(), self.b() + rhs.b()])
     }
@@ -82,6 +83,7 @@ impl Add for PackedCM31 {
 impl Sub for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self([self.a() - rhs.a(), self.b() - rhs.b()])
     }
@@ -90,6 +92,7 @@ impl Sub for PackedCM31 {
 impl Mul for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
         // Compute using Karatsuba.
         let ac = self.a() * rhs.a();
@@ -126,6 +129,7 @@ impl One for PackedCM31 {
 }
 
 impl MulAssign for PackedCM31 {
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;
     }
@@ -148,6 +152,7 @@ impl FieldExpOps for PackedCM31 {
 impl Add<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: PackedM31) -> Self::Output {
         Self([self.a() + rhs, self.b()])
     }
@@ -156,6 +161,7 @@ impl Add<PackedM31> for PackedCM31 {
 impl Sub<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a - rhs, b])
@@ -165,6 +171,7 @@ impl Sub<PackedM31> for PackedCM31 {
 impl Mul<PackedM31> for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a * rhs, b * rhs])
@@ -174,6 +181,7 @@ impl Mul<PackedM31> for PackedCM31 {
 impl Neg for PackedCM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         let Self([a, b]) = self;
         Self([-a, -b])

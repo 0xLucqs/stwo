@@ -100,6 +100,7 @@ impl PackedQM31 {
 impl Add for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self([self.a() + rhs.a(), self.b() + rhs.b()])
     }
@@ -108,6 +109,7 @@ impl Add for PackedQM31 {
 impl Sub for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self([self.a() - rhs.a(), self.b() - rhs.b()])
     }
@@ -116,6 +118,7 @@ impl Sub for PackedQM31 {
 impl Mul for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
         // Compute using Karatsuba.
         //   (a + ub) * (c + ud) =
@@ -155,18 +158,21 @@ impl One for PackedQM31 {
 }
 
 impl AddAssign for PackedQM31 {
+    #[inline(always)]
     fn add_assign(&mut self, rhs: Self) {
         *self = *self + rhs;
     }
 }
 
 impl MulAssign for PackedQM31 {
+    #[inline(always)]
     fn mul_assign(&mut self, rhs: Self) {
         *self = *self * rhs;
     }
 }
 
 impl FieldExpOps for PackedQM31 {
+    #[inline(always)]
     fn inverse(&self) -> Self {
         assert!(!self.is_zero(), "0 has no inverse");
         // (a + bu)^-1 = (a - bu) / (a^2 - (2+i)b^2).
@@ -192,6 +198,7 @@ pub fn batch_inverse_packed_qm31(column: &[PackedQM31], dst: &mut [PackedQM31]) 
 impl Add<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: PackedM31) -> Self::Output {
         Self([self.a() + rhs, self.b()])
     }
@@ -200,6 +207,7 @@ impl Add<PackedM31> for PackedQM31 {
 impl Mul<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a * rhs, b * rhs])
@@ -209,6 +217,7 @@ impl Mul<PackedM31> for PackedQM31 {
 impl Mul<PackedCM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: PackedCM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a * rhs, b * rhs])
@@ -218,6 +227,7 @@ impl Mul<PackedCM31> for PackedQM31 {
 impl Sub<PackedM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: PackedM31) -> Self::Output {
         let Self([a, b]) = self;
         Self([a - rhs, b])
@@ -227,6 +237,7 @@ impl Sub<PackedM31> for PackedQM31 {
 impl Add<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, rhs: QM31) -> Self::Output {
         self + PackedQM31::broadcast(rhs)
     }
@@ -235,6 +246,7 @@ impl Add<QM31> for PackedQM31 {
 impl Sub<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, rhs: QM31) -> Self::Output {
         self - PackedQM31::broadcast(rhs)
     }
@@ -243,6 +255,7 @@ impl Sub<QM31> for PackedQM31 {
 impl Mul<QM31> for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn mul(self, rhs: QM31) -> Self::Output {
         self * PackedQM31::broadcast(rhs)
     }
@@ -267,6 +280,7 @@ impl Add<M31> for PackedQM31 {
 }
 
 impl SubAssign for PackedQM31 {
+    #[inline(always)]
     fn sub_assign(&mut self, rhs: Self) {
         *self = *self - rhs;
     }
@@ -302,6 +316,7 @@ impl<'a> Sum<&'a Self> for PackedQM31 {
 impl Neg for PackedQM31 {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self::Output {
         let Self([a, b]) = self;
         Self([-a, -b])
