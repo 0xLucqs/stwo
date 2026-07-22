@@ -1,59 +1,127 @@
-#[cfg(test)]
-mod tests {
+mod harness {
     use std::error::Error;
     use std::fmt::{Display, Formatter};
+    use std::io::{self, Write};
     use std::time::{Duration, Instant};
 
     use num_traits::{One, Zero};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
-    #[cfg(feature = "parallel")]
+    #[cfg(all(test, feature = "parallel"))]
     use rayon::prelude::*;
+    #[cfg(test)]
     use stwo::core::air::accumulation::PointEvaluationAccumulator;
     use stwo::core::air::Components;
-    use stwo::core::channel::{Blake2sChannel, Channel};
+    use stwo::core::channel::Blake2sChannel;
+    #[cfg(test)]
+    use stwo::core::channel::Channel;
+    #[cfg(test)]
     use stwo::core::circle::CirclePoint;
     use stwo::core::fields::m31::{BaseField, P as M31_MODULUS};
     use stwo::core::fields::qm31::SecureField;
+    #[cfg(test)]
     use stwo::core::fields::{ExtensionOf, Field};
-    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
+    #[cfg(test)]
+    use stwo::core::pcs::TreeVec;
+    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
     use stwo::core::poly::circle::CanonicCoset;
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use stwo::core::verifier::verify;
-    use stwo::core::{ColumnVec, Fraction};
-    use stwo::prover::backend::simd::column::{BaseColumn, SecureColumn};
+    use stwo::core::ColumnVec;
+    #[cfg(test)]
+    use stwo::core::Fraction;
+    use stwo::prover::backend::simd::column::BaseColumn;
+    #[cfg(test)]
+    use stwo::prover::backend::simd::column::SecureColumn;
     use stwo::prover::backend::simd::qm31::PackedSecureField;
     use stwo::prover::backend::simd::SimdBackend;
+    #[cfg(test)]
     use stwo::prover::backend::Column;
+    #[cfg(test)]
     use stwo::prover::lookups::gkr_prover::{prove_batch as prove_gkr_batch, Layer};
+    #[cfg(test)]
     use stwo::prover::lookups::gkr_verifier::{
         partially_verify_batch, Gate, GkrArtifact, GkrBatchProof,
     };
+    #[cfg(test)]
     use stwo::prover::lookups::mle::{Mle, MleOps};
     use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
     use stwo::prover::poly::twiddles::TwiddleTree;
     use stwo::prover::poly::BitReversedOrder;
     use stwo::prover::{prove, CommitmentSchemeProver, ComponentProver};
+    #[cfg(test)]
     use stwo_constraint_framework::mle_eval::{
         build_trace as build_mle_eval_trace, MleCoeffColumnOracle, MleEvalProverComponent,
         MleEvalVerifierComponent,
     };
+    #[cfg(test)]
+    use stwo_constraint_framework::PointEvaluator;
     use stwo_constraint_framework::{
-        relation, EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator,
-        PointEvaluator, Relation, RelationEntry, TraceLocationAllocator,
+        relation, EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator, Relation,
+        RelationEntry, TraceLocationAllocator,
     };
 
+    #[cfg(test)]
     use crate::xor::gkr_lookups::accumulation::MleCollection;
 
     const AUX_TRACE_IDX: usize = 2;
     const LOG_EXPAND: u32 = 1;
-    #[cfg(feature = "parallel")]
+    #[cfg(all(test, feature = "parallel"))]
     const RELATION_COLUMN_CHUNK_SIZE: usize = 1 << 10;
 
     relation!(LookupRelation, 1);
 
-    type HarnessResult<T> = Result<T, Box<dyn Error>>;
+    pub type HarnessResult<T> = Result<T, Box<dyn Error>>;
+    #[cfg(test)]
     type BaseComponent = FrameworkComponent<BaseColumnsEval>;
+
+    #[derive(Clone, Debug)]
+    pub struct PhaseTiming {
+        pub phase: &'static str,
+        pub elapsed: Duration,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct PathAReport {
+        pub log_n: u32,
+        pub n_use_columns: usize,
+        pub phases: Vec<PhaseTiming>,
+        pub proof_bytes: usize,
+    }
+
+    impl PathAReport {
+        fn new(input: &LookupInput) -> Self {
+            Self {
+                log_n: input.log_n,
+                n_use_columns: input.n_use_columns(),
+                phases: Vec::with_capacity(6),
+                proof_bytes: 0,
+            }
+        }
+
+        fn record(&mut self, phase: &'static str, elapsed: Duration) {
+            self.phases.push(PhaseTiming { phase, elapsed });
+        }
+
+        pub fn write_e2e_lines(&self, out: &mut dyn Write) -> io::Result<usize> {
+            for measurement in &self.phases {
+                writeln!(
+                    out,
+                    "E2E path=a log_n={} l={} phase={} ms={:.3}",
+                    self.log_n,
+                    self.n_use_columns,
+                    measurement.phase,
+                    measurement.elapsed.as_secs_f64() * 1000.0
+                )?;
+            }
+            writeln!(
+                out,
+                "E2E path=a log_n={} l={} proof_bytes={} gkr_felts=0",
+                self.log_n, self.n_use_columns, self.proof_bytes
+            )?;
+            Ok(self.phases.len() + 1)
+        }
+    }
 
     #[derive(Debug)]
     struct HarnessError(&'static str);
@@ -168,11 +236,13 @@ mod tests {
     }
 
     #[derive(Clone)]
+    #[cfg(test)]
     struct BaseColumnsEval {
         log_n: u32,
         n_columns: usize,
     }
 
+    #[cfg(test)]
     impl FrameworkEval for BaseColumnsEval {
         fn log_size(&self) -> u32 {
             self.log_n
@@ -190,6 +260,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     struct CombinedMleOracle<'a> {
         component: &'a BaseComponent,
         relation_shift: SecureField,
@@ -197,6 +268,7 @@ mod tests {
         n_use_columns: usize,
     }
 
+    #[cfg(test)]
     impl MleCoeffColumnOracle for CombinedMleOracle<'_> {
         fn evaluate_at_point(
             &self,
@@ -231,6 +303,7 @@ mod tests {
         )
     }
 
+    #[cfg(test)]
     fn print_phase(path: char, input: &LookupInput, phase: &str, elapsed: Duration, emit: bool) {
         if emit {
             println!(
@@ -242,6 +315,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn print_size(
         path: char,
         input: &LookupInput,
@@ -302,6 +376,7 @@ mod tests {
         generator.finalize_last()
     }
 
+    #[cfg(test)]
     fn ensure_zero_lookup_sum(
         path: &'static str,
         outputs: &[Vec<SecureField>],
@@ -325,6 +400,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(test)]
     fn collect_mle_claims(
         artifact: &GkrArtifact,
         n_use_columns: usize,
@@ -360,6 +436,7 @@ mod tests {
         Ok(claims)
     }
 
+    #[cfg(test)]
     fn preflight_gkr_proof(
         proof: &GkrBatchProof,
         n_use_columns: usize,
@@ -388,12 +465,14 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(test)]
     fn combine_claims(claims: &[SecureField], alpha: SecureField) -> SecureField {
         claims
             .iter()
             .fold(SecureField::zero(), |acc, claim| acc * alpha + *claim)
     }
 
+    #[cfg(test)]
     fn relation_column(z: SecureField, column: &BaseColumn) -> Mle<SimdBackend, SecureField> {
         let packed_z = PackedSecureField::broadcast(z);
         #[cfg(not(feature = "parallel"))]
@@ -420,6 +499,7 @@ mod tests {
         Mle::new(values)
     }
 
+    #[cfg(test)]
     fn relation_columns(z: SecureField, input: &LookupInput) -> Vec<Mle<SimdBackend, SecureField>> {
         #[cfg(not(feature = "parallel"))]
         let columns = input
@@ -434,6 +514,7 @@ mod tests {
         columns.map(|column| relation_column(z, column)).collect()
     }
 
+    #[cfg(test)]
     fn mle_eval_at_point<B, F>(mle: &Mle<B, F>, point: &[SecureField]) -> SecureField
     where
         F: Field,
@@ -462,6 +543,7 @@ mod tests {
         evaluate(&evals, point)
     }
 
+    #[cfg(test)]
     fn gkr_felt_count(proof: &GkrBatchProof) -> usize {
         let round_polys = proof
             .sumcheck_proofs
@@ -487,8 +569,8 @@ mod tests {
         input: &LookupInput,
         config: PcsConfig,
         twiddles: &TwiddleTree<SimdBackend>,
-        emit: bool,
-    ) -> HarnessResult<()> {
+    ) -> HarnessResult<PathAReport> {
+        let mut report = PathAReport::new(input);
         let channel = &mut Blake2sChannel::default();
         config.mix_into(channel);
         let mut commitment_scheme =
@@ -502,12 +584,12 @@ mod tests {
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(input.base_trace());
         tree_builder.commit(channel);
-        print_phase('a', input, "base_commit", phase.elapsed(), emit);
+        report.record("base_commit", phase.elapsed());
 
         let relation = LookupRelation::draw(channel);
         let phase = Instant::now();
         let (interaction_trace, claimed_sum) = generate_interaction_trace(input, &relation);
-        print_phase('a', input, "interaction_gen", phase.elapsed(), emit);
+        report.record("interaction_gen", phase.elapsed());
         if !claimed_sum.is_zero() {
             return Err(HarnessError("Path A lookup sum is nonzero").into());
         }
@@ -516,7 +598,7 @@ mod tests {
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(interaction_trace);
         tree_builder.commit(channel);
-        print_phase('a', input, "interaction_commit", phase.elapsed(), emit);
+        report.record("interaction_commit", phase.elapsed());
 
         let allocator = &mut TraceLocationAllocator::default();
         let component = FrameworkComponent::new(
@@ -534,9 +616,9 @@ mod tests {
             channel,
             commitment_scheme,
         )?;
-        print_phase('a', input, "stark_prove", phase.elapsed(), emit);
-        print_phase('a', input, "total", total.elapsed(), emit);
-        print_size('a', input, proof.size_estimate(), 0, emit);
+        report.record("stark_prove", phase.elapsed());
+        report.record("total", total.elapsed());
+        report.proof_bytes = proof.size_estimate();
 
         let phase = Instant::now();
         let verifier_channel = &mut Blake2sChannel::default();
@@ -575,10 +657,19 @@ mod tests {
             commitment_scheme,
             proof,
         )?;
-        print_phase('a', input, "verify", phase.elapsed(), emit);
-        Ok(())
+        report.record("verify", phase.elapsed());
+        Ok(report)
     }
 
+    /// Runs the existing interaction-trace LogUp baseline with its original phase boundaries.
+    pub fn benchmark_path_a(log_n: u32, n_use_columns: usize) -> HarnessResult<PathAReport> {
+        let input = LookupInput::generate(log_n, n_use_columns, false);
+        let config = PcsConfig::default();
+        let twiddles = precompute_twiddles(input.log_n, config);
+        run_path_a(&input, config, &twiddles)
+    }
+
+    #[cfg(test)]
     fn run_path_b(
         input: &LookupInput,
         config: PcsConfig,
@@ -705,6 +796,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(test)]
     fn verify_path_b(
         input: &LookupInput,
         config: PcsConfig,
@@ -775,7 +867,7 @@ mod tests {
         let input = LookupInput::generate(8, 2, false);
         let config = PcsConfig::default();
         let twiddles = precompute_twiddles(input.log_n, config);
-        run_path_a(&input, config, &twiddles, false).unwrap();
+        run_path_a(&input, config, &twiddles).unwrap();
         run_path_b(&input, config, &twiddles, false).unwrap();
     }
 
@@ -809,7 +901,7 @@ mod tests {
             let input = LookupInput::generate(8, n_use_columns, false);
             let config = PcsConfig::default();
             let twiddles = precompute_twiddles(input.log_n, config);
-            run_path_a(&input, config, &twiddles, false).unwrap();
+            run_path_a(&input, config, &twiddles).unwrap();
             run_path_b(&input, config, &twiddles, false).unwrap();
         }
     }
@@ -819,11 +911,12 @@ mod tests {
         let input = LookupInput::generate(8, 2, true);
         let config = PcsConfig::default();
         let twiddles = precompute_twiddles(input.log_n, config);
-        assert!(run_path_a(&input, config, &twiddles, false).is_err());
+        assert!(run_path_a(&input, config, &twiddles).is_err());
         assert!(run_path_b(&input, config, &twiddles, false).is_err());
     }
 
-    pub(super) fn run_one() {
+    #[cfg(test)]
+    pub(super) fn run_one_from_env() {
         let log_n = std::env::var("GKR_E2E_LOG_N")
             .map(|value| value.parse().expect("GKR_E2E_LOG_N must be a u32"))
             .unwrap_or(16);
@@ -836,10 +929,18 @@ mod tests {
         let twiddles = precompute_twiddles(input.log_n, config);
 
         match path.as_str() {
-            "a" => run_path_a(&input, config, &twiddles, true).unwrap(),
+            "a" => {
+                run_path_a(&input, config, &twiddles)
+                    .unwrap()
+                    .write_e2e_lines(&mut io::stdout().lock())
+                    .unwrap();
+            }
             "b" => run_path_b(&input, config, &twiddles, true).unwrap(),
             "both" => {
-                run_path_a(&input, config, &twiddles, true).unwrap();
+                run_path_a(&input, config, &twiddles)
+                    .unwrap()
+                    .write_e2e_lines(&mut io::stdout().lock())
+                    .unwrap();
                 run_path_b(&input, config, &twiddles, true).unwrap();
             }
             _ => panic!("GKR_E2E_PATH must be a, b, or both"),
@@ -847,9 +948,11 @@ mod tests {
     }
 }
 
+pub use harness::{benchmark_path_a, HarnessResult, PathAReport, PhaseTiming};
+
 #[cfg(test)]
 #[test]
 #[ignore = "measurement harness; run explicitly with GKR_E2E_* env vars"]
 fn run_one() {
-    tests::run_one();
+    harness::run_one_from_env();
 }
